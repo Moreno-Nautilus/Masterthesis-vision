@@ -37,36 +37,54 @@ def estimate_pose_icp(
     voxel_size: float = 0.005,
 ) -> tuple[SE3, dict]:
     """
-    Convention:
-      - source = observed_points
-      - target = cad_points
-      - returned transform is T_obs_to_cad (maps observed -> cad)
-    """
-    source = _pcd(observed_points)
-    target = _pcd(cad_points)
+    Convention / frames:
 
-    # --- Downsample for global registration
+      - observed_points are points measured in the camera (or world) frame:  P_cam
+      - cad_points are model points in the object frame:                    P_obj
+
+    We return:
+      - T_obj_cam (maps cam -> obj), such that:
+            P_obj ≈ T_obj_cam(P_cam)
+
+    If you need the usual vision pose (object in camera frame):
+      - T_cam_obj = T_obj_cam.inverse()
+      - then: P_cam_pred = T_cam_obj(P_obj)
+    """
+    source = _pcd(observed_points)  # cam/world
+    target = _pcd(cad_points)       # obj
+
+    # Downsample for global registration
     src_down = source.voxel_down_sample(voxel_size)
     tgt_down = target.voxel_down_sample(voxel_size)
 
-    # --- Normals
+    # Normals
     radius_normal = voxel_size * 3.0
-    src_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50))
-    tgt_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50))
+    src_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50)
+    )
+    tgt_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50)
+    )
 
-    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50))
-    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50))
+    source.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50)
+    )
+    target.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=50)
+    )
 
-    # --- FPFH
+    # FPFH
     radius_feature = voxel_size * 8.0
     src_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        src_down, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=200)
+        src_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=200),
     )
     tgt_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        tgt_down, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=200)
+        tgt_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=200),
     )
 
-    # --- RANSAC init
+    # RANSAC init
     dist_thresh = voxel_size * 4.0
     ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
         src_down,
@@ -86,7 +104,7 @@ def estimate_pose_icp(
 
     T0 = np.asarray(ransac.transformation, dtype=float)
 
-    # --- Multi-init candidates
+    # Multi-init candidates
     candidates: list[np.ndarray] = []
 
     def _add_rot_left(Rleft: np.ndarray) -> None:
@@ -110,7 +128,7 @@ def estimate_pose_icp(
         yaw = float(rng.uniform(-30.0, 30.0))
         _add_rot_left(_rot_z(yaw))
 
-    # --- Evaluate candidates with ICP refine
+    # Evaluate candidates with ICP refine
     best_T = None
     best_fit = -1.0
     best_rmse = float("inf")
@@ -140,7 +158,8 @@ def estimate_pose_icp(
     if best_T is None:
         best_T = np.eye(4)
 
-    T = SE3.from_matrix(best_T)
+    T_obj_cam = SE3.from_matrix(best_T)
+
     metrics = {
         "ransac_fitness": float(getattr(ransac, "fitness", np.nan)),
         "ransac_inlier_rmse": float(getattr(ransac, "inlier_rmse", np.nan)),
@@ -148,7 +167,7 @@ def estimate_pose_icp(
         "icp_inlier_rmse": float(best_rmse),
         "n_candidates": float(len(candidates)),
     }
-    return T, metrics
+    return T_obj_cam, metrics
 
 
 def load_mesh(path: str | Path) -> o3d.geometry.TriangleMesh:

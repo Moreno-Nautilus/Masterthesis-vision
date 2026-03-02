@@ -93,11 +93,7 @@ def build_poses_gt(
                 positions[obj_id] = (x, y, z)
                 break
         else:
-            # if it fails, expand search bounds and try again
-            # (keeps everything automatic)
             xy_bounds = (xy_bounds[0] * 1.15, xy_bounds[1] * 1.15)
-            # restart this object placement with expanded bounds
-            # (simple approach: clear and restart all placements)
             return build_poses_gt(obj_ids=obj_ids, seed=seed + 999, cad_r_xy=cad_r_xy, margin=margin)
     poses: dict[str, SE3] = {}
     for obj_id in obj_ids:
@@ -211,7 +207,7 @@ def main() -> None:
     )
     pipe = GraspPerceptionPipeline(cad_library=cad_library, cfg=cfg)
 
-    # ---- batch settings
+    # batch settings
     seeds = list(range(50))
     occlusion_keep_ratio = 0.70   # realistic with 3 cams + overview
     n_outliers = 800

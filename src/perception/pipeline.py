@@ -152,11 +152,10 @@ class GraspPerceptionPipeline:
         cad_ids = list(self.cad_library.keys())
         cad_pts = [self.cad_library[k] for k in cad_ids]
 
-        # score matrix used for choosing best CAD per cluster:
-        # we choose by ICP inlier RMSE (lower is better)
         scores = np.full((len(clusters), len(cad_ids)), np.inf, dtype=float)
 
-        poses_obs_to_cad: list[list[SE3]] = [
+        # store T_obj_cam (cam -> obj) for each (cluster, cad) pair
+        poses_obj_cam: list[list[SE3]] = [
             [SE3.identity() for _ in cad_ids] for _ in clusters
         ]
         pair_metrics: dict[tuple[int, int], dict[str, float]] = {}
@@ -164,17 +163,20 @@ class GraspPerceptionPipeline:
         # --- compute all pairs
         for i, cluster in enumerate(clusters):
             for j, model in enumerate(cad_pts):
-                T_obs_to_cad, icp_metrics = estimate_pose_icp(
+                # returns T_obj_cam (cam -> obj)
+                T_obj_cam, icp_metrics = estimate_pose_icp(
                     cluster, model, voxel_size=self.cfg.voxel_size
                 )
-                aligned = T_obs_to_cad.transform_points(cluster)
-                rms_nn = nn_rms(aligned, model)
+
+                # map observed cluster (cam/world) into obj frame for NN RMS gating
+                cluster_in_obj = T_obj_cam.transform_points(cluster)
+                rms_nn = nn_rms(cluster_in_obj, model)  # both in obj frame
 
                 icp_fit = float(icp_metrics.get("icp_fitness", np.nan))
                 icp_rmse = float(icp_metrics.get("icp_inlier_rmse", np.nan))
 
                 scores[i, j] = icp_rmse
-                poses_obs_to_cad[i][j] = T_obs_to_cad
+                poses_obj_cam[i][j] = T_obj_cam
 
                 pair_metrics[(i, j)] = {
                     "rms_nn": float(rms_nn),
@@ -188,13 +190,16 @@ class GraspPerceptionPipeline:
         used: set[int] = set()
         out: list[DetectedObject] = []
 
-        # --- pick best CAD per cluster + gates
+        # pick best CAD per cluster + gates
         for i in range(len(clusters)):
             # sort CADs by ICP inlier RMSE (lower is better)
             order = np.argsort(scores[i])
 
             # margin computed on NN RMS (stable)
-            nn_row = np.array([pair_metrics[(i, j)]["rms_nn"] for j in range(len(cad_ids))], dtype=float)
+            nn_row = np.array(
+                [pair_metrics[(i, j)]["rms_nn"] for j in range(len(cad_ids))],
+                dtype=float,
+            )
             nn_order = np.argsort(nn_row)
             nn_best = float(nn_row[int(nn_order[0])])
             nn_second = float(nn_row[int(nn_order[1])]) if len(nn_order) > 1 else float("inf")
@@ -245,11 +250,12 @@ class GraspPerceptionPipeline:
 
             used.add(chosen)
 
-            # output pose
-            T_obs_to_cad = poses_obs_to_cad[i][chosen]
-            T_object_to_world = T_obs_to_cad.inverse()
+            # output pose:
+            # we store T_object_to_world as obj -> cam/world
+            T_obj_cam = poses_obj_cam[i][chosen]
+            T_cam_obj = T_obj_cam.inverse()  # obj -> cam/world
+            T_object_to_world = T_cam_obj
 
-            # optional sanity log
             cad_world = T_object_to_world.transform_points(self.cad_library[cad_ids[chosen]])
             cluster_world = clusters[i]
             c_err = float(np.linalg.norm(cad_world.mean(axis=0) - cluster_world.mean(axis=0)))

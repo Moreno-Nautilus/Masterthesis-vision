@@ -56,7 +56,7 @@ def main():
         dbscan_eps=0.02,
         dbscan_min_points=30,
         voxel_size=0.005,
-        max_rms=0.01,
+        max_rms_nn=0.01,
         min_margin=1.2,
     )
     pipe = GraspPerceptionPipeline(cad_library=cad_library, cfg=cfg)
@@ -103,7 +103,6 @@ def main():
     for obj in result.objects:
         print(
             f"- id={obj.object_id} id_conf={obj.id_confidence:.2f} pose_conf={obj.pose_confidence:.2f} "
-            f"rms={obj.metrics['rms']:.4f} margin={obj.metrics['margin']:.2f}"
         )
         T = obj.T_object_to_world.as_matrix()
         print("  T_object_to_world:\n", np.array_str(T, precision=3, suppress_small=True))

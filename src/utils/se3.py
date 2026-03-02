@@ -15,7 +15,7 @@ class SE3:
         if self.R.shape != (3,3):
             raise ValueError(f"R must be (3,3), got {self.R.shape}")
         if self.t.shape != (3,):
-            raise ValueError(f"t must be (3,), got {self.R.shape}")
+            raise ValueError(f"t must be (3,), got {self.t.shape}")
     
     @staticmethod
     def identity()->"SE3":
@@ -44,9 +44,31 @@ class SE3:
         R = self.R @ other.R
         t = self.R @ other.t +self.t
         return SE3(R,t)
+
+    def __matmul__(self, other: "SE3") -> "SE3":
+        if not isinstance(other, SE3):
+            return NotImplemented
+        return self.compose(other)
     
     def transform_points(self, pts: np.ndarray)-> np.ndarray:
         pts = np.asarray(pts,dtype= float)
         if pts.ndim != 2 or pts.shape[1] != 3:
             raise ValueError(f"pts  must be (N,3),  got {pts.shape} ")
         return (self.R @ pts.T).T+ self.t
+
+    def transform_point(self, p: np.ndarray)-> np.ndarray:
+        p = np.asarray(p, dtype = float).reshape(3,)
+        return self.R @ p + self.t
+
+    def is_valid(self, atol: float = 1e-6) -> bool:
+        """Checks R is a proper rot matrix within tolerance"""
+        RtR = self.R.T @self.R
+        if not np.allclose(RtR, np.eye(3), atol = atol):
+            return False
+        if not np.isfinite(self.t).all():
+            return False
+        det = np.linalg.det(self.R)
+        return np.isfinite(det) and abs(det- 1.0) < 1e-4
+
+    def __repr__(self)-> str:
+        return f"SE3(R=\n{np.array_str(self.R, precision=3, suppress_small=True)},\n t={np.array_str(self.t, precision=3, suppress_small=True)})"
