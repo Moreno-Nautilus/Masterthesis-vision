@@ -6,10 +6,10 @@ from src.utils.se3 import SE3
 class DetectedObject:
     object_id: str
     point_cloud: np.ndarray
-    pose_base: SE3 | None = None
-    id_confidence: float
+    T_obj_to_world: SE3 | None = None
     pose_confidence: float = 0.0
     id_confidence: float = 0.0
+    metrics: dict[str, float] | None = None
 
 
 @dataclass
