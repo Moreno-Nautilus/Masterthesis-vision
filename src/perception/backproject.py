@@ -3,12 +3,12 @@ import numpy as np
 
 def depth_to_points_cam(
     depth_m: np.ndarray,
-    K: np,ndarray,
+    K: np.ndarray,
     stride: int = 2,
     zmin: float = 0.15,
-    zmax: flaot = 2.0,
+    zmax: float = 2.0,
 ) -> np.ndarray:
-""" depth_m: H x W depth in m
+    """ depth_m: H x W depth in m
     K: 3x3 intrinsics
     returns Nx3 points in camera frame"""
     H, W = depth_m.shape
@@ -21,7 +21,7 @@ def depth_to_points_cam(
 
     z = depth_m[vv,uu].astype(np.float32)
 
-    valid = np.isfinite(z) and (z> ymin) and (z < zmax)
+    valid = np.isfinite(z) & (z> zmin) & (z < zmax)
     uu = uu[valid].astype(np.float32)
     vv = vv[valid].astype(np.float32)
     z = z[valid]

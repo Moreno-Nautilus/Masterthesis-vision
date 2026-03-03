@@ -3,5 +3,7 @@
 venv/
 env/
 
+.venv_ros/
+
 outputs
 Data

@@ -10,7 +10,6 @@ import open3d as o3d
 from src.utils.se3 import SE3
 from src.perception.pose_icp import estimate_pose_icp
 from src.perception.segmentation import (
-    remove_plane_ransac,
     cluster_dbscan,
     merge_close_clusters,
 )
@@ -34,7 +33,7 @@ class StageTiming:
 class DetectedObject:
     object_id: str
     point_cloud: np.ndarray
-    T_object_to_world: SE3
+    T_object_to_world: SE3  # semantically T_base_obj (OBJ -> BASE)
     id_confidence: float
     pose_confidence: float
     metrics: dict[str, float]
@@ -42,7 +41,9 @@ class DetectedObject:
 
 @dataclass
 class SceneResult:
+    points_world_raw: np.ndarray
     plane_model: np.ndarray
+    plane_points: np.ndarray
     points_wo_plane: np.ndarray
     clusters: list[np.ndarray]
     objects: list[DetectedObject]
@@ -51,39 +52,155 @@ class SceneResult:
 
 @dataclass
 class PipelineConfig:
-    # plane
-    plane_distance_threshold: float = 0.003
+    # plane (dominant plane only; DO NOT assume Z-up)
+    plane_distance_threshold: float = 0.002
     plane_ransac_n: int = 3
-    plane_num_iterations: int = 2000
+    plane_num_iterations: int = 4000
 
-    # clustering
-    dbscan_eps: float = 0.02
-    dbscan_min_points: int = 30
-    merge_dist: float = 0.05
-    merge_z_overlap: float = 0.03
+    # object band above plane (meters)
+    h_min: float = 0.010
+    h_max: float = 0.07
+
+    # remove a second plane from the above-band (tabletop / plate)
+    remove_plane2: bool = True
+    plane2_distance_threshold: float = 0.0025
+    plane2_num_iterations: int = 2000
+
+    # workspace crop in the plane around the plane centroid
+    use_disc_crop: bool = True
+    disc_radius: float = 0.45
+
+    # clustering (first pass)
+    dbscan_eps: float = 0.03
+    dbscan_min_points: int = 40
+    merge_dist: float = 0.06
+    merge_z_overlap: float = 0.04
+
+    # --- refinement inside the biggest cluster (zoom in) ---
+    refine_on_largest_cluster: bool = True
+    refine_max_points: int = 60000          # safety cap
+    refine_plane2_distance_threshold: float = 0.0020
+    refine_plane2_num_iterations: int = 2500
+    refine_dbscan_eps: float = 0.014
+    refine_dbscan_min_points: int = 50
 
     # matching / gating
     voxel_size: float = 0.005
     enforce_one_to_one: bool = True
 
-    # NN RMS gate + margin (margin is computed on NN RMS)
-    max_rms_nn: float = 0.015
+    # NN RMS gate + margin
+    max_rms_nn: float = 0.030
     min_margin: float = 1.5
 
     # soft ICP-quality gates (reject only if BOTH are bad)
-    min_icp_fitness: float = 0.10
-    max_icp_inlier_rmse: float = 0.02
+    min_icp_fitness: float = 0.05
+    max_icp_inlier_rmse: float = 0.04
+
+
+def _pcd(pts: np.ndarray) -> o3d.geometry.PointCloud:
+    p = o3d.geometry.PointCloud()
+    p.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=float))
+    return p
+
+
+def _remove_plane(
+    points: np.ndarray,
+    distance_threshold: float,
+    ransac_n: int = 3,
+    num_iterations: int = 2000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Segment one dominant plane from points.
+    Returns (wo_plane, plane_points, plane_model_normalized[a,b,c,d]).
+    """
+    if points is None or len(points) < 500:
+        return points, np.zeros((0, 3), dtype=float), np.array([0.0, 0.0, 1.0, 0.0], dtype=float)
+
+    pcd = _pcd(points)
+    model, inliers = pcd.segment_plane(
+        distance_threshold=float(distance_threshold),
+        ransac_n=int(ransac_n),
+        num_iterations=int(num_iterations),
+    )
+    inliers = np.asarray(inliers, dtype=int)
+    if inliers.size == 0:
+        return points, np.zeros((0, 3), dtype=float), np.array([0.0, 0.0, 1.0, 0.0], dtype=float)
+
+    mask = np.zeros(len(points), dtype=bool)
+    mask[inliers] = True
+    plane_pts = points[mask]
+    wo = points[~mask]
+
+    a, b, c, d = [float(x) for x in model]
+    n = np.array([a, b, c], dtype=float)
+    nn = np.linalg.norm(n) + 1e-12
+    n = n / nn
+    d = d / nn
+    model_n = np.array([n[0], n[1], n[2], d], dtype=float)
+    return wo, plane_pts, model_n
 
 
 def nn_rms(source_pts: np.ndarray, target_pts: np.ndarray) -> float:
     if len(source_pts) == 0 or len(target_pts) == 0:
         return float("inf")
-    src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source_pts))
-    tgt = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(target_pts))
+    src = _pcd(source_pts)
+    tgt = _pcd(target_pts)
     dists = np.asarray(src.compute_point_cloud_distance(tgt))
     if not np.isfinite(dists).all():
         return float("inf")
     return float(np.sqrt(np.mean(dists**2)))
+
+
+def _plane_basis_from_normal(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n = n / (np.linalg.norm(n) + 1e-12)
+    tmp = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(tmp, n))) > 0.9:
+        tmp = np.array([0.0, 1.0, 0.0], dtype=float)
+    u = np.cross(n, tmp)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+    v = v / (np.linalg.norm(v) + 1e-12)
+    return u, v
+
+
+def _crop_disc_in_plane(points: np.ndarray, n: np.ndarray, center: np.ndarray, radius: float) -> np.ndarray:
+    if len(points) == 0:
+        return points
+    u, v = _plane_basis_from_normal(n)
+    p = points - center
+    du = p @ u
+    dv = p @ v
+    r2 = du**2 + dv**2
+    return points[r2 <= float(radius) ** 2]
+
+
+def _choose_plane_sign_by_above_band(
+    points: np.ndarray,
+    n: np.ndarray,
+    d: float,
+    h_min: float,
+    h_max: float,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """
+    Choose sign of plane normal such that the number of points in the above-band is maximized.
+    Returns (n, d, signed_distances) after choosing sign.
+    """
+    signed0 = points @ n + d
+    signed1 = -signed0
+
+    n_above0 = int(np.count_nonzero((signed0 > h_min) & (signed0 < h_max)))
+    n_above1 = int(np.count_nonzero((signed1 > h_min) & (signed1 < h_max)))
+
+    if n_above1 > n_above0:
+        return -n, -d, signed1
+    return n, d, signed0
+
+
+def _bbox_diag(pts: np.ndarray) -> float:
+    if pts is None or len(pts) == 0:
+        return float("inf")
+    ext = pts.max(axis=0) - pts.min(axis=0)
+    return float(np.linalg.norm(ext))
 
 
 class GraspPerceptionPipeline:
@@ -97,49 +214,149 @@ class GraspPerceptionPipeline:
         self.cfg = cfg or PipelineConfig()
         self.log = logger or Logger()
 
+        # precompute cad diags for “shape size prior”
+        self._cad_diag: dict[str, float] = {}
+        for k, pts in self.cad_library.items():
+            self._cad_diag[k] = _bbox_diag(np.asarray(pts, dtype=float))
+
     def run(self, scene_points_world: np.ndarray) -> SceneResult:
         timings: list[StageTiming] = []
+        points_world_raw = np.asarray(scene_points_world, dtype=float)
 
-        # Plane removal
+        # --- 1) Dominant plane
         t0 = perf_counter()
-        wo_plane, plane_pts, plane_model = remove_plane_ransac(
-            scene_points_world,
+        pcd = _pcd(points_world_raw)
+        plane_model, inliers = pcd.segment_plane(
             distance_threshold=self.cfg.plane_distance_threshold,
             ransac_n=self.cfg.plane_ransac_n,
             num_iterations=self.cfg.plane_num_iterations,
         )
-        timings.append(StageTiming("plane_removal", perf_counter() - t0))
+        plane_model = np.asarray(plane_model, dtype=float)
+        inliers = np.asarray(inliers, dtype=int)
+
+        mask = np.zeros(len(points_world_raw), dtype=bool)
+        mask[inliers] = True
+        plane_pts = points_world_raw[mask]
+        wo_plane = points_world_raw[~mask]
+
+        # normalize plane
+        n = plane_model[:3].astype(float)
+        nn = np.linalg.norm(n) + 1e-12
+        n = n / nn
+        d = float(plane_model[3]) / nn
+        plane_model = np.array([n[0], n[1], n[2], d], dtype=float)
+
+        up_axis = int(np.argmax(np.abs(n)))
         self.log.info(
             "plane_removal",
-            n_in=len(scene_points_world),
+            n_in=len(points_world_raw),
             n_plane=len(plane_pts),
             n_left=len(wo_plane),
+            n=f"[{n[0]:.3f},{n[1]:.3f},{n[2]:.3f}]",
+            up_axis=f"{up_axis}(0=x,1=y,2=z)",
+        )
+        timings.append(StageTiming("plane_fit", perf_counter() - t0))
+
+        # --- 2) Above-plane band (robust sign)
+        h_min = float(self.cfg.h_min)
+        h_max = float(self.cfg.h_max)
+
+        n, d, signed = _choose_plane_sign_by_above_band(points_world_raw, n, d, h_min, h_max)
+        plane_model = np.array([n[0], n[1], n[2], d], dtype=float)
+
+        mask_above = (signed > h_min) & (signed < h_max)
+        points_objects = points_world_raw[mask_above]
+
+        # --- 2.5) Remove tabletop/plate plane from above-band
+        if self.cfg.remove_plane2 and len(points_objects) > 0:
+            before2 = len(points_objects)
+            points_objects, plane2_pts, _ = _remove_plane(
+                points_objects,
+                distance_threshold=float(self.cfg.plane2_distance_threshold),
+                ransac_n=3,
+                num_iterations=int(self.cfg.plane2_num_iterations),
+            )
+            self.log.info("remove_plane2", n_before=before2, n_plane2=len(plane2_pts), n_after=len(points_objects))
+
+        self.log.info(
+            "above_plane_band",
+            h_min=h_min,
+            h_max=h_max,
+            n_above=len(points_objects),
+            h_q50=float(np.quantile(signed, 0.5)),
+            h_q95=float(np.quantile(signed, 0.95)),
+            h_q99=float(np.quantile(signed, 0.99)),
         )
 
-        # Clustering (+ merge fragments)
+        # --- 3) Disc crop around plane centroid
+        if self.cfg.use_disc_crop and len(points_objects) > 0 and len(plane_pts) > 0:
+            center = plane_pts.mean(axis=0)
+            before = len(points_objects)
+            points_objects = _crop_disc_in_plane(points_objects, n, center, radius=float(self.cfg.disc_radius))
+            self.log.info("disc_crop", radius=float(self.cfg.disc_radius), n_before=before, n_after=len(points_objects))
+
+        # --- 4) First clustering
         t0 = perf_counter()
         clusters = cluster_dbscan(
-            wo_plane, eps=self.cfg.dbscan_eps, min_points=self.cfg.dbscan_min_points
+            points_objects,
+            eps=float(self.cfg.dbscan_eps),
+            min_points=int(self.cfg.dbscan_min_points),
         )
         clusters = merge_close_clusters(
-            clusters, merge_dist=self.cfg.merge_dist, z_overlap=self.cfg.merge_z_overlap
+            clusters,
+            merge_dist=float(self.cfg.merge_dist),
+            z_overlap=float(self.cfg.merge_z_overlap),
         )
         timings.append(StageTiming("clustering", perf_counter() - t0))
-        self.log.info(
-            "clustering",
-            n_clusters=len(clusters),
-            sizes=[len(c) for c in clusters[:5]],
-        )
+        self.log.info("clustering", n_clusters=len(clusters), sizes=[len(c) for c in clusters[:5]])
 
-        # Identify + pose
+        # --- 4.5) Refinement inside the largest cluster (THIS is your requested “zoomed in” segmentation)
+        if self.cfg.refine_on_largest_cluster and len(clusters) > 0:
+            largest = max(clusters, key=lambda c: c.shape[0])
+            self.log.info("refine_stage0", largest_n=len(largest))
+
+            pts_roi = largest
+            if len(pts_roi) > int(self.cfg.refine_max_points):
+                idx = np.random.choice(len(pts_roi), int(self.cfg.refine_max_points), replace=False)
+                pts_roi = pts_roi[idx]
+                self.log.info("refine_subsample", n=int(self.cfg.refine_max_points))
+
+            before = len(pts_roi)
+            pts_roi_wo_plane, plane2b_pts, _ = _remove_plane(
+                pts_roi,
+                distance_threshold=float(self.cfg.refine_plane2_distance_threshold),
+                ransac_n=3,
+                num_iterations=int(self.cfg.refine_plane2_num_iterations),
+            )
+            self.log.info("refine_remove_plane2", n_before=before, n_plane2=len(plane2b_pts), n_after=len(pts_roi_wo_plane))
+
+            clusters_ref = cluster_dbscan(
+                pts_roi_wo_plane,
+                eps=float(self.cfg.refine_dbscan_eps),
+                min_points=int(self.cfg.refine_dbscan_min_points),
+            )
+            clusters_ref = merge_close_clusters(
+                clusters_ref,
+                merge_dist=float(self.cfg.merge_dist),
+                z_overlap=float(self.cfg.merge_z_overlap),
+            )
+            self.log.info("refine_clustering", n_clusters=len(clusters_ref), sizes=[len(c) for c in clusters_ref[:5]])
+
+            # Replace clusters if refinement produced anything
+            if len(clusters_ref) > 0:
+                clusters = clusters_ref
+
+        # --- 5) Identify + pose
         t0 = perf_counter()
         objects = self._identify_and_pose(clusters)
         timings.append(StageTiming("identify_pose", perf_counter() - t0))
         self.log.info("identify_pose", n_objects=len(objects))
 
         return SceneResult(
+            points_world_raw=points_world_raw,
             plane_model=np.asarray(plane_model, dtype=float),
-            points_wo_plane=wo_plane,
+            plane_points=np.asarray(plane_pts, dtype=float),
+            points_wo_plane=np.asarray(wo_plane, dtype=float),
             clusters=clusters,
             objects=objects,
             timings=timings,
@@ -152,130 +369,115 @@ class GraspPerceptionPipeline:
         cad_ids = list(self.cad_library.keys())
         cad_pts = [self.cad_library[k] for k in cad_ids]
 
-        scores = np.full((len(clusters), len(cad_ids)), np.inf, dtype=float)
-
-        # store T_obj_cam (cam -> obj) for each (cluster, cad) pair
-        poses_obj_cam: list[list[SE3]] = [
-            [SE3.identity() for _ in cad_ids] for _ in clusters
-        ]
-        pair_metrics: dict[tuple[int, int], dict[str, float]] = {}
-
-        # --- compute all pairs
-        for i, cluster in enumerate(clusters):
-            for j, model in enumerate(cad_pts):
-                # returns T_obj_cam (cam -> obj)
-                T_obj_cam, icp_metrics = estimate_pose_icp(
-                    cluster, model, voxel_size=self.cfg.voxel_size
-                )
-
-                # map observed cluster (cam/world) into obj frame for NN RMS gating
-                cluster_in_obj = T_obj_cam.transform_points(cluster)
-                rms_nn = nn_rms(cluster_in_obj, model)  # both in obj frame
-
-                icp_fit = float(icp_metrics.get("icp_fitness", np.nan))
-                icp_rmse = float(icp_metrics.get("icp_inlier_rmse", np.nan))
-
-                scores[i, j] = icp_rmse
-                poses_obj_cam[i][j] = T_obj_cam
-
-                pair_metrics[(i, j)] = {
-                    "rms_nn": float(rms_nn),
-                    "icp_fitness": icp_fit,
-                    "icp_inlier_rmse": icp_rmse,
-                    "ransac_fitness": float(icp_metrics.get("ransac_fitness", np.nan)),
-                    "ransac_inlier_rmse": float(icp_metrics.get("ransac_inlier_rmse", np.nan)),
-                    "n_candidates": float(icp_metrics.get("n_candidates", np.nan)),
-                }
-
-        used: set[int] = set()
+        used_models: set[int] = set()
         out: list[DetectedObject] = []
 
-        # pick best CAD per cluster + gates
-        for i in range(len(clusters)):
-            # sort CADs by ICP inlier RMSE (lower is better)
-            order = np.argsort(scores[i])
+        for i, cluster in enumerate(clusters):
+            if cluster.shape[0] < max(20, int(self.cfg.dbscan_min_points)):
+                continue
 
-            # margin computed on NN RMS (stable)
-            nn_row = np.array(
-                [pair_metrics[(i, j)]["rms_nn"] for j in range(len(cad_ids))],
-                dtype=float,
-            )
-            nn_order = np.argsort(nn_row)
-            nn_best = float(nn_row[int(nn_order[0])])
-            nn_second = float(nn_row[int(nn_order[1])]) if len(nn_order) > 1 else float("inf")
+            cand = []
+            for j, model in enumerate(cad_pts):
+                T_base_obj, icp_metrics = estimate_pose_icp(
+                    observed_points=cluster,   # BASE
+                    cad_points=model,          # OBJ
+                    voxel_size=float(self.cfg.voxel_size),
+                )
+
+                # similarity in object frame
+                T_obj_base = T_base_obj.inverse()
+                cluster_in_obj = T_obj_base.transform_points(cluster)
+                rms = nn_rms(cluster_in_obj, model)
+
+                fit = float(icp_metrics.get("icp_fitness", 0.0))
+                rmse = float(icp_metrics.get("icp_inlier_rmse", np.inf))
+
+                cand.append(
+                    {
+                        "j": j,
+                        "obj_id": cad_ids[j],
+                        "T_base_obj": T_base_obj,
+                        "rms_nn": rms,
+                        "icp_fitness": fit,
+                        "icp_rmse": rmse,
+                        "metrics": icp_metrics,
+                    }
+                )
+
+            cand.sort(key=lambda c: float(c["rms_nn"]))
+            if len(cand) == 0:
+                continue
+
+            best = cand[0]
+            second = cand[1] if len(cand) > 1 else None
+
+            nn_best = float(best["rms_nn"])
+            nn_second = float(second["rms_nn"]) if second is not None else float("inf")
             margin = (nn_second / nn_best) if nn_best > 1e-12 else float("inf")
 
-            if margin < self.cfg.min_margin:
+            if margin < float(self.cfg.min_margin):
                 self.log.warn("reject_margin", cluster=i, margin=margin, min_margin=self.cfg.min_margin)
                 continue
 
             chosen = None
-            chosen_metrics = None
-
-            # try candidates in ICP-RMSE order until one passes gates
-            for j in order:
-                j = int(j)
-
-                if self.cfg.enforce_one_to_one and j in used:
+            for c in cand:
+                j = int(c["j"])
+                if self.cfg.enforce_one_to_one and j in used_models:
                     continue
 
-                m = pair_metrics[(i, j)]
-                fit = float(m.get("icp_fitness", 0.0))
-                inlier = float(m.get("icp_inlier_rmse", np.inf))
-                rms_nn = float(m.get("rms_nn", np.inf))
+                rms = float(c["rms_nn"])
+                fit = float(c["icp_fitness"])
+                rmse = float(c["icp_rmse"])
 
-                # HARD gate: NN RMS
-                if (not np.isfinite(rms_nn)) or rms_nn > self.cfg.max_rms_nn:
+                if (not np.isfinite(rms)) or (rms > float(self.cfg.max_rms_nn)):
                     continue
 
-                # SOFT gate: reject only if BOTH bad
-                if (fit < self.cfg.min_icp_fitness) and (inlier > self.cfg.max_icp_inlier_rmse):
-                    continue
+                # Soft ICP gating: reject only if BOTH are bad
+                if (fit < float(self.cfg.min_icp_fitness)) and (rmse > float(self.cfg.max_icp_inlier_rmse)):
+                    # allow if rms is very good
+                    if rms > 0.5 * float(self.cfg.max_rms_nn):
+                        continue
 
-                chosen = j
-                chosen_metrics = m
+                chosen = c
                 break
 
             if chosen is None:
-                # helpful debug: report best few candidates
-                top = [int(x) for x in order[:3]]
+                top = cand[:3]
                 self.log.warn(
                     "reject_cluster_no_candidate",
                     cluster=i,
-                    top=[cad_ids[t] for t in top],
-                    top_nn=[float(pair_metrics[(i, t)]["rms_nn"]) for t in top],
-                    top_icp=[float(pair_metrics[(i, t)]["icp_inlier_rmse"]) for t in top],
+                    top=[t["obj_id"] for t in top],
+                    top_nn=[float(t["rms_nn"]) for t in top],
+                    top_icp=[float(t["icp_rmse"]) for t in top],
                 )
                 continue
 
-            used.add(chosen)
+            if self.cfg.enforce_one_to_one:
+                used_models.add(int(chosen["j"]))
 
-            # output pose:
-            # we store T_object_to_world as obj -> cam/world
-            T_obj_cam = poses_obj_cam[i][chosen]
-            T_cam_obj = T_obj_cam.inverse()  # obj -> cam/world
-            T_object_to_world = T_cam_obj
+            obj_id = str(chosen["obj_id"])
+            T_base_obj = chosen["T_base_obj"]
 
-            cad_world = T_object_to_world.transform_points(self.cad_library[cad_ids[chosen]])
-            cluster_world = clusters[i]
-            c_err = float(np.linalg.norm(cad_world.mean(axis=0) - cluster_world.mean(axis=0)))
+            cad_base = T_base_obj.transform_points(self.cad_library[obj_id])
+            c_err = float(np.linalg.norm(cad_base.mean(axis=0) - cluster.mean(axis=0)))
             self.log.info("pose_sanity", cluster=i, centroid_err_m=c_err)
 
-            # confidences
-            id_conf = float(np.clip((margin - self.cfg.min_margin) / 2.0, 0.0, 1.0))
-            pose_conf = float(np.clip(1.0 - float(chosen_metrics["rms_nn"]) / self.cfg.max_rms_nn, 0.0, 1.0))
+            id_conf = float(np.clip((margin - float(self.cfg.min_margin)) / 2.0, 0.0, 1.0))
+            pose_conf = float(np.clip(1.0 - float(chosen["rms_nn"]) / float(self.cfg.max_rms_nn), 0.0, 1.0))
 
             out.append(
                 DetectedObject(
-                    object_id=cad_ids[chosen],
-                    point_cloud=clusters[i],
-                    T_object_to_world=T_object_to_world,
+                    object_id=obj_id,
+                    point_cloud=cluster,
+                    T_object_to_world=T_base_obj,
                     id_confidence=id_conf,
                     pose_confidence=pose_conf,
                     metrics={
                         "margin": float(margin),
-                        "score_icp_inlier_rmse": float(chosen_metrics.get("icp_inlier_rmse", np.nan)),
-                        **chosen_metrics,
+                        "rms_nn": float(chosen["rms_nn"]),
+                        "icp_fitness": float(chosen["icp_fitness"]),
+                        "icp_inlier_rmse": float(chosen["icp_rmse"]),
+                        **{k: float(v) for k, v in chosen["metrics"].items() if isinstance(v, (int, float, np.floating))},
                     },
                 )
             )
@@ -283,10 +485,10 @@ class GraspPerceptionPipeline:
             self.log.info(
                 "accept",
                 cluster=i,
-                obj=cad_ids[chosen],
-                nn_rms=float(chosen_metrics.get("rms_nn", np.nan)),
-                icp_rmse=float(chosen_metrics.get("icp_inlier_rmse", np.nan)),
-                fitness=float(chosen_metrics.get("icp_fitness", np.nan)),
+                obj=obj_id,
+                nn_rms=float(chosen["rms_nn"]),
+                icp_rmse=float(chosen["icp_rmse"]),
+                fitness=float(chosen["icp_fitness"]),
                 margin=float(margin),
             )
 

@@ -153,6 +153,7 @@ class MultiCamGrabber(Node):
         stamps = [self._depth_stamp_s[c.cam_id] for c in self.cameras]
         t_ref = max(stamps)
         max_dt = max(abs(t - t_ref) for t in stamps)
+        self.get_logger().info(f"depth stamps: {list(zip([c.cam_id for c in self.cameras], stamps))}")
 
         if max_dt > self.sync_slop_s and not self.use_best_effort_if_unsynced:
             self.get_logger().warn(f"unsynced set: max_dt={max_dt:.3f}s > slop={self.sync_slop_s:.3f}s")

@@ -1,50 +1,115 @@
 from __future__ import annotations
+
 import numpy as np
 import open3d as o3d
 
+
+def _pcd(points: np.ndarray) -> o3d.geometry.PointCloud:
+    p = o3d.geometry.PointCloud()
+    p.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=float))
+    return p
+
+
 def remove_plane_ransac(
     points: np.ndarray,
-    distance_threshold: float = 0.003,  # 3mm
+    distance_threshold: float = 0.003,
     ransac_n: int = 3,
     num_iterations: int = 2000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Removes the dominant plane via RANSAC.
-
-    Returns:
-      points_wo_plane: (K,3)
-      plane_points: (L,3)
-      plane_model: (4,) coefficients [a,b,c,d] for ax+by+cz+d=0
+    Dominant plane removal (kept for reference / fallback).
+    Returns: (wo_plane, plane_pts, plane_model[a,b,c,d])
     """
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-
+    pcd = _pcd(points)
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=distance_threshold,
         ransac_n=ransac_n,
         num_iterations=num_iterations,
     )
 
-    inlier_mask = np.zeros(len(points), dtype=bool)
-    inlier_mask[inliers] = True
-
-    plane_pts = points[inlier_mask]
-    wo_plane = points[~inlier_mask]
-
+    mask = np.zeros(len(points), dtype=bool)
+    mask[inliers] = True
+    plane_pts = points[mask]
+    wo_plane = points[~mask]
     return wo_plane, plane_pts, np.asarray(plane_model, dtype=float)
+
+
+def remove_horizontal_plane_ransac(
+    points: np.ndarray,
+    distance_threshold: float = 0.004,
+    ransac_n: int = 3,
+    num_iterations: int = 3000,
+    min_abs_nz: float = 0.93,      # tighter than before (~<=21deg tilt)
+    max_tries: int = 6,
+    min_inliers: int = 2000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Robustly find the *horizontal* supporting plane by extracting planes iteratively
+    and selecting one whose normal is close to vertical (|nz| >= min_abs_nz).
+
+    Returns: (wo_plane, plane_pts, plane_model_normalized)
+    where plane_model is normalized so signed distance has units of meters.
+    """
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must be (N,3), got {points.shape}")
+
+    remaining = points
+    remaining_idx = np.arange(points.shape[0])
+
+    for _ in range(max_tries):
+        if remaining.shape[0] < 500:
+            break
+
+        pcd = _pcd(remaining)
+        model, inliers = pcd.segment_plane(
+            distance_threshold=distance_threshold,
+            ransac_n=ransac_n,
+            num_iterations=num_iterations,
+        )
+
+        if len(inliers) < min_inliers:
+            keep = np.ones(remaining.shape[0], dtype=bool)
+            keep[inliers] = False
+            remaining = remaining[keep]
+            remaining_idx = remaining_idx[keep]
+            continue
+
+        a, b, c, d = [float(x) for x in model]
+        n = np.array([a, b, c], dtype=np.float64)
+        n_norm = np.linalg.norm(n) + 1e-12
+        n = n / n_norm
+        d = d / n_norm
+
+        if abs(n[2]) >= min_abs_nz:
+            # normalize model
+            plane_model = np.array([n[0], n[1], n[2], d], dtype=float)
+
+            mask = np.zeros(points.shape[0], dtype=bool)
+            mask[remaining_idx[inliers]] = True
+
+            plane_pts = points[mask]
+            wo_plane = points[~mask]
+            return wo_plane, plane_pts, plane_model
+
+        # remove this plane and continue
+        keep = np.ones(remaining.shape[0], dtype=bool)
+        keep[inliers] = False
+        remaining = remaining[keep]
+        remaining_idx = remaining_idx[keep]
+
+    # fallback
+    return remove_plane_ransac(points, distance_threshold, ransac_n, num_iterations)
+
 
 def cluster_dbscan(
     points: np.ndarray,
-    eps: float = 0.03,          # meters (start with 1 cm)
-    min_points: int = 20,
+    eps: float = 0.02,
+    min_points: int = 30,
 ) -> list[np.ndarray]:
-    """
-    DBSCAN clustering on a point cloud.
-    Returns list of clusters, each (Ni, 3).
-    """
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+    if points.size == 0:
+        return []
 
+    pcd = _pcd(points)
     labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
     if labels.size == 0:
         return []
@@ -52,28 +117,21 @@ def cluster_dbscan(
     clusters = []
     for lab in sorted(set(labels)):
         if lab == -1:
-            continue  # noise
-        cluster_pts = points[labels == lab]
-        clusters.append(cluster_pts)
+            continue
+        clusters.append(points[labels == lab])
 
-    # sort big-to-small
     clusters.sort(key=lambda c: c.shape[0], reverse=True)
     return clusters
 
 
 def merge_close_clusters(
     clusters: list[np.ndarray],
-    merge_dist: float = 0.05,   # 5 cm
-    z_overlap: float = 0.03,    # 3 cm overlap tolerance
+    merge_dist: float = 0.05,
+    z_overlap: float = 0.03,
 ) -> list[np.ndarray]:
-    """
-    Greedy merge of cluster fragments based on centroid distance + z overlap.
-    Helps when one physical object is split into multiple DBSCAN clusters.
-    """
     if len(clusters) <= 1:
         return clusters
 
-    # Precompute stats
     cents = [c.mean(axis=0) for c in clusters]
     zmins = [float(c[:, 2].min()) for c in clusters]
     zmaxs = [float(c[:, 2].max()) for c in clusters]
@@ -99,7 +157,6 @@ def merge_close_clusters(
                 if used[j]:
                     continue
                 d = float(np.linalg.norm(cents[j] - acc_cent))
-                # check z overlap-ish
                 overlap_ok = not (zmaxs[j] < acc_zmin - z_overlap or zmins[j] > acc_zmax + z_overlap)
                 if d < merge_dist and overlap_ok:
                     used[j] = True
