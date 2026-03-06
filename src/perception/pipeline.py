@@ -78,13 +78,13 @@ class PipelineConfig:
 
     # --- refinement inside the biggest cluster (zoom in) ---
     refine_on_largest_cluster: bool = True
-    refine_max_points: int = 60000          # safety cap
+    refine_max_points: int = 60000
     refine_plane2_distance_threshold: float = 0.0020
     refine_plane2_num_iterations: int = 2500
     refine_dbscan_eps: float = 0.014
     refine_dbscan_min_points: int = 50
 
-    # matching / gating
+    # ICP / matching
     voxel_size: float = 0.005
     enforce_one_to_one: bool = True
 
@@ -96,11 +96,34 @@ class PipelineConfig:
     min_icp_fitness: float = 0.05
     max_icp_inlier_rmse: float = 0.04
 
+    # --- NEW: CAD coverage scoring (fixes "cube fits to screw") ---
+    cad_cover_thresh: float = 0.012          # meters; ~1.2cm
+    min_cad_cover_ratio: float = 0.35        # require >=35% of CAD points explained
+
 
 def _pcd(pts: np.ndarray) -> o3d.geometry.PointCloud:
     p = o3d.geometry.PointCloud()
     p.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=float))
     return p
+
+def _snap_object_to_plane(
+    T_base_obj: SE3,
+    cad_obj: np.ndarray,
+    plane_n: np.ndarray,
+    plane_d: float,
+    clearance: float = 0.001,
+) -> SE3:
+    """
+    Shift object along plane normal so the CAD lowest point touches the plane (plus clearance).
+    plane equation: n^T x + d = 0, with n normalized.
+    """
+    n = plane_n / (np.linalg.norm(plane_n) + 1e-12)
+    cad_base = T_base_obj.transform_points(cad_obj)
+    h = cad_base @ n + float(plane_d)
+    h_min = float(h.min())
+    # want h_min == clearance
+    delta = (clearance - h_min) * n
+    return SE3(T_base_obj.R, T_base_obj.t + delta)
 
 
 def _remove_plane(
@@ -203,6 +226,25 @@ def _bbox_diag(pts: np.ndarray) -> float:
     return float(np.linalg.norm(ext))
 
 
+def _cad_coverage_metrics(cad_base: np.ndarray, cluster_base: np.ndarray, thresh: float) -> tuple[float, float, int]:
+    """
+    Compute how well the cluster explains the full CAD (coverage).
+    Returns (cover_ratio, cover_rmse, inlier_count) using CAD->cluster NN distances.
+    """
+    if len(cad_base) == 0 or len(cluster_base) == 0:
+        return 0.0, float("inf"), 0
+    cad_p = _pcd(cad_base)
+    clu_p = _pcd(cluster_base)
+    d = np.asarray(cad_p.compute_point_cloud_distance(clu_p), dtype=float)  # per CAD point
+    if d.size == 0 or (not np.isfinite(d).any()):
+        return 0.0, float("inf"), 0
+    inl = d < float(thresh)
+    ninl = int(np.count_nonzero(inl))
+    cover = float(ninl) / float(len(d))
+    rmse = float(np.sqrt(np.mean(d[inl] ** 2))) if ninl > 0 else float("inf")
+    return cover, rmse, ninl
+
+
 class GraspPerceptionPipeline:
     def __init__(
         self,
@@ -214,7 +256,6 @@ class GraspPerceptionPipeline:
         self.cfg = cfg or PipelineConfig()
         self.log = logger or Logger()
 
-        # precompute cad diags for “shape size prior”
         self._cad_diag: dict[str, float] = {}
         for k, pts in self.cad_library.items():
             self._cad_diag[k] = _bbox_diag(np.asarray(pts, dtype=float))
@@ -310,7 +351,7 @@ class GraspPerceptionPipeline:
         timings.append(StageTiming("clustering", perf_counter() - t0))
         self.log.info("clustering", n_clusters=len(clusters), sizes=[len(c) for c in clusters[:5]])
 
-        # --- 4.5) Refinement inside the largest cluster (THIS is your requested “zoomed in” segmentation)
+        # --- 4.5) Refinement inside the largest cluster
         if self.cfg.refine_on_largest_cluster and len(clusters) > 0:
             largest = max(clusters, key=lambda c: c.shape[0])
             self.log.info("refine_stage0", largest_n=len(largest))
@@ -342,13 +383,12 @@ class GraspPerceptionPipeline:
             )
             self.log.info("refine_clustering", n_clusters=len(clusters_ref), sizes=[len(c) for c in clusters_ref[:5]])
 
-            # Replace clusters if refinement produced anything
             if len(clusters_ref) > 0:
                 clusters = clusters_ref
 
         # --- 5) Identify + pose
         t0 = perf_counter()
-        objects = self._identify_and_pose(clusters)
+        objects = self._identify_and_pose(clusters, plane_model)        
         timings.append(StageTiming("identify_pose", perf_counter() - t0))
         self.log.info("identify_pose", n_objects=len(objects))
 
@@ -362,7 +402,7 @@ class GraspPerceptionPipeline:
             timings=timings,
         )
 
-    def _identify_and_pose(self, clusters: list[np.ndarray]) -> list[DetectedObject]:
+    def _identify_and_pose(self, clusters: list[np.ndarray], plane_model: np.ndarray) -> list[DetectedObject]:
         if len(clusters) == 0:
             return []
 
@@ -384,13 +424,21 @@ class GraspPerceptionPipeline:
                     voxel_size=float(self.cfg.voxel_size),
                 )
 
-                # similarity in object frame
+                # shape similarity (cluster -> obj frame)
                 T_obj_base = T_base_obj.inverse()
                 cluster_in_obj = T_obj_base.transform_points(cluster)
                 rms = nn_rms(cluster_in_obj, model)
 
                 fit = float(icp_metrics.get("icp_fitness", 0.0))
                 rmse = float(icp_metrics.get("icp_inlier_rmse", np.inf))
+
+                # --- NEW: coverage score (CAD -> cluster) ---
+                cad_base = T_base_obj.transform_points(model)
+                cover, cover_rmse, cover_n = _cad_coverage_metrics(
+                    cad_base=cad_base,
+                    cluster_base=cluster,
+                    thresh=float(self.cfg.cad_cover_thresh),
+                )
 
                 cand.append(
                     {
@@ -400,13 +448,24 @@ class GraspPerceptionPipeline:
                         "rms_nn": rms,
                         "icp_fitness": fit,
                         "icp_rmse": rmse,
+                        "cad_cover_ratio": float(cover),
+                        "cad_cover_rmse": float(cover_rmse),
+                        "cad_cover_n": int(cover_n),
                         "metrics": icp_metrics,
                     }
                 )
 
-            cand.sort(key=lambda c: float(c["rms_nn"]))
             if len(cand) == 0:
                 continue
+
+            # Prefer coverage (prevents tiny screw cluster from winning)
+            cand.sort(
+                key=lambda c: (
+                    -float(c["cad_cover_ratio"]),
+                    float(c["cad_cover_rmse"]),
+                    float(c["rms_nn"]),
+                )
+            )
 
             best = cand[0]
             second = cand[1] if len(cand) > 1 else None
@@ -414,10 +473,6 @@ class GraspPerceptionPipeline:
             nn_best = float(best["rms_nn"])
             nn_second = float(second["rms_nn"]) if second is not None else float("inf")
             margin = (nn_second / nn_best) if nn_best > 1e-12 else float("inf")
-
-            if margin < float(self.cfg.min_margin):
-                self.log.warn("reject_margin", cluster=i, margin=margin, min_margin=self.cfg.min_margin)
-                continue
 
             chosen = None
             for c in cand:
@@ -428,25 +483,35 @@ class GraspPerceptionPipeline:
                 rms = float(c["rms_nn"])
                 fit = float(c["icp_fitness"])
                 rmse = float(c["icp_rmse"])
+                cover = float(c["cad_cover_ratio"])
+
+                if cover < float(self.cfg.min_cad_cover_ratio):
+                    continue
 
                 if (not np.isfinite(rms)) or (rms > float(self.cfg.max_rms_nn)):
                     continue
 
+                # keep margin gate (still useful if you later add more CADs)
+                if margin < float(self.cfg.min_margin):
+                    continue
+
                 # Soft ICP gating: reject only if BOTH are bad
                 if (fit < float(self.cfg.min_icp_fitness)) and (rmse > float(self.cfg.max_icp_inlier_rmse)):
-                    # allow if rms is very good
-                    if rms > 0.5 * float(self.cfg.max_rms_nn):
+                    # allow if coverage is strong (common with partial views)
+                    if cover < (float(self.cfg.min_cad_cover_ratio) + 0.10):
                         continue
 
                 chosen = c
                 break
 
             if chosen is None:
-                top = cand[:3]
+                top = cand[:5]
                 self.log.warn(
                     "reject_cluster_no_candidate",
                     cluster=i,
                     top=[t["obj_id"] for t in top],
+                    top_cover=[float(t["cad_cover_ratio"]) for t in top],
+                    top_cover_rmse=[float(t["cad_cover_rmse"]) for t in top],
                     top_nn=[float(t["rms_nn"]) for t in top],
                     top_icp=[float(t["icp_rmse"]) for t in top],
                 )
@@ -457,13 +522,31 @@ class GraspPerceptionPipeline:
 
             obj_id = str(chosen["obj_id"])
             T_base_obj = chosen["T_base_obj"]
+                        # snap translation so object rests on plane (prevents penetration)
+            n = np.asarray(plane_model[:3], dtype=float)
+            d = float(plane_model[3])
+            T_base_obj = _snap_object_to_plane(
+                T_base_obj=T_base_obj,
+                cad_obj=self.cad_library[obj_id],
+                plane_n=n,
+                plane_d=d,
+                clearance=0.001,
+            )
 
             cad_base = T_base_obj.transform_points(self.cad_library[obj_id])
             c_err = float(np.linalg.norm(cad_base.mean(axis=0) - cluster.mean(axis=0)))
-            self.log.info("pose_sanity", cluster=i, centroid_err_m=c_err)
+            self.log.info(
+                "pose_sanity",
+                cluster=i,
+                centroid_err_m=c_err,
+                cad_cover=f"{float(chosen['cad_cover_ratio']):.3f}",
+                cad_cover_rmse=f"{float(chosen['cad_cover_rmse']):.3f}",
+                cad_cover_n=int(chosen["cad_cover_n"]),
+            )
 
             id_conf = float(np.clip((margin - float(self.cfg.min_margin)) / 2.0, 0.0, 1.0))
-            pose_conf = float(np.clip(1.0 - float(chosen["rms_nn"]) / float(self.cfg.max_rms_nn), 0.0, 1.0))
+            # confidence should strongly track coverage now
+            pose_conf = float(np.clip((float(chosen["cad_cover_ratio"]) - float(self.cfg.min_cad_cover_ratio)) / 0.40, 0.0, 1.0))
 
             out.append(
                 DetectedObject(
@@ -477,6 +560,10 @@ class GraspPerceptionPipeline:
                         "rms_nn": float(chosen["rms_nn"]),
                         "icp_fitness": float(chosen["icp_fitness"]),
                         "icp_inlier_rmse": float(chosen["icp_rmse"]),
+                        "cad_cover_ratio": float(chosen["cad_cover_ratio"]),
+                        "cad_cover_rmse": float(chosen["cad_cover_rmse"]),
+                        "cad_cover_n": float(chosen["cad_cover_n"]),
+                        "cad_cover_thresh": float(self.cfg.cad_cover_thresh),
                         **{k: float(v) for k, v in chosen["metrics"].items() if isinstance(v, (int, float, np.floating))},
                     },
                 )
@@ -486,10 +573,11 @@ class GraspPerceptionPipeline:
                 "accept",
                 cluster=i,
                 obj=obj_id,
+                cad_cover=float(chosen["cad_cover_ratio"]),
+                cad_cover_rmse=float(chosen["cad_cover_rmse"]),
                 nn_rms=float(chosen["rms_nn"]),
                 icp_rmse=float(chosen["icp_rmse"]),
                 fitness=float(chosen["icp_fitness"]),
-                margin=float(margin),
             )
 
         return out
