@@ -15,9 +15,9 @@ from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker
 
 from src.calibration.io_extrinsics import load_extrinsics_yaml
-from src.perception.pipeline import GraspPerceptionPipeline, PipelineConfig
-from src.perception.pipeline_multiview import MultiViewConfig, MultiViewRunner
-from src.perception.pose_icp import load_cad_as_pointcloud
+from src.perception.pipeline_fast import GraspPerceptionPipeline, PipelineConfig
+from src.perception.pipeline_multiview_fast import MultiViewConfig, MultiViewRunner
+from src.perception.pose_icp_fast import load_cad_as_pointcloud
 from src.perception.ros.multicam_grabber import CameraTopics, MultiCamGrabber
 
 
@@ -40,13 +40,13 @@ CAMERAS = [
 
 
 BASE_FRAME = "base"
-TIMER_PERIOD_S = 0.10  # aim for 10 Hz, busy-guarded
+TIMER_PERIOD_S = 0.10
 MIN_PROCESS_DT_S = 0.08
 PUBLISH_RGB = False
 RGB_PUBLISH_EVERY_N = 5
 PUBLISH_FUSED_CLOUD = True
-CLOUD_PUBLISH_EVERY_N = 2
-MAX_CLOUD_POINTS_PUBLISH = 25000
+CLOUD_PUBLISH_EVERY_N = 1
+MAX_CLOUD_POINTS_PUBLISH = 100000
 ENABLE_AABB_MARKERS = True
 ENABLE_CAD_MARKERS = True
 
@@ -59,7 +59,6 @@ FAST_QOS = QoSProfile(
 
 
 def _mat3_to_quat_xyzw(R: np.ndarray) -> Tuple[float, float, float, float]:
-    """Convert 3x3 rotation matrix to quaternion (x,y,z,w)."""
     m = np.asarray(R, dtype=float)
     tr = m[0, 0] + m[1, 1] + m[2, 2]
     if tr > 0.0:
@@ -167,18 +166,6 @@ def _try_get_view_stamp_ns(view: Any) -> Optional[int]:
 
 
 class LiveMultiViewDebug(Node):
-    """
-    Faster ROS node for the live multi-view pipeline.
-
-    Main speed changes in this file:
-      - much more aggressive internal downsampling config
-      - skip re-entrant processing if previous tick is still running
-      - skip processing when frames did not change
-      - throttle / disable RGB publication
-      - throttle cloud publication and decimate cloud before PointCloud2 packing
-      - use best-effort keep-last-1 publishers to reduce ROS transport pressure
-    """
-
     def __init__(self, grabber: MultiCamGrabber):
         super().__init__("live_multiview_debug")
         self.grabber = grabber
@@ -199,23 +186,27 @@ class LiveMultiViewDebug(Node):
 
         pipe_cfg = PipelineConfig(
             plane_distance_threshold=0.004,
+            expected_num_objects=3,
             dbscan_eps=0.035,
             dbscan_min_points=25,
-            voxel_size=0.010,
+            voxel_size=0.005,
             max_rms_nn=0.020,
             min_margin=1.2,
+            accept_icp_rmse_max=0.015,
+            accept_icp_fitness_min=0.15,
+            accept_cluster_points_min=120,
         )
         pipe = GraspPerceptionPipeline(cad_library=self.cad_library, cfg=pipe_cfg)
 
         mv_cfg = MultiViewConfig(
-            voxel_size_fusion=0.012,
+            voxel_size_fusion=0.005,
             stride=4,
             zmin=0.30,
             zmax=1.05,
-            roi_x_min=-0.30,
-            roi_x_max=0.45,
-            roi_y_min=-0.30,
-            roi_y_max=0.45,
+            roi_x_min=-0.15,
+            roi_x_max=0.30,
+            roi_y_min=-0.15,
+            roi_y_max=0.30,
             roi_z_min=0.30,
             roi_z_max=1.05,
         )
@@ -233,7 +224,7 @@ class LiveMultiViewDebug(Node):
 
         self.timer = self.create_timer(TIMER_PERIOD_S, self._tick)
 
-        self.get_logger().info("LiveMultiViewDebug started (optimized version)")
+        self.get_logger().info("LiveMultiViewDebug started (fast version)")
         self.get_logger().info(f"[CAD] cube extents (marker scale) = {self.cube_size_xyz}")
         self.get_logger().info(
             f"[CFG] stride={mv_cfg.stride} voxel_fusion={mv_cfg.voxel_size_fusion:.3f} "
@@ -318,12 +309,7 @@ class LiveMultiViewDebug(Node):
             pub.publish(_rgb_numpy_to_imgmsg(v.rgb, frame_id=v.cam_id, stamp=stamp))
 
     def _select_cloud_to_publish(self, result: Any) -> Optional[np.ndarray]:
-        for attr in (
-            "points_world",
-            "points_world_fused",
-            "points_world_roi",
-            "points_world_raw",
-        ):
+        for attr in ("debug_points_world_raw", "points_world_raw", "points_world_roi", "points_world"):
             pts = getattr(result, attr, None)
             if pts is not None:
                 return pts
@@ -412,12 +398,24 @@ class LiveMultiViewDebug(Node):
 
             self._maybe_publish_rgb(views, stamp)
 
+            t_run0 = time.perf_counter()
             result = self.runner.run(views)
+            t_run1 = time.perf_counter()
+
             self._last_result = result
             self._last_views_signature = signature
             self._last_process_wall_t = time.perf_counter()
 
+            t_pub0 = time.perf_counter()
             self._publish_result(result, stamp)
+            t_pub1 = time.perf_counter()
+
+            self.get_logger().info(
+                f"[TIMING run_multiview_ros_fast] "
+                f"runner.run={(t_run1 - t_run0) * 1000:.1f} ms | "
+                f"publish={(t_pub1 - t_pub0) * 1000:.1f} ms | "
+                f"total={(t_pub1 - t0) * 1000:.1f} ms"
+            )
 
             if self._frame % 10 == 0:
                 pts = self._select_cloud_to_publish(result)
