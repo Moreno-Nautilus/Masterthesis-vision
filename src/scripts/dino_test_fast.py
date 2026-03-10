@@ -96,21 +96,15 @@ def _reject_border_masks(
     masks,
     image_h,
     image_w,
-    border_px=6,
-    max_border_fraction=0.08,
+    border_px=8,
+    max_border_fraction=0.04,
 ):
-    """
-    Reject masks that touch the image border too much.
-    Table/background masks usually extend to image edges.
-    """
-
     filtered = []
 
     for cand in masks:
         mask = cand.mask
 
         border = np.zeros_like(mask, dtype=bool)
-
         border[:border_px, :] = True
         border[-border_px:, :] = True
         border[:, :border_px] = True
@@ -123,7 +117,6 @@ def _reject_border_masks(
             continue
 
         frac = border_overlap / float(mask_area)
-
         if frac > max_border_fraction:
             continue
 
@@ -131,48 +124,32 @@ def _reject_border_masks(
 
     return filtered
 
-def _rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
-    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
-    msg = Image()
-    msg.header = Header(frame_id=frame_id, stamp=stamp)
-    msg.height = int(rgb.shape[0])
-    msg.width = int(rgb.shape[1])
-    msg.encoding = "rgb8"
-    msg.is_bigendian = False
-    msg.step = int(rgb.shape[1] * 3)
-    msg.data = rgb.tobytes()
-    return msg
 
 def _reject_large_masks(
-        masks,
-        image_h,
-        image_w,
-        max_mask_area_ratio=0.25,
-        max_bbox_area_ratio=0.30,
-    ):
-        """
-        Remove masks that are too large relative to the image.
-        These are usually table/background segments.
-        """
+    masks,
+    image_h,
+    image_w,
+    max_mask_area_ratio=0.14,
+    max_bbox_area_ratio=0.18,
+):
+    image_area = float(image_h * image_w)
+    filtered = []
 
-        image_area = float(image_h * image_w)
-        filtered = []
+    for cand in masks:
+        x0, y0, x1, y1 = cand.bbox_xyxy
+        bbox_area = float((x1 - x0) * (y1 - y0))
+        mask_area = float(cand.area)
 
-        for cand in masks:
-            x0, y0, x1, y1 = cand.bbox_xyxy
+        if mask_area / image_area > max_mask_area_ratio:
+            continue
 
-            bbox_area = float((x1 - x0) * (y1 - y0))
-            mask_area = float(cand.area)
+        if bbox_area / image_area > max_bbox_area_ratio:
+            continue
 
-            if mask_area / image_area > max_mask_area_ratio:
-                continue
+        filtered.append(cand)
 
-            if bbox_area / image_area > max_bbox_area_ratio:
-                continue
+    return filtered
 
-            filtered.append(cand)
-
-        return filtered
 
 def _draw_mask_overlay(
     rgb: np.ndarray,
@@ -185,6 +162,19 @@ def _draw_mask_overlay(
     mask3 = mask.astype(bool)[..., None]
     blended = ((1.0 - alpha) * out + alpha * color_arr).astype(np.uint8)
     return np.where(mask3, blended, out)
+
+
+def _rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+    msg = Image()
+    msg.header = Header(frame_id=frame_id, stamp=stamp)
+    msg.height = int(rgb.shape[0])
+    msg.width = int(rgb.shape[1])
+    msg.encoding = "rgb8"
+    msg.is_bigendian = False
+    msg.step = int(rgb.shape[1] * 3)
+    msg.data = rgb.tobytes()
+    return msg
 
 
 def _try_get_view_stamp_ns(view: Any) -> Optional[int]:
@@ -211,6 +201,87 @@ def _try_get_view_stamp_ns(view: Any) -> Optional[int]:
         if isinstance(value, float):
             return int(value * 1e9)
     return None
+
+
+def _resize_keep_aspect_by_width(
+    rgb: np.ndarray,
+    target_w: int,
+) -> Tuple[np.ndarray, float]:
+    h, w = rgb.shape[:2]
+    if w <= 0:
+        return rgb, 1.0
+    if w == target_w:
+        return rgb, 1.0
+
+    scale = float(target_w) / float(w)
+    new_h = max(1, int(round(h * scale)))
+    rgb_small = cv2.resize(rgb, (target_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return rgb_small, scale
+
+
+def _scale_mask_to_fullres(mask_small: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    mask_u8 = (mask_small.astype(np.uint8) * 255)
+    mask_full = cv2.resize(mask_u8, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+    return mask_full > 0
+
+
+def _scale_bbox_xyxy(
+    bbox_xyxy: Tuple[int, int, int, int],
+    inv_scale: float,
+) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox_xyxy
+    return (
+        int(round(x0 * inv_scale)),
+        int(round(y0 * inv_scale)),
+        int(round(x1 * inv_scale)),
+        int(round(y1 * inv_scale)),
+    )
+
+
+def _crop_rgb_with_roi(rgb: np.ndarray, roi_xyxy: Tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, y1 = roi_xyxy
+    return rgb[y0:y1, x0:x1].copy()
+
+
+def _shift_bbox_xyxy(
+    bbox_xyxy: Tuple[int, int, int, int],
+    dx: int,
+    dy: int,
+) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox_xyxy
+    return (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+
+
+def _paste_roi_mask_into_full(
+    roi_mask: np.ndarray,
+    full_h: int,
+    full_w: int,
+    roi_xyxy: Tuple[int, int, int, int],
+) -> np.ndarray:
+    x0, y0, x1, y1 = roi_xyxy
+    full = np.zeros((full_h, full_w), dtype=bool)
+    full[y0:y1, x0:x1] = roi_mask
+    return full
+
+
+def _roi_from_relative(
+    image_h: int,
+    image_w: int,
+    rel_roi: Tuple[float, float, float, float],
+) -> Tuple[int, int, int, int]:
+    rx0, ry0, rx1, ry1 = rel_roi
+
+    x0 = int(round(rx0 * image_w))
+    y0 = int(round(ry0 * image_h))
+    x1 = int(round(rx1 * image_w))
+    y1 = int(round(ry1 * image_h))
+
+    x0 = max(0, min(x0, image_w - 1))
+    y0 = max(0, min(y0, image_h - 1))
+    x1 = max(x0 + 1, min(x1, image_w))
+    y1 = max(y0 + 1, min(y1, image_h))
+
+    return (x0, y0, x1, y1)
 
 
 class DINODebugNode(Node):
@@ -261,6 +332,27 @@ class DINODebugNode(Node):
             (128, 0, 255),
         ]
 
+        # speed knobs
+        self.sam_input_width = 640
+        self.max_masks_early = 10
+        self.max_masks_for_dino = 4
+        self.max_masks_for_sam_vis = 8
+
+        # run SAM only every N live ticks per camera
+        self.sam_every_n_ticks = 4
+
+        # per-camera relative ROIs: (x0_rel, y0_rel, x1_rel, y1_rel)
+        # tune these in Foxglove after you see the rectangle overlay
+        self.relative_roi_by_cam: Dict[str, Tuple[float, float, float, float]] = {
+            "zed2i_1": (0.05, 0.05, 0.9, 0.9),
+            "zed2i_2": (0.05, 0.05, 0.9, 0.9),
+        }
+
+        # per-camera live tick counters and cached visual outputs
+        self._live_tick_by_cam: Dict[str, int] = {}
+        self._cache_overlay_by_cam: Dict[str, np.ndarray] = {}
+        self._cache_sam_vis_by_cam: Dict[str, np.ndarray] = {}
+
         self.dino = DINOIdentifier(
             DINOIdentifierConfig(
                 model_name="dinov2_vitb14",
@@ -278,13 +370,28 @@ class DINODebugNode(Node):
                     repo_root="external/sam2",
                     checkpoint="external/sam2/checkpoints/sam2.1_hiera_base_plus.pt",
                     model_cfg="configs/sam2.1/sam2.1_hiera_b+.yaml",
-                    max_image_side=1024,
+                    max_image_side=640,
                     min_mask_area=300,
                     min_bbox_side_px=8,
                     attach_rgb_crops=False,
                 )
             )
+
+            try:
+                if hasattr(self.sam, "config") and hasattr(self.sam.config, "auto_points_per_side"):
+                    self.sam.config.auto_points_per_side = 10
+                if hasattr(self.sam, "auto_points_per_side"):
+                    self.sam.auto_points_per_side = 10
+            except Exception:
+                pass
+
             self.get_logger().info("SAM enabled for proposal generation")
+            self.get_logger().info(
+                f"SAM config: sam_input_width={self.sam_input_width}, "
+                f"max_masks_early={self.max_masks_early}, "
+                f"max_masks_for_dino={self.max_masks_for_dino}, "
+                f"sam_every_n_ticks={self.sam_every_n_ticks}"
+            )
 
         self._last_views_signature = None
         self._busy = False
@@ -323,14 +430,53 @@ class DINODebugNode(Node):
 
         best_obj, best_score = sorted_scores[0]
         second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else -1.0
-        margin = best_score - second_score
 
-        if best_score < 0.6:  # or margin < 0.05:
+        if best_score < 0.6:
             label = "unknown"
         else:
             label = best_obj
 
         return label, best_score, scores
+
+    def _get_roi_xyxy(self, rgb: np.ndarray, cam_id: str) -> Tuple[int, int, int, int]:
+        h, w = rgb.shape[:2]
+        rel_roi = self.relative_roi_by_cam.get(cam_id, (0.0, 0.0, 1.0, 1.0))
+        return _roi_from_relative(h, w, rel_roi)
+
+    def _draw_roi_box(
+        self,
+        rgb: np.ndarray,
+        roi_xyxy: Tuple[int, int, int, int],
+        cam_id: str,
+        color: Tuple[int, int, int] = (255, 255, 255),
+    ) -> np.ndarray:
+        vis = rgb.copy()
+        x0, y0, x1, y1 = roi_xyxy
+
+        cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
+
+        label = f"ROI {cam_id}"
+        (tw, th), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            2,
+        )
+        box_y0 = max(0, y0 - th - baseline - 8)
+        box_y1 = y0
+        box_x1 = min(vis.shape[1], x0 + tw + 12)
+        cv2.rectangle(vis, (x0, box_y0), (box_x1, box_y1), color, -1)
+        cv2.putText(
+            vis,
+            label,
+            (x0 + 6, box_y1 - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        return vis
 
     def _draw_whole_image_label(self, rgb: np.ndarray, label: str, score: float) -> np.ndarray:
         vis = rgb.copy()
@@ -370,29 +516,19 @@ class DINODebugNode(Node):
             )
         return vis
 
-    def _draw_sam_dino(self, rgb: np.ndarray, masks) -> np.ndarray:
+    def _draw_sam_dino_preds(self, rgb: np.ndarray, preds: List[Dict[str, Any]]) -> np.ndarray:
         vis = rgb.copy()
-        for i, cand in enumerate(masks):
-            color = self.palette[i % len(self.palette)]
-            x0, y0, x1, y1 = cand.bbox_xyxy
-
-            crop = _masked_tight_crop(rgb, cand.mask)
-            if crop is None or crop.size == 0:
+        for j, pred in enumerate(preds):
+            if pred["obj_id"] == "unknown":
                 continue
 
-            try:
-                obj_id, score, _ = self._classify_single_crop(crop)
+            color = self.palette[j % len(self.palette)]
+            x0, y0, x1, y1 = pred["bbox_xyxy"]
 
-            except Exception as e:
-                self.get_logger().warn(f"DINO classify failed on mask {i}: {e}")
-                continue
-
-            if obj_id == "unknown":
-                continue
-
-            vis = _draw_mask_overlay(vis, cand.mask, color, alpha=0.22)
+            vis = _draw_mask_overlay(vis, pred["mask"], color, alpha=0.22)
             cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
-            txt = f"{obj_id} {score:.2f}"
+
+            txt = f'{pred["obj_id"]} {pred["score"]:.2f}'
             cv2.putText(
                 vis,
                 txt,
@@ -404,6 +540,83 @@ class DINODebugNode(Node):
                 cv2.LINE_AA,
             )
         return vis
+
+    def _generate_sam_candidates_in_roi(
+        self,
+        rgb: np.ndarray,
+        cam_id: str,
+    ):
+        if self.sam is None:
+            return []
+
+        h_full, w_full = rgb.shape[:2]
+        roi_xyxy = self._get_roi_xyxy(rgb, cam_id)
+        x0_roi, y0_roi, x1_roi, y1_roi = roi_xyxy
+
+        rgb_roi = _crop_rgb_with_roi(rgb, roi_xyxy)
+        if rgb_roi.size == 0:
+            return []
+
+        h_roi, w_roi = rgb_roi.shape[:2]
+
+        rgb_small, scale = _resize_keep_aspect_by_width(rgb_roi, target_w=self.sam_input_width)
+        inv_scale = 1.0 / scale
+
+        masks_small = self.sam.generate_auto(rgb_small)
+        masks_small = masks_small[: self.max_masks_early]
+
+        masks = []
+        for cand in masks_small:
+            try:
+                roi_mask = _scale_mask_to_fullres(cand.mask, h_roi, w_roi)
+                full_mask = _paste_roi_mask_into_full(roi_mask, h_full, w_full, roi_xyxy)
+
+                bbox_roi = _scale_bbox_xyxy(cand.bbox_xyxy, inv_scale)
+                bbox_full = _shift_bbox_xyxy(bbox_roi, x0_roi, y0_roi)
+
+                cand.mask = full_mask
+                cand.bbox_xyxy = bbox_full
+                cand.area = int(full_mask.sum())
+            except Exception:
+                continue
+            masks.append(cand)
+
+        masks = _reject_large_masks(masks, h_full, w_full)
+        masks = _reject_border_masks(masks, h_full, w_full)
+        return masks
+
+    def _predict_mask_labels(
+        self,
+        rgb: np.ndarray,
+        masks,
+        max_masks: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        preds: List[Dict[str, Any]] = []
+        max_masks = self.max_masks_for_dino if max_masks is None else max_masks
+
+        for i, cand in enumerate(masks[:max_masks]):
+            crop = _masked_tight_crop(rgb, cand.mask)
+            if crop is None or crop.size == 0:
+                continue
+
+            try:
+                obj_id, score, scores = self._classify_single_crop(crop)
+            except Exception as e:
+                self.get_logger().warn(f"DINO classify failed on mask {i}: {e}")
+                continue
+
+            preds.append(
+                {
+                    "index": i,
+                    "mask": cand.mask,
+                    "bbox_xyxy": cand.bbox_xyxy,
+                    "obj_id": obj_id,
+                    "score": score,
+                    "scores": scores,
+                }
+            )
+
+        return preds
 
     def _publish_pair(
         self,
@@ -439,6 +652,7 @@ class DINODebugNode(Node):
         if self._busy:
             return
         self._busy = True
+
         try:
             img_path = self.image_paths[self._index]
             bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
@@ -448,21 +662,28 @@ class DINODebugNode(Node):
                 return
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            cam_id = "zed2i_1"
+            roi_xyxy = self._get_roi_xyxy(rgb, cam_id)
 
             if self.use_sam and self.sam is not None:
                 t0 = time.perf_counter()
-                masks = self.sam.generate_auto(rgb)
-                h, w = rgb.shape[:2]
-                masks = _reject_large_masks(masks, h, w)
-                masks = _reject_border_masks(masks, h, w)
-
+                masks = self._generate_sam_candidates_in_roi(rgb, cam_id=cam_id)
                 t1 = time.perf_counter()
 
-                masks_vis = self._draw_sam_only(rgb, masks[:15])
-                overlay = self._draw_sam_dino(rgb, masks[:15])
+                preds = self._predict_mask_labels(rgb, masks, max_masks=self.max_masks_for_dino)
+                t2 = time.perf_counter()
+
+                masks_vis = self._draw_sam_only(rgb, masks[: self.max_masks_for_sam_vis])
+                overlay = self._draw_sam_dino_preds(rgb, preds)
+
+                masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
+                overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
 
                 self.get_logger().info(
-                    f"[images] {img_path.name} masks={len(masks)} sam={(t1 - t0) * 1000:.1f} ms"
+                    f"[images] {img_path.name} masks={len(masks)} preds={len(preds)} "
+                    f"sam={(t1 - t0) * 1000:.1f} ms "
+                    f"dino={(t2 - t1) * 1000:.1f} ms "
+                    f"total={(t2 - t0) * 1000:.1f} ms"
                 )
             else:
                 t0 = time.perf_counter()
@@ -472,19 +693,22 @@ class DINODebugNode(Node):
                 overlay = self._draw_whole_image_label(rgb, obj_id, score)
                 masks_vis = rgb.copy()
 
+                masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
+                overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+
                 self.get_logger().info(
                     f"[images] {img_path.name} pred={obj_id} score={score:.3f} "
                     f"dino={(t1 - t0) * 1000:.1f} ms all={scores_by_object}"
                 )
 
             self._publish_pair(
-                cam_id="zed2i_1",
+                cam_id=cam_id,
                 rgb=rgb,
                 overlay=overlay,
                 frame_id="image_mode",
             )
             self._publish_sam_masks(
-                cam_id="zed2i_1",
+                cam_id=cam_id,
                 sam_vis=masks_vis,
                 frame_id="image_mode",
             )
@@ -526,23 +750,53 @@ class DINODebugNode(Node):
                     continue
 
                 frame_id = cam_id
+                roi_xyxy = self._get_roi_xyxy(rgb, cam_id)
 
                 if self.use_sam and self.sam is not None:
-                    t0 = time.perf_counter()
-                    masks = self.sam.generate_auto(rgb)
-                    h, w = rgb.shape[:2]
-                    masks = _reject_large_masks(masks, h, w)
-                    masks = _reject_border_masks(masks, h, w)
+                    tick = self._live_tick_by_cam.get(cam_id, 0) + 1
+                    self._live_tick_by_cam[cam_id] = tick
 
-                    t1 = time.perf_counter()
-
-                    masks_vis = self._draw_sam_only(rgb, masks[:15])
-                    overlay = self._draw_sam_dino(rgb, masks[:15])
-
-                    self.get_logger().info(
-                        f"[live:{cam_id}] masks={len(masks)} "
-                        f"sam={(t1 - t0) * 1000:.1f} ms"
+                    should_run_sam = (
+                        cam_id not in self._cache_overlay_by_cam
+                        or cam_id not in self._cache_sam_vis_by_cam
+                        or (tick % self.sam_every_n_ticks == 0)
                     )
+
+                    if should_run_sam:
+                        t0 = time.perf_counter()
+                        masks = self._generate_sam_candidates_in_roi(rgb, cam_id=cam_id)
+                        t1 = time.perf_counter()
+
+                        preds = self._predict_mask_labels(rgb, masks, max_masks=self.max_masks_for_dino)
+                        t2 = time.perf_counter()
+
+                        masks_vis = self._draw_sam_only(rgb, masks[: self.max_masks_for_sam_vis])
+                        overlay = self._draw_sam_dino_preds(rgb, preds)
+
+                        masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
+                        overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+
+                        self._cache_overlay_by_cam[cam_id] = overlay
+                        self._cache_sam_vis_by_cam[cam_id] = masks_vis
+
+                        self.get_logger().info(
+                            f"[live:{cam_id}] tick={tick} ran_sam=1 masks={len(masks)} preds={len(preds)} "
+                            f"sam={(t1 - t0) * 1000:.1f} ms "
+                            f"dino={(t2 - t1) * 1000:.1f} ms "
+                            f"total={(t2 - t0) * 1000:.1f} ms"
+                        )
+                    else:
+                        overlay = self._cache_overlay_by_cam[cam_id].copy()
+                        masks_vis = self._cache_sam_vis_by_cam[cam_id].copy()
+
+                        # redraw current ROI on cached images just in case ROI changes while tuning
+                        overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+                        masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
+
+                        self.get_logger().info(
+                            f"[live:{cam_id}] tick={tick} ran_sam=0 reused_cached=1"
+                        )
+
                 else:
                     t0 = time.perf_counter()
                     obj_id, score, scores_by_object = self._classify_single_crop(rgb)
@@ -550,6 +804,9 @@ class DINODebugNode(Node):
 
                     overlay = self._draw_whole_image_label(rgb, obj_id, score)
                     masks_vis = rgb.copy()
+
+                    overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+                    masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
 
                     self.get_logger().info(
                         f"[live:{cam_id}] pred={obj_id} score={score:.3f} "

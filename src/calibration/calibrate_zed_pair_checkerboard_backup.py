@@ -10,6 +10,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 import yaml
+
 import cv2
 
 from src.utils.se3 import SE3
@@ -25,9 +26,10 @@ CAM2_RGB = "/zed2i_2/zed_node/rgb/color/rect/image"
 CAM1_INFO = "/zed2i_1/zed_node/rgb/color/rect/camera_info"
 CAM2_INFO = "/zed2i_2/zed_node/rgb/color/rect/camera_info"
 
+# Checkerboard: inner corners (columns, rows)
 CHESS_COLS = 8
 CHESS_ROWS = 11
-SQUARE_SIZE_M = 0.03
+SQUARE_SIZE_M = 0.03  # 30 mm
 
 SYNC_SLOP_S = 0.05
 OUT_YAML = "config/camera_extrinsics.yaml"
@@ -43,9 +45,11 @@ def _K_from_camerainfo(msg: CameraInfo) -> np.ndarray:
 
 
 def _img_to_numpy_color(msg: Image) -> np.ndarray:
+    """Convert ROS Image -> np.uint8 HxWx3 (BGR) without cv_bridge."""
     h, w = int(msg.height), int(msg.width)
     enc = msg.encoding.lower()
 
+    # Map encodings we might see from ZED
     if enc in ("rgb8", "bgr8"):
         channels = 3
     elif enc in ("bgra8", "rgba8"):
@@ -55,26 +59,33 @@ def _img_to_numpy_color(msg: Image) -> np.ndarray:
 
     data = np.frombuffer(msg.data, dtype=np.uint8)
 
+    # handle row stride
     step = int(msg.step)
     row_bytes = w * channels
     if step == row_bytes:
         img = data.reshape(h, w, channels)
     else:
+        # padded rows
         img = np.zeros((h, w, channels), dtype=np.uint8)
         for r in range(h):
             start = r * step
-            img[r] = data[start:start + row_bytes].reshape(w, channels)
+            img[r] = data[start : start + row_bytes].reshape(w, channels)
 
     if channels == 4:
-        img = img[:, :, :3]
+        img = img[:, :, :3]  # drop alpha
 
+    # Convert to BGR for OpenCV
     if enc.startswith("rgb"):
-        img = img[:, :, ::-1].copy()
+        img = img[:, :, ::-1].copy()  # RGB -> BGR
+    # else already BGR/BGRA
 
     return img
 
 
 def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarray]:
+    """
+    Returns (T_cam_board, corners_img Nx2)
+    """
     pattern_size = (CHESS_COLS, CHESS_ROWS)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -84,13 +95,16 @@ def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarr
     if not ok or corners is None:
         raise RuntimeError("Chessboard NOT found")
 
+    # refine
     term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-4)
     corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), term)
 
+    # Object points in board frame
     objp = np.zeros((CHESS_ROWS * CHESS_COLS, 3), dtype=np.float32)
     grid = np.mgrid[0:CHESS_COLS, 0:CHESS_ROWS].T.reshape(-1, 2).astype(np.float32)
     objp[:, :2] = grid * float(SQUARE_SIZE_M)
 
+    # Distortion is 0 in your CameraInfo, pass zeros
     dist = np.zeros((8, 1), dtype=np.float64)
 
     ok, rvec, tvec = cv2.solvePnP(objp, corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
@@ -101,25 +115,6 @@ def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarr
     t = tvec.reshape(3,)
 
     return SE3(R, t), corners.reshape(-1, 2)
-
-
-def _roi_from_corners(
-    corners: np.ndarray,
-    img_shape: tuple[int, int, int],
-    pad_x: int = 260,
-    pad_y_top: int = 120,
-    pad_y_bottom: int = 260,
-) -> dict[str, int]:
-    h, w = img_shape[:2]
-    xs = corners[:, 0]
-    ys = corners[:, 1]
-
-    x0 = max(0, int(np.floor(xs.min())) - pad_x)
-    x1 = min(w, int(np.ceil(xs.max())) + pad_x)
-    y0 = max(0, int(np.floor(ys.min())) - pad_y_top)
-    y1 = min(h, int(np.ceil(ys.max())) + pad_y_bottom)
-
-    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
 
 
 @dataclass
@@ -192,30 +187,29 @@ def main() -> None:
 
     print("Finding checkerboard in cam1...")
     T_cam1_board, corners1 = _solve_board_pose(img1, K1)
+    # --- compute table plane in base frame (cam1 frame) ---
 
-    print("Finding checkerboard in cam2...")
-    T_cam2_board, corners2 = _solve_board_pose(img2, K2)
+    # board normal in board frame
+    n_board = np.array([0.0, 0.0, 1.0])
 
-    n_board = np.array([0.0, 0.0, 1.0], dtype=float)
+    # rotate into cam1/base frame
     n_base = T_cam1_board.R @ n_board
-    n_base = n_base / (np.linalg.norm(n_base) + 1e-12)
-    if n_base[2] < 0.0:
-        n_base = -n_base
 
+    # point on plane
     p_base = T_cam1_board.t
+
+    # plane equation: n·x + d = 0
     d = -float(n_base @ p_base)
 
     table_plane = {
         "frame": "base",
         "normal": n_base.tolist(),
-        "d": float(d),
+        "d": float(d)
     }
+    print("Finding checkerboard in cam2...")
+    T_cam2_board, corners2 = _solve_board_pose(img2, K2)
 
-    roi_data = {
-        CAM1: _roi_from_corners(corners1, img1.shape),
-        CAM2: _roi_from_corners(corners2, img2.shape),
-    }
-
+    # Compute T_cam1_cam2 = T_cam1_board @ inv(T_cam2_board)
     T_cam1_cam2 = T_cam1_board @ T_cam2_board.inverse()
 
     print("\n=== RESULTS ===")
@@ -225,8 +219,8 @@ def main() -> None:
     print("R det:", np.linalg.det(T_cam1_cam2.R), "valid:", T_cam1_cam2.is_valid())
 
     out = {
-        CAM1: SE3.identity(),
-        CAM2: T_cam1_cam2,
+        CAM1: SE3.identity(),    # base = cam1 optical
+        CAM2: T_cam1_cam2,       # cam2 -> cam1
     }
 
     out_path = Path(OUT_YAML)
@@ -235,15 +229,19 @@ def main() -> None:
         backup.write_text(out_path.read_text())
         print(f"Backed up existing YAML to: {backup}")
 
+    n_base = T_cam1_board.R @ n_board
+    n_base = n_base / (np.linalg.norm(n_base) + 1e-12)
+
+    if n_base[2] < 0.0:
+        n_base = -n_base
+
+    d = -float(n_base @ p_base)
+    
     table_yaml = Path("config/table_plane.yaml")
     with open(table_yaml, "w") as f:
-        yaml.safe_dump(table_plane, f, sort_keys=False)
-    print("Saved table plane to:", table_yaml)
+        yaml.dump(table_plane, f)
 
-    roi_yaml = Path("config/table_roi.yaml")
-    with open(roi_yaml, "w") as f:
-        yaml.safe_dump(roi_data, f, sort_keys=False)
-    print("Saved table ROI to:", roi_yaml)
+    print("Saved table plane to:", table_yaml)
 
     save_extrinsics_yaml(out_path, out)
     print(f"\nWrote extrinsics to: {out_path}")

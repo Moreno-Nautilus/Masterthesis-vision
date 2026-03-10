@@ -44,93 +44,6 @@ CAMERAS = [
 ]
 
 
-def _bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0 or len(ys) == 0:
-        return (0, 0, 0, 0)
-    x0 = int(xs.min())
-    y0 = int(ys.min())
-    x1 = int(xs.max()) + 1
-    y1 = int(ys.max()) + 1
-    return (x0, y0, x1, y1)
-
-
-def _masked_tight_crop(
-    rgb: np.ndarray,
-    mask: np.ndarray,
-    pad: int = 4,
-    min_side_after_resize: int = 96,
-) -> Optional[np.ndarray]:
-    if mask is None or not np.any(mask):
-        return None
-
-    x0, y0, x1, y1 = _bbox_from_mask(mask)
-    h_img, w_img = mask.shape
-
-    x0 = max(0, x0 - pad)
-    y0 = max(0, y0 - pad)
-    x1 = min(w_img, x1 + pad)
-    y1 = min(h_img, y1 + pad)
-
-    crop = rgb[y0:y1, x0:x1].copy()
-    crop_mask = mask[y0:y1, x0:x1]
-
-    if crop.size == 0 or not np.any(crop_mask):
-        return None
-
-    out = np.zeros_like(crop)
-    out[crop_mask] = crop[crop_mask]
-
-    h, w = out.shape[:2]
-    min_side = min(h, w)
-    if min_side > 0 and min_side < min_side_after_resize:
-        scale = float(min_side_after_resize) / float(min_side)
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        out = cv2.resize(out, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-    return np.ascontiguousarray(out)
-
-
-def _reject_border_masks(
-    masks,
-    image_h,
-    image_w,
-    border_px=6,
-    max_border_fraction=0.08,
-):
-    """
-    Reject masks that touch the image border too much.
-    Table/background masks usually extend to image edges.
-    """
-
-    filtered = []
-
-    for cand in masks:
-        mask = cand.mask
-
-        border = np.zeros_like(mask, dtype=bool)
-
-        border[:border_px, :] = True
-        border[-border_px:, :] = True
-        border[:, :border_px] = True
-        border[:, -border_px:] = True
-
-        border_overlap = np.logical_and(mask, border).sum()
-        mask_area = mask.sum()
-
-        if mask_area == 0:
-            continue
-
-        frac = border_overlap / float(mask_area)
-
-        if frac > max_border_fraction:
-            continue
-
-        filtered.append(cand)
-
-    return filtered
-
 def _rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
     rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
     msg = Image()
@@ -143,36 +56,6 @@ def _rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
     msg.data = rgb.tobytes()
     return msg
 
-def _reject_large_masks(
-        masks,
-        image_h,
-        image_w,
-        max_mask_area_ratio=0.25,
-        max_bbox_area_ratio=0.30,
-    ):
-        """
-        Remove masks that are too large relative to the image.
-        These are usually table/background segments.
-        """
-
-        image_area = float(image_h * image_w)
-        filtered = []
-
-        for cand in masks:
-            x0, y0, x1, y1 = cand.bbox_xyxy
-
-            bbox_area = float((x1 - x0) * (y1 - y0))
-            mask_area = float(cand.area)
-
-            if mask_area / image_area > max_mask_area_ratio:
-                continue
-
-            if bbox_area / image_area > max_bbox_area_ratio:
-                continue
-
-            filtered.append(cand)
-
-        return filtered
 
 def _draw_mask_overlay(
     rgb: np.ndarray,
@@ -375,14 +258,13 @@ class DINODebugNode(Node):
         for i, cand in enumerate(masks):
             color = self.palette[i % len(self.palette)]
             x0, y0, x1, y1 = cand.bbox_xyxy
+            crop = rgb[y0:y1, x0:x1]
 
-            crop = _masked_tight_crop(rgb, cand.mask)
-            if crop is None or crop.size == 0:
+            if crop.size == 0:
                 continue
 
             try:
                 obj_id, score, _ = self._classify_single_crop(crop)
-
             except Exception as e:
                 self.get_logger().warn(f"DINO classify failed on mask {i}: {e}")
                 continue
@@ -452,10 +334,6 @@ class DINODebugNode(Node):
             if self.use_sam and self.sam is not None:
                 t0 = time.perf_counter()
                 masks = self.sam.generate_auto(rgb)
-                h, w = rgb.shape[:2]
-                masks = _reject_large_masks(masks, h, w)
-                masks = _reject_border_masks(masks, h, w)
-
                 t1 = time.perf_counter()
 
                 masks_vis = self._draw_sam_only(rgb, masks[:15])
@@ -530,10 +408,6 @@ class DINODebugNode(Node):
                 if self.use_sam and self.sam is not None:
                     t0 = time.perf_counter()
                     masks = self.sam.generate_auto(rgb)
-                    h, w = rgb.shape[:2]
-                    masks = _reject_large_masks(masks, h, w)
-                    masks = _reject_border_masks(masks, h, w)
-
                     t1 = time.perf_counter()
 
                     masks_vis = self._draw_sam_only(rgb, masks[:15])
