@@ -5,7 +5,7 @@ import time
 import numpy as np
 import open3d as o3d
 
-from src.perception.pose_icp_fast import estimate_pose_icp
+from src.perception.classical.pose_icp_fast import estimate_pose_icp
 
 
 @dataclass

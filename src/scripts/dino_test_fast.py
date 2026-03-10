@@ -96,8 +96,8 @@ def _reject_border_masks(
     masks,
     image_h,
     image_w,
-    border_px=8,
-    max_border_fraction=0.04,
+    border_px: int = 8,
+    max_border_fraction: float = 0.04,
 ):
     filtered = []
 
@@ -129,8 +129,8 @@ def _reject_large_masks(
     masks,
     image_h,
     image_w,
-    max_mask_area_ratio=0.14,
-    max_bbox_area_ratio=0.18,
+    max_mask_area_ratio: float = 0.14,
+    max_bbox_area_ratio: float = 0.18,
 ):
     image_area = float(image_h * image_w)
     filtered = []
@@ -264,24 +264,57 @@ def _paste_roi_mask_into_full(
     return full
 
 
-def _roi_from_relative(
+def _clip_polygon_to_image(poly: np.ndarray, image_h: int, image_w: int) -> np.ndarray:
+    poly = poly.astype(np.int32).copy()
+    poly[:, 0] = np.clip(poly[:, 0], 0, image_w - 1)
+    poly[:, 1] = np.clip(poly[:, 1], 0, image_h - 1)
+    return poly
+
+
+def _bbox_from_polygon(poly: np.ndarray) -> Tuple[int, int, int, int]:
+    x0 = int(np.min(poly[:, 0]))
+    y0 = int(np.min(poly[:, 1]))
+    x1 = int(np.max(poly[:, 0])) + 1
+    y1 = int(np.max(poly[:, 1])) + 1
+    return (x0, y0, x1, y1)
+
+
+def _shift_polygon(poly: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    out = poly.copy()
+    out[:, 0] += dx
+    out[:, 1] += dy
+    return out
+
+
+def _make_polygon_mask(
     image_h: int,
     image_w: int,
-    rel_roi: Tuple[float, float, float, float],
-) -> Tuple[int, int, int, int]:
-    rx0, ry0, rx1, ry1 = rel_roi
+    poly: np.ndarray,
+) -> np.ndarray:
+    mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, poly.astype(np.int32), 255)
+    return mask > 0
 
-    x0 = int(round(rx0 * image_w))
-    y0 = int(round(ry0 * image_h))
-    x1 = int(round(rx1 * image_w))
-    y1 = int(round(ry1 * image_h))
 
-    x0 = max(0, min(x0, image_w - 1))
-    y0 = max(0, min(y0, image_h - 1))
-    x1 = max(x0 + 1, min(x1, image_w))
-    y1 = max(y0 + 1, min(y1, image_h))
+def _filter_masks_by_polygon_overlap(
+    masks,
+    polygon_mask_full: np.ndarray,
+    min_inside_fraction: float = 0.65,
+):
+    filtered = []
+    for cand in masks:
+        mask = cand.mask
+        area = float(mask.sum())
+        if area <= 0:
+            continue
 
-    return (x0, y0, x1, y1)
+        inside = float(np.logical_and(mask, polygon_mask_full).sum())
+        frac_inside = inside / area
+
+        if frac_inside >= min_inside_fraction:
+            filtered.append(cand)
+
+    return filtered
 
 
 class DINODebugNode(Node):
@@ -332,23 +365,37 @@ class DINODebugNode(Node):
             (128, 0, 255),
         ]
 
-        # speed knobs
+        # Speed knobs
         self.sam_input_width = 640
         self.max_masks_early = 10
         self.max_masks_for_dino = 4
         self.max_masks_for_sam_vis = 8
-
-        # run SAM only every N live ticks per camera
         self.sam_every_n_ticks = 4
 
-        # per-camera relative ROIs: (x0_rel, y0_rel, x1_rel, y1_rel)
-        # tune these in Foxglove after you see the rectangle overlay
-        self.relative_roi_by_cam: Dict[str, Tuple[float, float, float, float]] = {
-            "zed2i_1": (0.05, 0.05, 0.9, 0.9),
-            "zed2i_2": (0.05, 0.05, 0.9, 0.9),
+        # Polygon workspace ROI per camera (FULL IMAGE PIXELS)
+        # Tune these in Foxglove.
+        self.workspace_poly_by_cam: Dict[str, np.ndarray] = {
+            "zed2i_1": np.array(
+                [
+                    [10, 500],
+                    [1500, 40],
+                    [1900, 1100],
+                    [250, 1000],
+                ],
+                dtype=np.int32,
+            ),
+            # to be edited
+            "zed2i_2": np.array(
+                [
+                    [220, 210],
+                    [1030, 170],
+                    [1180, 860],
+                    [250, 920],
+                ],
+                dtype=np.int32,
+            ),
         }
 
-        # per-camera live tick counters and cached visual outputs
         self._live_tick_by_cam: Dict[str, int] = {}
         self._cache_overlay_by_cam: Dict[str, np.ndarray] = {}
         self._cache_sam_vis_by_cam: Dict[str, np.ndarray] = {}
@@ -429,7 +476,6 @@ class DINODebugNode(Node):
         sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
 
         best_obj, best_score = sorted_scores[0]
-        second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else -1.0
 
         if best_score < 0.6:
             label = "unknown"
@@ -438,24 +484,36 @@ class DINODebugNode(Node):
 
         return label, best_score, scores
 
-    def _get_roi_xyxy(self, rgb: np.ndarray, cam_id: str) -> Tuple[int, int, int, int]:
+    def _get_workspace_polygon(self, rgb: np.ndarray, cam_id: str) -> np.ndarray:
         h, w = rgb.shape[:2]
-        rel_roi = self.relative_roi_by_cam.get(cam_id, (0.0, 0.0, 1.0, 1.0))
-        return _roi_from_relative(h, w, rel_roi)
+        poly = self.workspace_poly_by_cam.get(cam_id, None)
+        if poly is None:
+            poly = np.array(
+                [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+                dtype=np.int32,
+            )
+        return _clip_polygon_to_image(poly, h, w)
 
-    def _draw_roi_box(
+    def _draw_workspace_polygon(
         self,
         rgb: np.ndarray,
-        roi_xyxy: Tuple[int, int, int, int],
+        poly: np.ndarray,
         cam_id: str,
         color: Tuple[int, int, int] = (255, 255, 255),
     ) -> np.ndarray:
         vis = rgb.copy()
-        x0, y0, x1, y1 = roi_xyxy
 
-        cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
+        cv2.polylines(
+            vis,
+            [poly.reshape(-1, 1, 2)],
+            isClosed=True,
+            color=color,
+            thickness=2,
+        )
 
+        x0, y0, _, _ = _bbox_from_polygon(poly)
         label = f"ROI {cam_id}"
+
         (tw, th), baseline = cv2.getTextSize(
             label,
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -465,6 +523,7 @@ class DINODebugNode(Node):
         box_y0 = max(0, y0 - th - baseline - 8)
         box_y1 = y0
         box_x1 = min(vis.shape[1], x0 + tw + 12)
+
         cv2.rectangle(vis, (x0, box_y0), (box_x1, box_y1), color, -1)
         cv2.putText(
             vis,
@@ -550,14 +609,25 @@ class DINODebugNode(Node):
             return []
 
         h_full, w_full = rgb.shape[:2]
-        roi_xyxy = self._get_roi_xyxy(rgb, cam_id)
-        x0_roi, y0_roi, x1_roi, y1_roi = roi_xyxy
+
+        poly_full = self._get_workspace_polygon(rgb, cam_id)
+        x0_roi, y0_roi, x1_roi, y1_roi = _bbox_from_polygon(poly_full)
+        roi_xyxy = (x0_roi, y0_roi, x1_roi, y1_roi)
 
         rgb_roi = _crop_rgb_with_roi(rgb, roi_xyxy)
         if rgb_roi.size == 0:
             return []
 
         h_roi, w_roi = rgb_roi.shape[:2]
+
+        poly_roi = _shift_polygon(poly_full, -x0_roi, -y0_roi)
+        polygon_mask_roi = _make_polygon_mask(h_roi, w_roi, poly_roi)
+        polygon_mask_full = _paste_roi_mask_into_full(
+            polygon_mask_roi,
+            h_full,
+            w_full,
+            roi_xyxy,
+        )
 
         rgb_small, scale = _resize_keep_aspect_by_width(rgb_roi, target_w=self.sam_input_width)
         inv_scale = 1.0 / scale
@@ -569,9 +639,15 @@ class DINODebugNode(Node):
         for cand in masks_small:
             try:
                 roi_mask = _scale_mask_to_fullres(cand.mask, h_roi, w_roi)
+
+                # Keep only the part inside the workspace polygon
+                roi_mask = np.logical_and(roi_mask, polygon_mask_roi)
+                if roi_mask.sum() == 0:
+                    continue
+
                 full_mask = _paste_roi_mask_into_full(roi_mask, h_full, w_full, roi_xyxy)
 
-                bbox_roi = _scale_bbox_xyxy(cand.bbox_xyxy, inv_scale)
+                bbox_roi = _bbox_from_mask(roi_mask)
                 bbox_full = _shift_bbox_xyxy(bbox_roi, x0_roi, y0_roi)
 
                 cand.mask = full_mask
@@ -579,10 +655,17 @@ class DINODebugNode(Node):
                 cand.area = int(full_mask.sum())
             except Exception:
                 continue
+
             masks.append(cand)
 
+        masks = _filter_masks_by_polygon_overlap(
+            masks,
+            polygon_mask_full=polygon_mask_full,
+            min_inside_fraction=0.65,
+        )
         masks = _reject_large_masks(masks, h_full, w_full)
         masks = _reject_border_masks(masks, h_full, w_full)
+
         return masks
 
     def _predict_mask_labels(
@@ -663,7 +746,7 @@ class DINODebugNode(Node):
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             cam_id = "zed2i_1"
-            roi_xyxy = self._get_roi_xyxy(rgb, cam_id)
+            poly = self._get_workspace_polygon(rgb, cam_id)
 
             if self.use_sam and self.sam is not None:
                 t0 = time.perf_counter()
@@ -676,8 +759,8 @@ class DINODebugNode(Node):
                 masks_vis = self._draw_sam_only(rgb, masks[: self.max_masks_for_sam_vis])
                 overlay = self._draw_sam_dino_preds(rgb, preds)
 
-                masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
-                overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+                masks_vis = self._draw_workspace_polygon(masks_vis, poly, cam_id)
+                overlay = self._draw_workspace_polygon(overlay, poly, cam_id)
 
                 self.get_logger().info(
                     f"[images] {img_path.name} masks={len(masks)} preds={len(preds)} "
@@ -693,8 +776,8 @@ class DINODebugNode(Node):
                 overlay = self._draw_whole_image_label(rgb, obj_id, score)
                 masks_vis = rgb.copy()
 
-                masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
-                overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+                masks_vis = self._draw_workspace_polygon(masks_vis, poly, cam_id)
+                overlay = self._draw_workspace_polygon(overlay, poly, cam_id)
 
                 self.get_logger().info(
                     f"[images] {img_path.name} pred={obj_id} score={score:.3f} "
@@ -750,7 +833,7 @@ class DINODebugNode(Node):
                     continue
 
                 frame_id = cam_id
-                roi_xyxy = self._get_roi_xyxy(rgb, cam_id)
+                poly = self._get_workspace_polygon(rgb, cam_id)
 
                 if self.use_sam and self.sam is not None:
                     tick = self._live_tick_by_cam.get(cam_id, 0) + 1
@@ -773,11 +856,11 @@ class DINODebugNode(Node):
                         masks_vis = self._draw_sam_only(rgb, masks[: self.max_masks_for_sam_vis])
                         overlay = self._draw_sam_dino_preds(rgb, preds)
 
-                        masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
-                        overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
+                        masks_vis = self._draw_workspace_polygon(masks_vis, poly, cam_id)
+                        overlay = self._draw_workspace_polygon(overlay, poly, cam_id)
 
-                        self._cache_overlay_by_cam[cam_id] = overlay
-                        self._cache_sam_vis_by_cam[cam_id] = masks_vis
+                        self._cache_overlay_by_cam[cam_id] = overlay.copy()
+                        self._cache_sam_vis_by_cam[cam_id] = masks_vis.copy()
 
                         self.get_logger().info(
                             f"[live:{cam_id}] tick={tick} ran_sam=1 masks={len(masks)} preds={len(preds)} "
@@ -789,9 +872,8 @@ class DINODebugNode(Node):
                         overlay = self._cache_overlay_by_cam[cam_id].copy()
                         masks_vis = self._cache_sam_vis_by_cam[cam_id].copy()
 
-                        # redraw current ROI on cached images just in case ROI changes while tuning
-                        overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
-                        masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
+                        overlay = self._draw_workspace_polygon(overlay, poly, cam_id)
+                        masks_vis = self._draw_workspace_polygon(masks_vis, poly, cam_id)
 
                         self.get_logger().info(
                             f"[live:{cam_id}] tick={tick} ran_sam=0 reused_cached=1"
@@ -805,8 +887,8 @@ class DINODebugNode(Node):
                     overlay = self._draw_whole_image_label(rgb, obj_id, score)
                     masks_vis = rgb.copy()
 
-                    overlay = self._draw_roi_box(overlay, roi_xyxy, cam_id)
-                    masks_vis = self._draw_roi_box(masks_vis, roi_xyxy, cam_id)
+                    overlay = self._draw_workspace_polygon(overlay, poly, cam_id)
+                    masks_vis = self._draw_workspace_polygon(masks_vis, poly, cam_id)
 
                     self.get_logger().info(
                         f"[live:{cam_id}] pred={obj_id} score={score:.3f} "

@@ -5,8 +5,8 @@ import time
 import numpy as np
 
 from src.perception.view import View
-from src.perception.pipeline_fast import GraspPerceptionPipeline, SceneResult
-from src.perception.fusion_fast import fuse_views_to_points_base_with_colors, RGBMaskConfig
+from src.perception.classical.pipeline_fast import GraspPerceptionPipeline, SceneResult
+from src.perception.classical.fusion_fast import fuse_views_to_points_base_with_colors, RGBMaskConfig
 
 
 @dataclass
