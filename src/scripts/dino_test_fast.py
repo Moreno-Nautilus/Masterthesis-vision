@@ -377,20 +377,20 @@ class DINODebugNode(Node):
         self.workspace_poly_by_cam: Dict[str, np.ndarray] = {
             "zed2i_1": np.array(
                 [
-                    [10, 500],
-                    [1500, 40],
-                    [1900, 1100],
-                    [250, 1000],
+                    [10, 250],
+                    [1900, 30],
+                    [1650, 1000],
+                    [200, 1100],
                 ],
                 dtype=np.int32,
             ),
             # to be edited
             "zed2i_2": np.array(
                 [
-                    [220, 210],
-                    [1030, 170],
-                    [1180, 860],
-                    [250, 920],
+                    [50, 500],
+                    [700, 200],
+                    [1700, 550],
+                    [1100, 1000],
                 ],
                 dtype=np.int32,
             ),

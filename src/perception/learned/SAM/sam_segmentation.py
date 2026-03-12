@@ -66,8 +66,9 @@ class SAMSegmenter:
             self.cfg.device if self.cfg.device == "cuda" and torch.cuda.is_available() else "cpu"
         )
 
-        self._predictor = self._build_predictor()
-        self._auto_mask_generator = self._build_auto_mask_generator()
+        model = self._build_model()
+        self._predictor = self._build_predictor(model)
+        self._auto_mask_generator = self._build_auto_mask_generator(model)
 
     def _ensure_repo_on_path(self) -> None:
         repo_root = Path(self.cfg.repo_root).resolve()
@@ -95,19 +96,16 @@ class SAMSegmenter:
         )
         return model
 
-    def _build_predictor(self) -> Any:
+    def _build_predictor(self, model: Any) -> Any:
         self._ensure_repo_on_path()
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-        model = self._build_model()
         predictor = SAM2ImagePredictor(model)
         return predictor
 
-    def _build_auto_mask_generator(self) -> Any:
+    def _build_auto_mask_generator(self, model: Any) -> Any:
         self._ensure_repo_on_path()
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-
-        model = self._build_model()
 
         amg = SAM2AutomaticMaskGenerator(
             model=model,

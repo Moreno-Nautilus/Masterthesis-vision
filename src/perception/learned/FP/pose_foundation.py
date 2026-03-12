@@ -15,6 +15,8 @@ class FoundationPoseConfig:
     debug_dir: str = "outputs/foundationpose/fp_internal_debug"
     debug: int = 2
     est_refine_iter: int = 5
+    mesh_scale: float = 0.00383  # STL is in mm, convert to meters
+
 
 
 @dataclass
@@ -88,6 +90,9 @@ class FoundationPoseWrapper:
 
         import trimesh
         import nvdiffrast.torch as dr
+        import learning.training.predict_score as ps
+        #print(f"[FP DEBUG import] predict_score file = {ps.__file__}")
+
         from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
 
         self._trimesh = trimesh
@@ -109,7 +114,7 @@ class FoundationPoseWrapper:
 
     @staticmethod
     def _sanitize_depth(depth: np.ndarray) -> np.ndarray:
-        depth = np.asarray(depth)
+        depth = np.asarray(depth, dtype=np.float32)
         if depth.ndim == 3:
             depth = depth[..., 0]
         depth = depth.astype(np.float32, copy=False)
@@ -145,6 +150,13 @@ class FoundationPoseWrapper:
 
         mesh = self._trimesh.load(mesh_path)
 
+        # Scale mesh to meters if needed
+        if self.cfg.mesh_scale != 1.0:
+            mesh.apply_scale(self.cfg.mesh_scale)
+
+        # trimesh usually computes these lazily; force availability
+        _ = mesh.vertex_normals
+
         # trimesh usually computes these lazily; force availability
         _ = mesh.vertex_normals
 
@@ -153,17 +165,34 @@ class FoundationPoseWrapper:
 
         scorer = self._ScorePredictor()
         refiner = self._PoseRefinePredictor()
+
+        import torch
+
+        if hasattr(scorer, "model") and scorer.model is not None:
+            scorer.model = scorer.model.float().cuda().eval()
+        if hasattr(refiner, "model") and refiner.model is not None:
+            refiner.model = refiner.model.float().cuda().eval()
+
+        # DEBUG: print model param dtype/device once when estimator is built
+        if hasattr(scorer, "model") and scorer.model is not None:
+            p = next(scorer.model.parameters())
+            #print(f"[FP DEBUG] scorer model dtype={p.dtype}, device={p.device}")
+        if hasattr(refiner, "model") and refiner.model is not None:
+            p = next(refiner.model.parameters())
+            #print(f"[FP DEBUG] refiner model dtype={p.dtype}, device={p.device}")
+
         glctx = self._dr.RasterizeCudaContext()
 
         est = self._FoundationPose(
-            model_pts=np.asarray(mesh.vertices),
-            model_normals=np.asarray(mesh.vertex_normals),
+            model_pts=np.asarray(mesh.vertices, dtype=np.float32),
+            model_normals=np.asarray(mesh.vertex_normals, dtype=np.float32),
             mesh=mesh,
             scorer=scorer,
             refiner=refiner,
             debug_dir=str(object_debug_dir),
             debug=int(self.cfg.debug),
             glctx=glctx,
+        
         )
 
         self._mesh_path_loaded = mesh_path
@@ -172,6 +201,63 @@ class FoundationPoseWrapper:
         self._refiner = refiner
         self._glctx = glctx
         self._est = est
+
+    def track_pose(
+        self,
+        *,
+        object_id: str,
+        mesh_path: str,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        K: np.ndarray,
+        T_object_camera_init: np.ndarray,
+    ):
+        try:
+            self._build_estimator(object_id=object_id, mesh_path=mesh_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"FoundationPose _build_estimator() failed for {object_id}: {e}"
+            ) from None
+
+        rgb = self._sanitize_rgb(rgb)
+        depth = self._sanitize_depth(depth).astype(np.float32)
+        K = self._sanitize_K(K).astype(np.float32)
+
+        try:
+            import torch
+
+            # IMPORTANT:
+            # Do NOT overwrite self._est.pose_last here.
+            # After estimate_pose/register(), FoundationPose already keeps internal
+            # tracker state in its own convention. Re-seeding it from T_init appears
+            # to be what causes the immediate same-frame jump.
+
+            pose_raw = self._est.track_one(
+                rgb=rgb,
+                depth=depth,
+                K=K,
+                iteration=2,
+            )
+
+            if isinstance(pose_raw, torch.Tensor):
+                pose = pose_raw.detach().cpu().numpy()
+            else:
+                pose = np.asarray(pose_raw, dtype=np.float32)
+
+        except Exception as e:
+            raise RuntimeError(
+                f"FoundationPose track_one() failed for {object_id}: {e}"
+            ) from None
+
+        pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
+
+        return FoundationPoseResult(
+            object_id=object_id,
+            mesh_path=str(Path(mesh_path).resolve()),
+            T_object_camera=pose,
+            mask_area=0,
+            debug_dir=str((self.debug_dir / object_id).resolve()),
+        )
 
     def estimate_pose(
         self,
@@ -184,27 +270,90 @@ class FoundationPoseWrapper:
         mask: np.ndarray,
         est_refine_iter: int | None = None,
     ) -> FoundationPoseResult:
-        self._build_estimator(object_id=object_id, mesh_path=mesh_path)
+        try:
+            self._build_estimator(object_id=object_id, mesh_path=mesh_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"FoundationPose _build_estimator() failed for {object_id} "
+                f"(mesh={mesh_path}): {e}"
+            ) from None
 
         rgb = self._sanitize_rgb(rgb)
-        depth = self._sanitize_depth(depth)
-        K = self._sanitize_K(K)
+        depth = self._sanitize_depth(depth).astype(np.float32)
+        K = self._sanitize_K(K).astype(np.float32)
         mask = self._sanitize_mask(mask, rgb.shape[:2])
 
-        pose = self._est.register(
-            K=K,
-            rgb=rgb,
-            depth=depth,
-            ob_mask=mask,
-            iteration=int(est_refine_iter if est_refine_iter is not None else self.cfg.est_refine_iter),
-        )
+        try:
+            import torch
+
+            # Safety: make sure internal FP networks are float32
+            if hasattr(self._scorer, "model") and self._scorer.model is not None:
+                self._scorer.model = self._scorer.model.float().cuda().eval()
+            if hasattr(self._refiner, "model") and self._refiner.model is not None:
+                self._refiner.model = self._refiner.model.float().cuda().eval()
+
+            pose = self._est.register(
+                K=K,
+                rgb=rgb,
+                depth=depth,
+                ob_mask=mask,
+                iteration=int(
+                    est_refine_iter
+                    if est_refine_iter is not None
+                    else self.cfg.est_refine_iter
+                ),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"FoundationPose register() failed for {object_id} "
+                f"(mask_area={int(mask.sum())}): {e}"
+            ) from None
+
+        if pose is None:
+            raise RuntimeError(
+                f"FoundationPose register() returned None for {object_id} "
+                f"(mask_area={int(mask.sum())}) — likely insufficient depth or too few pose hypotheses"
+            )
 
         pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
+
+        # Debug / convention fix:
+        # Prefer the pose variant that yields a positive z translation in the camera frame.
+        # If both raw and inverse have positive z, choose the one with the smaller |z|.
+        try:
+            pose_inv = np.linalg.inv(pose)
+            z_raw = float(pose[2, 3])
+            z_inv = float(pose_inv[2, 3])
+
+            if z_raw > 0.0 and z_inv <= 0.0:
+                pose_out = pose
+                chosen = "raw"
+            elif z_inv > 0.0 and z_raw <= 0.0:
+                pose_out = pose_inv
+                chosen = "inv"
+            elif z_raw > 0.0 and z_inv > 0.0:
+                if abs(z_raw) <= abs(z_inv):
+                    pose_out = pose
+                    chosen = "raw"
+                else:
+                    pose_out = pose_inv
+                    chosen = "inv"
+            else:
+                pose_out = pose
+                chosen = "raw"
+
+            print(
+                f"[estimate_pose()] {object_id} "
+                f"z_raw={z_raw:.3f} z_inv={z_inv:.3f} chosen={chosen}"
+            )
+        except Exception as e:
+            print(f"[estimate_pose()] inverse check failed for {object_id}: {e}")
+            pose_out = pose
 
         return FoundationPoseResult(
             object_id=object_id,
             mesh_path=str(Path(mesh_path).resolve()),
-            T_object_camera=pose,
+            T_object_camera=pose_out,
             mask_area=int(mask.sum()),
             debug_dir=str((self.debug_dir / object_id).resolve()),
         )
