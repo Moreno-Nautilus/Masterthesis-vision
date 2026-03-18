@@ -1,0 +1,9 @@
+base_board:
+  # Translation of the checkerboard ORIGIN corner in robot base frame [m]
+  translation_xyz_m: [0.358, 0.03, 0.006]
+
+  # Rotation of board frame in base frame [deg]
+  # For a flat board on the table, start with roll=180, pitch=0, yaw=0
+  # or roll=0, pitch=180, yaw=0 depending on which side/facing your corner ordering gives.
+  # You may need one sign flip trial here.
+  rotation_rpy_deg: [0.0, 180.0, 0.0]

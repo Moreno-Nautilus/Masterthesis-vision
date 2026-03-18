@@ -15,7 +15,7 @@ class FoundationPoseConfig:
     debug_dir: str = "outputs/foundationpose/fp_internal_debug"
     debug: int = 2
     est_refine_iter: int = 5
-    mesh_scale: float = 0.00383  # STL is in mm, convert to meters
+    mesh_scale: float = 0.01  # STL is in mm, convert to meters
 
 
 
@@ -64,6 +64,7 @@ class FoundationPoseWrapper:
         self._glctx = None
         self._scorer = None
         self._refiner = None
+        print(f"[FoundationPoseWrapper] mesh_scale={self.cfg.mesh_scale}")
 
     def _ensure_repo_on_path(self) -> None:
         if not self.repo_root.exists():
@@ -149,6 +150,10 @@ class FoundationPoseWrapper:
             return
 
         mesh = self._trimesh.load(mesh_path)
+        print("DEBUG mesh extents BEFORE:", mesh.extents)
+        # Center mesh at origin (required for correct FP pose)
+        mesh.vertices -= mesh.centroid
+        mesh_scale = self.cfg.mesh_scale
 
         # Scale mesh to meters if needed
         if self.cfg.mesh_scale != 1.0:
@@ -188,7 +193,7 @@ class FoundationPoseWrapper:
             model_normals=np.asarray(mesh.vertex_normals, dtype=np.float32),
             mesh=mesh,
             scorer=scorer,
-            refiner=refiner,
+            refiner=None,
             debug_dir=str(object_debug_dir),
             debug=int(self.cfg.debug),
             glctx=glctx,
@@ -282,27 +287,37 @@ class FoundationPoseWrapper:
         depth = self._sanitize_depth(depth).astype(np.float32)
         K = self._sanitize_K(K).astype(np.float32)
         mask = self._sanitize_mask(mask, rgb.shape[:2])
+        mask_bool = mask.astype(bool)
+        d = depth[mask_bool]
+        valid = d[np.isfinite(d) & (d > 0)]
+        if valid.size > 0:
+            print(
+                f"[estimate_pose depth] {object_id} "
+                f"mask_area={int(mask.sum())} "
+                f"depth_min={float(valid.min()):.3f} "
+                f"depth_med={float(np.median(valid)):.3f} "
+                f"depth_max={float(valid.max()):.3f}"
+            )
+        else:
+            print(f"[estimate_pose depth] {object_id} no valid depth in mask")
 
         try:
             import torch
 
-            # Safety: make sure internal FP networks are float32
             if hasattr(self._scorer, "model") and self._scorer.model is not None:
                 self._scorer.model = self._scorer.model.float().cuda().eval()
             if hasattr(self._refiner, "model") and self._refiner.model is not None:
                 self._refiner.model = self._refiner.model.float().cuda().eval()
-
+            # RIGHT BEFORE self._est.register():
+            print(f"[DEBUG depth check] has_nan={np.isnan(depth).any()} has_inf={np.isinf(depth).any()} min={np.nanmin(depth):.3f} max={np.nanmax(depth):.3f}")
             pose = self._est.register(
                 K=K,
                 rgb=rgb,
                 depth=depth,
                 ob_mask=mask,
-                iteration=int(
-                    est_refine_iter
-                    if est_refine_iter is not None
-                    else self.cfg.est_refine_iter
-                ),
+                iteration=0,
             )
+            print("FP raw translation:", pose[:3, 3])
         except Exception as e:
             raise RuntimeError(
                 f"FoundationPose register() failed for {object_id} "
@@ -312,48 +327,79 @@ class FoundationPoseWrapper:
         if pose is None:
             raise RuntimeError(
                 f"FoundationPose register() returned None for {object_id} "
-                f"(mask_area={int(mask.sum())}) — likely insufficient depth or too few pose hypotheses"
+                f"(mask_area={int(mask.sum())})"
             )
-
         pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
 
-        # Debug / convention fix:
-        # Prefer the pose variant that yields a positive z translation in the camera frame.
-        # If both raw and inverse have positive z, choose the one with the smaller |z|.
-        try:
-            pose_inv = np.linalg.inv(pose)
-            z_raw = float(pose[2, 3])
-            z_inv = float(pose_inv[2, 3])
-
-            if z_raw > 0.0 and z_inv <= 0.0:
-                pose_out = pose
-                chosen = "raw"
-            elif z_inv > 0.0 and z_raw <= 0.0:
-                pose_out = pose_inv
-                chosen = "inv"
-            elif z_raw > 0.0 and z_inv > 0.0:
-                if abs(z_raw) <= abs(z_inv):
-                    pose_out = pose
-                    chosen = "raw"
-                else:
-                    pose_out = pose_inv
-                    chosen = "inv"
-            else:
-                pose_out = pose
-                chosen = "raw"
-
-            print(
-                f"[estimate_pose()] {object_id} "
-                f"z_raw={z_raw:.3f} z_inv={z_inv:.3f} chosen={chosen}"
-            )
-        except Exception as e:
-            print(f"[estimate_pose()] inverse check failed for {object_id}: {e}")
-            pose_out = pose
+        t_raw = pose[:3, 3].copy()
+        print(
+            f"[estimate_pose RAW] {object_id} "
+            f"t_raw=[{t_raw[0]:.3f}, {t_raw[1]:.3f}, {t_raw[2]:.3f}]"
+        )
 
         return FoundationPoseResult(
             object_id=object_id,
             mesh_path=str(Path(mesh_path).resolve()),
-            T_object_camera=pose_out,
+            T_object_camera=pose,
             mask_area=int(mask.sum()),
             debug_dir=str((self.debug_dir / object_id).resolve()),
         )
+        # pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
+        # pose_inv = np.linalg.inv(pose)
+
+        # t_raw = pose[:3, 3].copy()
+        # t_inv = pose_inv[:3, 3].copy()
+        # z_raw = float(t_raw[2])
+        # z_inv = float(t_inv[2])
+
+        # # Pick physically plausible candidate.
+        # # Your cube should be roughly 0.30-0.50 m away, so prefer:
+        # #   1) positive z
+        # #   2) z in a sane range [0.10, 1.50]
+        # #   3) smaller |x|, |y| if both are sane
+        # raw_ok = 0.10 <= z_raw <= 1.50
+        # inv_ok = 0.10 <= z_inv <= 1.50
+
+        # if raw_ok and not inv_ok:
+        #     pose_out = pose
+        #     chosen = "raw"
+        # elif inv_ok and not raw_ok:
+        #     pose_out = pose_inv
+        #     chosen = "inv"
+        # elif raw_ok and inv_ok:
+        #     raw_xy = float(np.linalg.norm(t_raw[:2]))
+        #     inv_xy = float(np.linalg.norm(t_inv[:2]))
+        #     if raw_xy <= inv_xy:
+        #         pose_out = pose
+        #         chosen = "raw"
+        #     else:
+        #         pose_out = pose_inv
+        #         chosen = "inv"
+        # else:
+        #     # fallback: choose positive z if available, otherwise raw
+        #     if z_raw > 0.0 and z_inv <= 0.0:
+        #         pose_out = pose
+        #         chosen = "raw_fallback"
+        #     elif z_inv > 0.0 and z_raw <= 0.0:
+        #         pose_out = pose_inv
+        #         chosen = "inv_fallback"
+        #     else:
+        #         pose_out = pose
+        #         chosen = "raw_fallback"
+
+        # t_out = pose_out[:3, 3]
+        # print(
+        #     f"[estimate_pose()] {object_id} "
+        #     f"t_raw=[{t_raw[0]:.3f}, {t_raw[1]:.3f}, {t_raw[2]:.3f}] "
+        #     f"t_inv=[{t_inv[0]:.3f}, {t_inv[1]:.3f}, {t_inv[2]:.3f}] "
+        #     f"chosen={chosen} "
+        #     f"t_out=[{t_out[0]:.3f}, {t_out[1]:.3f}, {t_out[2]:.3f}]"
+        # )
+
+        # return FoundationPoseResult(
+        #     object_id=object_id,
+        #     mesh_path=str(Path(mesh_path).resolve()),
+        #     T_object_camera=pose_out,
+        #     mask_area=int(mask.sum()),
+        #     debug_dir=str((self.debug_dir / object_id).resolve()),
+        # )

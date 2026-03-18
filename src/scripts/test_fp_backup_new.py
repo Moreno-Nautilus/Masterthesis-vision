@@ -11,7 +11,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-import csv
+
 import cv2
 import numpy as np
 import torch
@@ -321,10 +321,8 @@ class FoundationPoseTrackerNode(Node):
         self.args = args
         self.grabber = grabber
         self.T_base_cam_map = T_base_cam_map
-
         self.pub_pose_base: dict[str, Any] = {}
-        self.pub_pose_base_init: dict[str, Any] = {}
-        self.pub_pose_base_track: dict[str, Any] = {}
+        
 
         self.palette = [
             (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
@@ -334,26 +332,13 @@ class FoundationPoseTrackerNode(Node):
         self.last_signature: Optional[tuple[tuple[str, int], ...]] = None
         self.busy = False
         self.frame_counter = 0
-        self.csv_log_path = str(Path(args.output_root) / "fp_pose_debug.csv")
-        Path(self.csv_log_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(self.csv_log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "frame",
-                "cam",
-                "object",
-                "raw_x", "raw_y", "raw_z",
-                "inv_x", "inv_y", "inv_z",
-                "base_raw_z",
-                "base_inv_z",
-            ])
 
         self.mesh_map = self._build_mesh_map(args.cad_dir)
 
         self.track_states: dict[str, list[ObjectTrackState]] = {
             c.cam_id: [] for c in CAMERAS
         }
+        
 
         self.dino = DINOIdentifier(
             DINOIdentifierConfig(
@@ -399,11 +384,7 @@ class FoundationPoseTrackerNode(Node):
         self.pub_sam_overlay: dict[str, Any] = {}
         self.pub_dino_overlay: dict[str, Any] = {}
         self.pub_pose_overlay: dict[str, Any] = {}
-
         self.pub_pose: dict[str, Any] = {}
-        self.pub_pose_init: dict[str, Any] = {}
-        self.pub_pose_track: dict[str, Any] = {}
-
         self.last_sam_overlay: dict[str, np.ndarray] = {}
         self.last_dino_overlay: dict[str, np.ndarray] = {}
 
@@ -423,9 +404,7 @@ class FoundationPoseTrackerNode(Node):
             )
 
         self.timer = self.create_timer(args.timer_period_s, self._tick)
-        self.get_logger().info(
-            f"FoundationPoseTrackerNode started | run_mode={self.args.run_mode}"
-        )
+        self.get_logger().info("FoundationPoseTrackerNode started")
 
     @staticmethod
     def _build_mesh_map(cad_dir: str) -> dict[str, str]:
@@ -441,7 +420,7 @@ class FoundationPoseTrackerNode(Node):
                     mesh_map[name.capitalize()] = str(mesh_file)
 
         return mesh_map
-
+    
     def _get_or_create_pose_base_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
         key = f"{cam_id}/{object_id}_{idx}"
         if key not in self.pub_pose_base:
@@ -449,23 +428,7 @@ class FoundationPoseTrackerNode(Node):
                 PoseStamped, f"/perception/fp/pose_base/{key}", FAST_QOS
             )
         return self.pub_pose_base[key]
-
-    def _get_or_create_pose_base_init_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
-        if key not in self.pub_pose_base_init:
-            self.pub_pose_base_init[key] = self.create_publisher(
-                PoseStamped, f"/perception/fp/pose_base_init/{key}", FAST_QOS
-            )
-        return self.pub_pose_base_init[key]
-
-    def _get_or_create_pose_base_track_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
-        if key not in self.pub_pose_base_track:
-            self.pub_pose_base_track[key] = self.create_publisher(
-                PoseStamped, f"/perception/fp/pose_base_track/{key}", FAST_QOS
-            )
-        return self.pub_pose_base_track[key]
-
+    
     def _publish_pose_base(
         self, cam_id: str, object_id: str, idx: int, T_object_camera: np.ndarray, stamp
     ) -> None:
@@ -482,41 +445,7 @@ class FoundationPoseTrackerNode(Node):
             pub_inv.publish(T_to_pose_stamped(T_base_object_inv, frame_id="base", stamp=stamp))
         except np.linalg.LinAlgError:
             pass
-
-    def _publish_pose_base_init(
-        self, cam_id: str, object_id: str, idx: int, T_object_camera: np.ndarray, stamp
-    ) -> None:
-        T_object_camera = np.asarray(T_object_camera, dtype=np.float32).reshape(4, 4)
-
-        T_base_object_raw = self._to_base_pose(cam_id, T_object_camera)
-        pub_raw = self._get_or_create_pose_base_init_pub(cam_id, object_id + "_raw", idx)
-        pub_raw.publish(T_to_pose_stamped(T_base_object_raw, frame_id="base", stamp=stamp))
-
-        try:
-            T_object_camera_inv = np.linalg.inv(T_object_camera)
-            T_base_object_inv = self._to_base_pose(cam_id, T_object_camera_inv)
-            pub_inv = self._get_or_create_pose_base_init_pub(cam_id, object_id + "_inv", idx)
-            pub_inv.publish(T_to_pose_stamped(T_base_object_inv, frame_id="base", stamp=stamp))
-        except np.linalg.LinAlgError:
-            pass
-
-    def _publish_pose_base_track(
-        self, cam_id: str, object_id: str, idx: int, T_object_camera: np.ndarray, stamp
-    ) -> None:
-        T_object_camera = np.asarray(T_object_camera, dtype=np.float32).reshape(4, 4)
-
-        T_base_object_raw = self._to_base_pose(cam_id, T_object_camera)
-        pub_raw = self._get_or_create_pose_base_track_pub(cam_id, object_id + "_raw", idx)
-        pub_raw.publish(T_to_pose_stamped(T_base_object_raw, frame_id="base", stamp=stamp))
-
-        try:
-            T_object_camera_inv = np.linalg.inv(T_object_camera)
-            T_base_object_inv = self._to_base_pose(cam_id, T_object_camera_inv)
-            pub_inv = self._get_or_create_pose_base_track_pub(cam_id, object_id + "_inv", idx)
-            pub_inv.publish(T_to_pose_stamped(T_base_object_inv, frame_id="base", stamp=stamp))
-        except np.linalg.LinAlgError:
-            pass
-
+            
     def _resolve_mesh_path(self, object_id: str) -> str:
         if object_id in self.mesh_map:
             return self.mesh_map[object_id]
@@ -528,6 +457,7 @@ class FoundationPoseTrackerNode(Node):
 
         raise FileNotFoundError(f"No CAD mesh for object_id='{object_id}'")
 
+
     def _get_or_create_pose_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
         key = f"{cam_id}/{object_id}_{idx}"
         if key not in self.pub_pose:
@@ -535,22 +465,6 @@ class FoundationPoseTrackerNode(Node):
                 PoseStamped, f"/perception/fp/pose/{key}", FAST_QOS
             )
         return self.pub_pose[key]
-
-    def _get_or_create_pose_init_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
-        if key not in self.pub_pose_init:
-            self.pub_pose_init[key] = self.create_publisher(
-                PoseStamped, f"/perception/fp/pose_init/{key}", FAST_QOS
-            )
-        return self.pub_pose_init[key]
-
-    def _get_or_create_pose_track_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
-        if key not in self.pub_pose_track:
-            self.pub_pose_track[key] = self.create_publisher(
-                PoseStamped, f"/perception/fp/pose_track/{key}", FAST_QOS
-            )
-        return self.pub_pose_track[key]
 
     def _views_signature(self, views: list[Any]) -> tuple[tuple[str, int], ...]:
         items = []
@@ -562,10 +476,10 @@ class FoundationPoseTrackerNode(Node):
 
     def _to_base_pose(self, cam_id: str, T_object_camera: np.ndarray) -> np.ndarray:
         T_object_camera = np.asarray(T_object_camera, dtype=np.float32).reshape(4, 4)
-        
+
         if cam_id not in self.T_base_cam_map:
             raise KeyError(f"No base extrinsic for cam_id={cam_id}")
-        
+
         T_base_cam = self.T_base_cam_map[cam_id]
         if hasattr(T_base_cam, "as_matrix"):
             T_base_cam = T_base_cam.as_matrix()
@@ -573,8 +487,7 @@ class FoundationPoseTrackerNode(Node):
             T_base_cam = T_base_cam.matrix
         else:
             T_base_cam = np.asarray(T_base_cam, dtype=np.float32).reshape(4, 4)
-        
-        # Use directly - NO INVERSE
+
         return T_base_cam @ T_object_camera
 
     def _generate_and_filter_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
@@ -691,27 +604,24 @@ class FoundationPoseTrackerNode(Node):
         return selected
 
     def _pose_reason(self, T: np.ndarray) -> tuple[bool, str]:
-        R = T[:3, :3]
-        t = T[:3, 3]
-        
-        # Check rotation trace - reject upside-down orientations
-        trace = np.trace(R)
-        if trace < -1.5:
-            return False, f"flipped_orientation trace={trace:.3f}"
-        
-        # Object MUST be in front of camera at reasonable distance
-        # Camera is ~53cm above table, object on table should be Z ≈ 0.4-0.7m
-        z = t[2]
-        if z < 0.3 or z > 0.8:
-            return False, f"bad_z z={z:.3f} (expected 0.3-0.8)"
-        
-        # Check total distance magnitude
-        t_mag = np.linalg.norm(t)
-        if t_mag < 0.4 or t_mag > 0.9:
-            return False, f"bad_distance mag={t_mag:.3f}"
-        
-        return True, "ok"
+        T = np.asarray(T, dtype=np.float32).reshape(4, 4)
 
+        if not np.isfinite(T).all():
+            return False, "nonfinite"
+
+        z = float(T[2, 3])
+        if z <= self.args.min_valid_z_m or z > self.args.max_valid_z_m:
+            return False, f"bad_z z={z:.3f}"
+
+        det = float(np.linalg.det(T[:3, :3]))
+        if abs(det - 1.0) > 0.25:
+            return False, f"bad_det det={det:.3f}"
+
+        return True, f"ok z={z:.3f} det={det:.3f}"
+
+    def _pose_is_reasonable(self, T: np.ndarray) -> bool:
+        ok, _ = self._pose_reason(T)
+        return ok
 
     def _draw_track_box(
         self,
@@ -747,7 +657,6 @@ class FoundationPoseTrackerNode(Node):
                 obj_idx=obj_idx,
             )
         return out
-
     def _draw_sam_overlay(self, rgb: np.ndarray, masks: list[SAMMaskCandidate]) -> np.ndarray:
         vis = rgb.copy()
         for i, cand in enumerate(masks[:self.args.max_candidate_draw]):
@@ -788,22 +697,6 @@ class FoundationPoseTrackerNode(Node):
         pub = self._get_or_create_pose_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T, frame_id=cam_id, stamp=stamp))
 
-    def _publish_pose_init(self, cam_id: str, object_id: str, idx: int, T: np.ndarray, stamp) -> None:
-        pub = self._get_or_create_pose_init_pub(cam_id, object_id, idx)
-        pub.publish(T_to_pose_stamped(T, frame_id=cam_id, stamp=stamp))
-
-    def _publish_pose_track(self, cam_id: str, object_id: str, idx: int, T: np.ndarray, stamp) -> None:
-        pub = self._get_or_create_pose_track_pub(cam_id, object_id, idx)
-        pub.publish(T_to_pose_stamped(T, frame_id=cam_id, stamp=stamp))
-
-    def _log_pose(self, prefix: str, cam_id: str, object_id: str, idx: int, T: np.ndarray, score: float) -> None:
-        q = rotation_matrix_to_quaternion_xyzw(T[:3, :3])
-        self.get_logger().info(
-            f"[{cam_id}] {prefix} [{idx}] {object_id} "
-            f"t=[{T[0,3]:.3f}, {T[1,3]:.3f}, {T[2,3]:.3f}] "
-            f"q=[{q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f}] "
-            f"score={score:.3f}"
-        )
 
     def _try_local_recover(
         self,
@@ -818,7 +711,6 @@ class FoundationPoseTrackerNode(Node):
 
         rgb = view.rgb
         depth = view.depth
-        #print("depth min/max:", depth.min(), depth.max())
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
 
         try:
@@ -845,6 +737,7 @@ class FoundationPoseTrackerNode(Node):
             )
             return None, None
 
+        # Re-evaluate which tracking convention matches the recovered pose better
         try:
             same_result = state.fp_tracker.track_pose(
                 object_id=state.object_id,
@@ -879,12 +772,13 @@ class FoundationPoseTrackerNode(Node):
 
         return T_rec, recovered_convention
 
+
+
     def _initialize_objects(
-        self, view: Any, selections: list[CandidateSelection], stamp,
+        self, view: Any, selections: list[CandidateSelection],
     ) -> tuple[list[ObjectTrackState], np.ndarray]:
         rgb = view.rgb
         depth = view.depth
-        #print("depth min/max:", depth.min(), depth.max())
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
         cam_id = view.cam_id
 
@@ -924,29 +818,7 @@ class FoundationPoseTrackerNode(Node):
             )
 
             t0 = time.perf_counter()
-            # Save frame for offline debugging
-            debug_frame_dir = Path(self.args.output_root) / "debug_frames" / f"frame_{self.frame_counter:06d}"
-            debug_frame_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(debug_frame_dir / "rgb.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-            np.save(str(debug_frame_dir / "depth.npy"), depth)
-            cv2.imwrite(str(debug_frame_dir / "mask.png"), (sel.candidate.mask * 255).astype(np.uint8))
-            np.save(str(debug_frame_dir / "K.npy"), K)
             try:
-                # BEFORE calling estimate_pose
-                mask_depth = depth[mask]
-                valid_depth = mask_depth[np.isfinite(mask_depth) & (mask_depth > 0)]
-                print(f"[DEPTH CHECK] median={np.median(valid_depth):.3f} std={np.std(valid_depth):.3f}")
-                print(f"[DEPTH CHECK] Expecting object at ~0.58m, mesh is 0.12m wide")
-                print(f"[DEPTH CHECK] If mesh center is at depth={np.median(valid_depth):.3f}, mesh extends {np.median(valid_depth)-0.06:.3f} to {np.median(valid_depth)+0.06:.3f}")
-                # BEFORE calling estimate_pose
-                mask_depth = depth[mask]
-                valid_depth = mask_depth[np.isfinite(mask_depth) & (mask_depth > 0)]
-                self.get_logger().info(
-                    f"[FP INPUT DEBUG] {sel.object_id} "
-                    f"depth: min={np.min(valid_depth):.3f} median={np.median(valid_depth):.3f} max={np.max(valid_depth):.3f} "
-                    f"mask_area={int(mask.sum())} "
-                    f"K_fx={K[0,0]:.1f} K_fy={K[1,1]:.1f}"
-                )
                 result = tracker.estimate_pose(
                     object_id=sel.object_id,
                     mesh_path=mesh_path,
@@ -954,40 +826,6 @@ class FoundationPoseTrackerNode(Node):
                     depth=depth,
                     K=K,
                     mask=sel.candidate.mask,
-                )
-                T = result.T_object_camera
-                print(f"[FP RESULT] t={T[:3,3]} det={np.linalg.det(T):.6f}")
-                print(f"[FP RESULT] R_trace={np.trace(T[:3,:3]):.6f}")
-                # AFTER estimate_pose
-                T = result.T_object_camera
-                R = T[:3, :3]
-                t = T[:3, 3]
-
-                self.get_logger().info(
-                    f"[FP OUTPUT DEBUG] {sel.object_id} "
-                    f"t={t} "
-                    f"trace={np.trace(R):.3f} "
-                    f"det={np.linalg.det(R):.6f}"
-                )
-
-                # Check if we need to INVERT the pose
-                T_inv = np.linalg.inv(T)
-                t_inv = T_inv[:3, 3]
-                self.get_logger().info(
-                    f"[FP OUTPUT DEBUG INV] {sel.object_id} "
-                    f"t_inv={t_inv}"
-                )
-
-                # Check if rotation makes sense
-                R = T[:3,:3]
-                print(f"[FP RESULT] R@R.T (should be I):\n{R @ R.T}")
-                R = T[:3, :3]
-                t = T[:3, 3]
-                trace = np.trace(R)
-
-                self.get_logger().info(
-                    f"[FP CONVENTION CHECK] trace={trace:.3f} t_mag={np.linalg.norm(t):.3f} "
-                    f"depth_median={np.median(valid_depth):.3f}"
                 )
             except Exception as e:
                 self.get_logger().warn(
@@ -998,65 +836,6 @@ class FoundationPoseTrackerNode(Node):
 
             T = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
 
-            T_inv = None
-            T_base_raw = None
-            T_base_inv = None
-
-            try:
-                T_inv = np.linalg.inv(T)
-            except np.linalg.LinAlgError:
-                pass
-
-            try:
-                T_base_raw = self._to_base_pose(cam_id, T)
-            except Exception as e:
-                self.get_logger().warn(f"[{cam_id}] INIT base raw failed: {e}")
-
-            if T_inv is not None:
-                try:
-                    T_base_inv = self._to_base_pose(cam_id, T_inv)
-                except Exception as e:
-                    self.get_logger().warn(f"[{cam_id}] INIT base inv failed: {e}")
-
-            self.get_logger().info(
-                f"[{cam_id}] DEBUG INIT RAW {sel.object_id} "
-                f"t_cam=[{T[0,3]:.3f}, {T[1,3]:.3f}, {T[2,3]:.3f}]"
-            )
-
-            if T_inv is not None:
-                self.get_logger().info(
-                    f"[{cam_id}] DEBUG INIT INV {sel.object_id} "
-                    f"t_cam_inv=[{T_inv[0,3]:.3f}, {T_inv[1,3]:.3f}, {T_inv[2,3]:.3f}]"
-                )
-
-            if T_base_raw is not None:
-                self.get_logger().info(
-                    f"[{cam_id}] DEBUG INIT BASE_RAW {sel.object_id} "
-                    f"t_base_raw=[{T_base_raw[0,3]:.3f}, {T_base_raw[1,3]:.3f}, {T_base_raw[2,3]:.3f}]"
-                )
-
-            if T_base_inv is not None:
-                self.get_logger().info(
-                    f"[{cam_id}] DEBUG INIT BASE_INV {sel.object_id} "
-                    f"t_base_inv=[{T_base_inv[0,3]:.3f}, {T_base_inv[1,3]:.3f}, {T_base_inv[2,3]:.3f}]"
-                )
-            def xyz(T):
-                if T is None:
-                    return [None, None, None]
-                return [float(T[0,3]), float(T[1,3]), float(T[2,3])]
-
-            with open(self.csv_log_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    self.frame_counter,
-                    cam_id,
-                    sel.object_id,
-                    *xyz(T),
-                    *xyz(T_inv),
-                    T_base_raw[2,3] if T_base_raw is not None else None,
-                    T_base_inv[2,3] if T_base_inv is not None else None,
-                ])
-
             ok_pose, pose_msg = self._pose_reason(T)
             if not ok_pose:
                 self.get_logger().warn(
@@ -1064,10 +843,6 @@ class FoundationPoseTrackerNode(Node):
                     f"t=[{T[0,3]:.3f}, {T[1,3]:.3f}, {T[2,3]:.3f}]"
                 )
                 continue
-
-            self._log_pose("INIT POSE", cam_id, sel.object_id, i, T, float(sel.score))
-            self._publish_pose_init(cam_id, sel.object_id, i, T, stamp)
-            self._publish_pose_base_init(cam_id, sel.object_id, i, T, stamp)
 
             track_pose_convention = "raw"
             try:
@@ -1144,7 +919,7 @@ class FoundationPoseTrackerNode(Node):
         return new_states, pose_overlay
 
     def _track_objects(
-        self, view: Any, states: list[ObjectTrackState], stamp,
+        self, view: Any, states: list[ObjectTrackState],
     ) -> tuple[list[ObjectTrackState], np.ndarray]:
         """Run FoundationPose tracking with local recovery before losing a track."""
         rgb = view.rgb
@@ -1269,12 +1044,6 @@ class FoundationPoseTrackerNode(Node):
                         pose_overlay, state, i, mode=f"recover/{state.track_pose_convention}"
                     )
 
-                    self._log_pose("TRACK RECOVER", cam_id, smoothed_id, i, T_rec, state.dino_score)
-                    self._publish_pose_track(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose_base_track(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose_base(cam_id, state.object_id, i, T_rec, stamp)
-
                     self.get_logger().info(
                         f"[{cam_id}] TRACK [{i}] RECOVERED obj={smoothed_id} "
                         f"new_convention={state.track_pose_convention}"
@@ -1302,18 +1071,13 @@ class FoundationPoseTrackerNode(Node):
                 pose_overlay, state, i, mode=f"track/{convention}"
             )
 
-            self._log_pose("TRACK POSE", cam_id, smoothed_id, i, T_new, state.dino_score)
-            self._publish_pose_track(cam_id, state.object_id, i, T_new, stamp)
-            self._publish_pose_base_track(cam_id, state.object_id, i, T_new, stamp)
-            self._publish_pose(cam_id, state.object_id, i, T_new, stamp)
-            self._publish_pose_base(cam_id, state.object_id, i, T_new, stamp)
-
             self.get_logger().info(
                 f"[{cam_id}] TRACK [{i}] ACCEPT obj={smoothed_id} "
                 f"convention={convention} jump={jump_m:.3f}m"
             )
 
         return surviving, pose_overlay
+
 
     def _process_single_view(self, view: Any) -> None:
         cam_id = view.cam_id
@@ -1330,9 +1094,9 @@ class FoundationPoseTrackerNode(Node):
         depth = view.depth
         states = self.track_states[cam_id]
 
-        if self.args.run_mode == "track" and states and all(s.mode == "track" for s in states):
+        if states and all(s.mode == "track" for s in states):
             t0 = time.perf_counter()
-            surviving, pose_overlay = self._track_objects(view, states, stamp)
+            surviving, pose_overlay = self._track_objects(view, states)
             dt = (time.perf_counter() - t0) * 1000.0
 
             if surviving:
@@ -1347,6 +1111,10 @@ class FoundationPoseTrackerNode(Node):
                     dino_overlay=dino_overlay_cached,
                     pose_overlay=pose_overlay,
                 )
+                for i, s in enumerate(surviving):
+                    if s.T_object_camera is not None:
+                        self._publish_pose(cam_id, s.object_id, i, s.T_object_camera, stamp)
+                        self._publish_pose_base(cam_id, s.object_id, i, s.T_object_camera, stamp)
                 self.get_logger().info(
                     f"[{cam_id}] TRACK total={dt:.1f}ms objects={len(surviving)}"
                 )
@@ -1381,7 +1149,6 @@ class FoundationPoseTrackerNode(Node):
                 pose_overlay=rgb,
             )
             return
-
         sam_overlay = self._draw_sam_overlay(rgb, masks)
 
         t0 = time.perf_counter()
@@ -1402,16 +1169,12 @@ class FoundationPoseTrackerNode(Node):
             return
 
         t0 = time.perf_counter()
-        new_states, pose_overlay = self._initialize_objects(view, selected, stamp)
+        new_states, pose_overlay = self._initialize_objects(view, selected)
         dt_fp = (time.perf_counter() - t0) * 1000.0
 
-        if self.args.run_mode == "track":
-            self.track_states[cam_id] = new_states
-        else:
-            self.track_states[cam_id] = []
+        self.track_states[cam_id] = new_states
 
         self._publish_overlays(cam_id, stamp, rgb, sam_overlay, dino_overlay, pose_overlay)
-
         for i, s in enumerate(new_states):
             if s.T_object_camera is not None:
                 self._publish_pose(cam_id, s.object_id, i, s.T_object_camera, stamp)
@@ -1422,9 +1185,11 @@ class FoundationPoseTrackerNode(Node):
             f"[{cam_id}] INIT total={dt_total:.1f}ms "
             f"(sam={dt_sam:.1f} dino={dt_dino:.1f} fp={dt_fp:.1f}) "
             f"masks={len(masks)} ranked={len(ranked)} "
-            f"selected={len(selected)} initialized={len(new_states)} "
-            f"run_mode={self.args.run_mode}"
+            f"selected={len(selected)} initialized={len(new_states)}"
         )
+ 
+
+
 
     def _tick(self) -> None:
         if self.busy:
@@ -1458,7 +1223,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda")
     p.add_argument("--mask-source", choices=["sam", "projected"], default="sam")
     p.add_argument("--target-object", default=None)
-    p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
 
     p.add_argument("--reference-dir", default="Data/ZED_screens")
     p.add_argument("--cad-dir", default="Data/CAD_Models")
@@ -1486,7 +1250,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fp-weights-dir", default="external/FoundationPose/weights")
     p.add_argument("--fp-debug", type=int, default=2)
     p.add_argument("--est-refine-iter", type=int, default=5)
-    p.add_argument("--mesh-scale", type=float, default=0.01)
 
     p.add_argument("--timer-period-s", type=float, default=0.25)
     p.add_argument("--max-candidate-draw", type=int, default=8)
@@ -1517,7 +1280,7 @@ def main() -> None:
         rgb_depth_max_dt_s=0.08,
     )
 
-    node = FoundationPoseTrackerNode(args=args, grabber=grabber, T_base_cam_map=T_map)
+    node = FoundationPoseTrackerNode(args=args, grabber=grabber, T_base_cam_map = T_map)
 
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(grabber)
