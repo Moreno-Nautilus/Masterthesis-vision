@@ -27,8 +27,8 @@ class SAMSegmenterConfig:
     use_bfloat16: bool = True
 
     # proposal filtering
-    min_mask_area: int = 1500
-    max_mask_area_ratio: float = 0.85
+    min_mask_area: int = 800 # 1500
+    max_mask_area_ratio: float = 0.18 #0.85
     min_bbox_side_px: int = 20
 
     # image resizing before mask generation
@@ -38,12 +38,12 @@ class SAMSegmenterConfig:
     attach_rgb_crops: bool = True
 
     # automatic mask generation
-    auto_points_per_side: int = 24
-    auto_pred_iou_thresh: float = 0.88
-    auto_stability_score_thresh: float = 0.92
-    auto_crop_n_layers: int = 0
-    auto_crop_n_points_downscale_factor: int = 1
-    auto_min_mask_region_area: int = 200
+    auto_points_per_side: int = 28 #24
+    auto_pred_iou_thresh: float = 0.90 #0.88
+    auto_stability_score_thresh: float = 0.95 #0.92
+    auto_crop_n_layers: int = 1
+    auto_crop_n_points_downscale_factor: int = 2
+    auto_min_mask_region_area: int = 100 #200
 
 
 class SAMSegmenter:

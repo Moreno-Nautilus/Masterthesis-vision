@@ -30,7 +30,7 @@ from src.perception.learned.DINO.dino_identifier import (
     DINOIdentifierConfig,
     DINOResult,
 )
-from src.perception.learned.FP.pose_foundation import (
+from src.perception.learned.FP.pose_foundation_fast import (
     FoundationPoseConfig,
     FoundationPoseWrapper,
 )
@@ -49,13 +49,6 @@ FAST_QOS = QoSProfile(
 )
 
 CAMERAS = [
-    # CameraTopics(
-    #     cam_id="zed2i_1",
-    #     depth_topic="/zed2i_1/zed_node/depth/depth_registered",
-    #     info_topic="/zed2i_1/zed_node/depth/depth_registered/camera_info",
-    #     rgb_topic="/zed2i_1/zed_node/rgb/color/rect/image",
-    #     rgb_info_topic="/zed2i_1/zed_node/rgb/color/rect/image/camera_info",
-    # ),
     CameraTopics(
         cam_id="zed2i_2",
         depth_topic="/zed2i_2/zed_node/depth/depth_registered",
@@ -86,8 +79,13 @@ class ObjectTrackState:
     lost_count: int = 0
     last_mask_area: int = 0
     id_history: deque = field(default_factory=lambda: deque(maxlen=5))
-    track_pose_convention: str = "raw"   # "raw" or "inv"
+    track_pose_convention: str = "raw"   # kept for debug compatibility
     recovery_mask: Optional[np.ndarray] = None
+
+    # fast local tracking state
+    last_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    last_depth_m: float = 0.0
+    last_update_time_s: float = 0.0
 
 
 def rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
@@ -151,8 +149,6 @@ def T_to_pose_stamped(T: np.ndarray, frame_id: str, stamp) -> PoseStamped:
     return msg
 
 
-
-
 def draw_mask_overlay(
     rgb: np.ndarray, mask: np.ndarray,
     color: tuple[int, int, int], alpha: float = 0.30,
@@ -209,11 +205,6 @@ def draw_pose_text(
     return out
 
 
-# def bbox_crop_with_local_mask(
-#     rgb: np.ndarray, mask: np.ndarray, bbox_xyxy: tuple[int, int, int, int],
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
-#     return rgb[y0:y1, x0:x1].copy(), mask[y0:y1, x0:x1].copy()
 def bbox_crop_with_local_mask(
     rgb: np.ndarray,
     mask: np.ndarray,
@@ -240,6 +231,7 @@ def bbox_crop_with_local_mask(
         mask[y0p:y1p, x0p:x1p].copy(),
     )
 
+
 def reject_large_masks(
     masks: list[SAMMaskCandidate], h: int, w: int,
     max_mask_area_ratio: float = 0.25, max_bbox_area_ratio: float = 0.30,
@@ -255,18 +247,16 @@ def reject_large_masks(
         out.append(c)
     return out
 
+
 def reject_outside_roi(
     masks: list[SAMMaskCandidate],
     x_min: int, x_max: int, y_min: int, y_max: int,
 ) -> list[SAMMaskCandidate]:
     kept = []
     for m in masks:
-        x0, y0, x1, y1 = m.bbox_xyxy  # SAMMaskCandidate attribute
-
-        # keep only if fully inside ROI
+        x0, y0, x1, y1 = m.bbox_xyxy
         if x0 >= x_min and x1 <= x_max and y0 >= y_min and y1 <= y_max:
             kept.append(m)
-
     return kept
 
 
@@ -347,11 +337,6 @@ def batch_dino_classify(
 
             cv2.imwrite(str(crop_dir / "masked.png"),
                         cv2.cvtColor(rgb_masked, cv2.COLOR_RGB2BGR))
-    # for rgb, mask in zip(crops_rgb, crops_mask):
-    #     rgb_proc = dino._ensure_rgb(rgb)
-    #     rgb_proc = dino._apply_mask(rgb_proc, mask)
-    #     t = dino._preprocess(rgb_proc)
-    #     tensors.append(t)
 
     batch = torch.cat(tensors, dim=0)
 
@@ -381,10 +366,8 @@ def batch_dino_classify(
                 f.write(f"pred: {res.object_id}\n")
                 f.write(f"score: {res.score:.4f}\n\n")
                 for k, v in sorted(res.scores_by_object.items(),
-                                key=lambda x: x[1], reverse=True):
+                                   key=lambda x: x[1], reverse=True):
                     f.write(f"{k}: {float(v):.4f}\n")
-    # for emb in embeddings:
-    #     results.append(dino.classify_embedding(emb))
     return results
 
 
@@ -471,6 +454,7 @@ class FoundationPoseTrackerNode(Node):
             debug_dir=str(Path(args.output_root).resolve() / "fp_internal_debug"),
             debug=args.fp_debug,
             est_refine_iter=args.est_refine_iter,
+            mesh_scale=args.mesh_scale,
         )
 
         self.pub_raw: dict[str, Any] = {}
@@ -519,6 +503,151 @@ class FoundationPoseTrackerNode(Node):
                     mesh_map[name.capitalize()] = str(mesh_file)
 
         return mesh_map
+
+    def _clip_bbox(self, bbox_xyxy: tuple[int, int, int, int], h: int, w: int) -> tuple[int, int, int, int]:
+        x0, y0, x1, y1 = bbox_xyxy
+        x0 = max(0, min(w - 1, int(x0)))
+        y0 = max(0, min(h - 1, int(y0)))
+        x1 = max(x0 + 1, min(w, int(x1)))
+        y1 = max(y0 + 1, min(h, int(y1)))
+        return x0, y0, x1, y1
+
+    def _expand_bbox(
+        self,
+        bbox_xyxy: tuple[int, int, int, int],
+        h: int,
+        w: int,
+        pad_px: int,
+    ) -> tuple[int, int, int, int]:
+        x0, y0, x1, y1 = bbox_xyxy
+        return self._clip_bbox((x0 - pad_px, y0 - pad_px, x1 + pad_px, y1 + pad_px), h, w)
+
+    def _crop_K(self, K: np.ndarray, x0: int, y0: int) -> np.ndarray:
+        Kc = np.asarray(K, dtype=np.float32).copy()
+        Kc[0, 2] -= float(x0)
+        Kc[1, 2] -= float(y0)
+        return Kc
+
+    def _make_global_mask_from_local(
+        self,
+        local_mask: np.ndarray,
+        x0: int,
+        y0: int,
+        h: int,
+        w: int,
+    ) -> np.ndarray:
+        out = np.zeros((h, w), dtype=bool)
+        hh, ww = local_mask.shape[:2]
+        x1 = min(w, x0 + ww)
+        y1 = min(h, y0 + hh)
+        out[y0:y1, x0:x1] = local_mask[:y1 - y0, :x1 - x0].astype(bool)
+        return out
+
+    def _largest_component(self, mask: np.ndarray) -> np.ndarray:
+        mask_u8 = (mask.astype(np.uint8) * 255)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+        if n <= 1:
+            return mask.astype(bool)
+
+        best_idx = -1
+        best_area = 0
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area > best_area:
+                best_area = area
+                best_idx = i
+
+        if best_idx < 0:
+            return mask.astype(bool)
+
+        return (labels == best_idx)
+
+    def _bbox_from_mask(self, mask: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+        ys, xs = np.where(mask.astype(bool))
+        if xs.size == 0 or ys.size == 0:
+            return None
+        x0 = int(xs.min())
+        x1 = int(xs.max()) + 1
+        y0 = int(ys.min())
+        y1 = int(ys.max()) + 1
+        return (x0, y0, x1, y1)
+
+    def _build_local_track_observation(
+        self,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        K: np.ndarray,
+        state: ObjectTrackState,
+    ) -> tuple[
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[tuple[int, int, int, int]],
+        Optional[float],
+        Optional[tuple[int, int, int, int]],
+    ]:
+        """
+        Fast tracking observation:
+        - crop a small ROI around last bbox
+        - build a cheap depth-gated local mask
+        """
+        if state.last_bbox_xyxy is None or state.T_object_camera is None:
+            return None, None, None, None, None, None, None
+
+        h, w = rgb.shape[:2]
+        roi_bbox = self._expand_bbox(
+            state.last_bbox_xyxy, h, w, pad_px=self.args.track_roi_pad_px
+        )
+        x0, y0, x1, y1 = roi_bbox
+
+        rgb_crop = rgb[y0:y1, x0:x1].copy()
+        depth_crop = depth[y0:y1, x0:x1].copy()
+        if rgb_crop.size == 0 or depth_crop.size == 0:
+            return None, None, None, None, None, None, None
+
+        K_crop = self._crop_K(K, x0, y0)
+
+        z_prev = float(state.last_depth_m if state.last_depth_m > 0 else state.T_object_camera[2, 3])
+        z_lo = max(self.args.min_valid_z_m, z_prev - self.args.track_depth_band_m)
+        z_hi = min(self.args.max_valid_z_m, z_prev + self.args.track_depth_band_m)
+
+        valid = np.isfinite(depth_crop) & (depth_crop > z_lo) & (depth_crop < z_hi)
+
+        valid_u8 = (valid.astype(np.uint8) * 255)
+        kernel = np.ones((5, 5), np.uint8)
+        valid_u8 = cv2.morphologyEx(valid_u8, cv2.MORPH_OPEN, kernel)
+        valid_u8 = cv2.morphologyEx(valid_u8, cv2.MORPH_CLOSE, kernel)
+        local_mask = valid_u8 > 0
+
+        if int(local_mask.sum()) < self.args.track_min_local_mask_px:
+            z_lo = max(self.args.min_valid_z_m, z_prev - 2.0 * self.args.track_depth_band_m)
+            z_hi = min(self.args.max_valid_z_m, z_prev + 2.0 * self.args.track_depth_band_m)
+            valid = np.isfinite(depth_crop) & (depth_crop > z_lo) & (depth_crop < z_hi)
+            local_mask = valid
+
+        if int(local_mask.sum()) < self.args.track_min_local_mask_px:
+            return None, None, None, None, None, None, None
+
+        local_mask = self._largest_component(local_mask)
+
+        if int(local_mask.sum()) < self.args.track_min_local_mask_px:
+            return None, None, None, None, None, None, None
+
+        local_bbox = self._bbox_from_mask(local_mask)
+        if local_bbox is None:
+            return None, None, None, None, None, None, None
+
+        lx0, ly0, lx1, ly1 = local_bbox
+        global_bbox = self._clip_bbox((x0 + lx0, y0 + ly0, x0 + lx1, y0 + ly1), h, w)
+
+        d = depth_crop[local_mask]
+        d = d[np.isfinite(d) & (d > self.args.min_valid_z_m) & (d < self.args.max_valid_z_m)]
+        if d.size == 0:
+            return None, None, None, None, None, None, None
+
+        z_med = float(np.median(d))
+        return rgb_crop, depth_crop, K_crop, local_mask.astype(bool), global_bbox, z_med, roi_bbox
 
     def _get_or_create_pose_base_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
         key = f"{cam_id}/{object_id}_{idx}"
@@ -640,10 +769,10 @@ class FoundationPoseTrackerNode(Node):
 
     def _to_base_pose(self, cam_id: str, T_object_camera: np.ndarray) -> np.ndarray:
         T_object_camera = np.asarray(T_object_camera, dtype=np.float32).reshape(4, 4)
-        
+
         if cam_id not in self.T_base_cam_map:
             raise KeyError(f"No base extrinsic for cam_id={cam_id}")
-        
+
         T_base_cam = self.T_base_cam_map[cam_id]
         if hasattr(T_base_cam, "as_matrix"):
             T_base_cam = T_base_cam.as_matrix()
@@ -651,8 +780,7 @@ class FoundationPoseTrackerNode(Node):
             T_base_cam = T_base_cam.matrix
         else:
             T_base_cam = np.asarray(T_base_cam, dtype=np.float32).reshape(4, 4)
-        
-        # Use directly - NO INVERSE
+
         return T_base_cam @ T_object_camera
 
     def _generate_and_filter_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
@@ -702,8 +830,6 @@ class FoundationPoseTrackerNode(Node):
             return []
 
         try:
-            # dino_results = batch_dino_classify(self.dino, crops_rgb, crops_mask)
-            from pathlib import Path
             debug_dir = str(
                 Path(self.args.output_root) / "dino_debug" / f"frame_{self.frame_counter:06d}"
             )
@@ -787,25 +913,20 @@ class FoundationPoseTrackerNode(Node):
     def _pose_reason(self, T: np.ndarray) -> tuple[bool, str]:
         R = T[:3, :3]
         t = T[:3, 3]
-        
-        # Check rotation trace - reject upside-down orientations
+
         trace = np.trace(R)
         if trace < -1.5:
             return False, f"flipped_orientation trace={trace:.3f}"
-        
-        # Object MUST be in front of camera at reasonable distance
-        # Camera is ~53cm above table, object on table should be Z ≈ 0.4-0.7m
+
         z = t[2]
         if z < 0.3 or z > 0.8:
             return False, f"bad_z z={z:.3f} (expected 0.3-0.8)"
-        
-        # Check total distance magnitude
+
         t_mag = np.linalg.norm(t)
         if t_mag < 0.4 or t_mag > 0.9:
             return False, f"bad_distance mag={t_mag:.3f}"
-        
-        return True, "ok"
 
+        return True, "ok"
 
     def _draw_track_box(
         self,
@@ -817,19 +938,17 @@ class FoundationPoseTrackerNode(Node):
         out = image.copy()
         color = self.palette[obj_idx % len(self.palette)]
 
+        if state.last_bbox_xyxy is not None:
+            out = draw_bbox_label(
+                out,
+                state.last_bbox_xyxy,
+                f"{state.object_id} {mode}",
+                color,
+                font_scale=0.6,
+            )
+
         if state.recovery_mask is not None:
-            ys, xs = np.where(state.recovery_mask.astype(bool))
-            if xs.size > 0 and ys.size > 0:
-                x0, x1 = int(xs.min()), int(xs.max())
-                y0, y1 = int(ys.min()), int(ys.max())
-                out = draw_bbox_label(
-                    out,
-                    (x0, y0, x1, y1),
-                    f"{state.object_id} {mode}",
-                    color,
-                    font_scale=0.6,
-                )
-                out = draw_mask_overlay(out, state.recovery_mask, color=color, alpha=0.18)
+            out = draw_mask_overlay(out, state.recovery_mask, color=color, alpha=0.18)
 
         if state.T_object_camera is not None:
             out = draw_pose_text(
@@ -904,25 +1023,31 @@ class FoundationPoseTrackerNode(Node):
         view: Any,
         state: ObjectTrackState,
     ) -> tuple[Optional[np.ndarray], Optional[str]]:
-        """Try to recover a drifting track by re-registering the same object only."""
+        """
+        Slow recovery path:
+        rerun local FP estimate on a cropped ROI, then continue.
+        """
         if state.fp_tracker is None:
-            return None, None
-        if state.recovery_mask is None:
             return None, None
 
         rgb = view.rgb
         depth = view.depth
-        #print("depth min/max:", depth.min(), depth.max())
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
+
+        obs = self._build_local_track_observation(rgb, depth, K, state)
+        rgb_crop, depth_crop, K_crop, mask_crop, new_bbox_xyxy, z_med, roi_bbox = obs
+
+        if rgb_crop is None:
+            return None, None
 
         try:
             result = state.fp_tracker.estimate_pose(
                 object_id=state.object_id,
                 mesh_path=state.mesh_path,
-                rgb=rgb,
-                depth=depth,
-                K=K,
-                mask=state.recovery_mask,
+                rgb=rgb_crop,
+                depth=depth_crop,
+                K=K_crop,
+                mask=mask_crop,
             )
         except Exception as e:
             self.get_logger().warn(
@@ -939,46 +1064,21 @@ class FoundationPoseTrackerNode(Node):
             )
             return None, None
 
-        try:
-            same_result = state.fp_tracker.track_pose(
-                object_id=state.object_id,
-                mesh_path=state.mesh_path,
-                rgb=rgb,
-                depth=depth,
-                K=K,
-                T_object_camera_init=T_rec,
-            )
-            T_same_raw = np.asarray(same_result.T_object_camera, dtype=np.float32).reshape(4, 4)
-            jump_same_raw = float(np.linalg.norm(T_same_raw[:3, 3] - T_rec[:3, 3]))
+        h, w = rgb.shape[:2]
+        if roi_bbox is not None:
+            rx0, ry0, _, _ = roi_bbox
+            state.recovery_mask = self._make_global_mask_from_local(mask_crop, rx0, ry0, h, w)
+        state.last_bbox_xyxy = new_bbox_xyxy
+        state.last_depth_m = float(z_med) if z_med is not None else float(T_rec[2, 3])
+        state.last_update_time_s = time.time()
 
-            try:
-                T_same_inv = np.linalg.inv(T_same_raw)
-                jump_same_inv = float(np.linalg.norm(T_same_inv[:3, 3] - T_rec[:3, 3]))
-            except np.linalg.LinAlgError:
-                jump_same_inv = float("inf")
-
-            recovered_convention = "inv" if jump_same_inv < jump_same_raw else "raw"
-
-            self.get_logger().info(
-                f"[{view.cam_id}] RECOVER-CONVENTION {state.object_id} "
-                f"jump_same_raw={jump_same_raw:.3f}m "
-                f"jump_same_inv={jump_same_inv:.3f}m "
-                f"chosen={recovered_convention}"
-            )
-        except Exception as e:
-            self.get_logger().warn(
-                f"[{view.cam_id}] RECOVER-CONVENTION {state.object_id} failed: {e}"
-            )
-            recovered_convention = state.track_pose_convention
-
-        return T_rec, recovered_convention
+        return T_rec, "raw"
 
     def _initialize_objects(
         self, view: Any, selections: list[CandidateSelection], stamp,
     ) -> tuple[list[ObjectTrackState], np.ndarray]:
         rgb = view.rgb
         depth = view.depth
-        #print("depth min/max:", depth.min(), depth.max())
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
         cam_id = view.cam_id
 
@@ -1018,7 +1118,6 @@ class FoundationPoseTrackerNode(Node):
             )
 
             t0 = time.perf_counter()
-            # Save frame for offline debugging
             debug_frame_dir = Path(self.args.output_root) / "debug_frames" / f"frame_{self.frame_counter:06d}"
             debug_frame_dir.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(debug_frame_dir / "rgb.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
@@ -1026,15 +1125,11 @@ class FoundationPoseTrackerNode(Node):
             cv2.imwrite(str(debug_frame_dir / "mask.png"), (sel.candidate.mask * 255).astype(np.uint8))
             np.save(str(debug_frame_dir / "K.npy"), K)
             try:
-                # BEFORE calling estimate_pose
                 mask_depth = depth[mask]
                 valid_depth = mask_depth[np.isfinite(mask_depth) & (mask_depth > 0)]
                 print(f"[DEPTH CHECK] median={np.median(valid_depth):.3f} std={np.std(valid_depth):.3f}")
                 print(f"[DEPTH CHECK] Expecting object at ~0.58m, mesh is 0.12m wide")
                 print(f"[DEPTH CHECK] If mesh center is at depth={np.median(valid_depth):.3f}, mesh extends {np.median(valid_depth)-0.06:.3f} to {np.median(valid_depth)+0.06:.3f}")
-                # BEFORE calling estimate_pose
-                mask_depth = depth[mask]
-                valid_depth = mask_depth[np.isfinite(mask_depth) & (mask_depth > 0)]
                 self.get_logger().info(
                     f"[FP INPUT DEBUG] {sel.object_id} "
                     f"depth: min={np.min(valid_depth):.3f} median={np.median(valid_depth):.3f} max={np.max(valid_depth):.3f} "
@@ -1052,7 +1147,7 @@ class FoundationPoseTrackerNode(Node):
                 T = result.T_object_camera
                 print(f"[FP RESULT] t={T[:3,3]} det={np.linalg.det(T):.6f}")
                 print(f"[FP RESULT] R_trace={np.trace(T[:3,:3]):.6f}")
-                # AFTER estimate_pose
+
                 T = result.T_object_camera
                 R = T[:3, :3]
                 t = T[:3, 3]
@@ -1064,7 +1159,6 @@ class FoundationPoseTrackerNode(Node):
                     f"det={np.linalg.det(R):.6f}"
                 )
 
-                # Check if we need to INVERT the pose
                 T_inv = np.linalg.inv(T)
                 t_inv = T_inv[:3, 3]
                 self.get_logger().info(
@@ -1072,11 +1166,8 @@ class FoundationPoseTrackerNode(Node):
                     f"t_inv={t_inv}"
                 )
 
-                # Check if rotation makes sense
-                R = T[:3,:3]
-                print(f"[FP RESULT] R@R.T (should be I):\n{R @ R.T}")
                 R = T[:3, :3]
-                t = T[:3, 3]
+                print(f"[FP RESULT] R@R.T (should be I):\n{R @ R.T}")
                 trace = np.trace(R)
 
                 self.get_logger().info(
@@ -1134,10 +1225,11 @@ class FoundationPoseTrackerNode(Node):
                     f"[{cam_id}] DEBUG INIT BASE_INV {sel.object_id} "
                     f"t_base_inv=[{T_base_inv[0,3]:.3f}, {T_base_inv[1,3]:.3f}, {T_base_inv[2,3]:.3f}]"
                 )
-            def xyz(T):
-                if T is None:
+
+            def xyz(Tm):
+                if Tm is None:
                     return [None, None, None]
-                return [float(T[0,3]), float(T[1,3]), float(T[2,3])]
+                return [float(Tm[0,3]), float(Tm[1,3]), float(Tm[2,3])]
 
             with open(self.csv_log_path, "a", newline="") as f:
                 writer = csv.writer(f)
@@ -1210,6 +1302,9 @@ class FoundationPoseTrackerNode(Node):
                 last_mask_area=int(sel.candidate.mask.sum()),
                 track_pose_convention=track_pose_convention,
                 recovery_mask=sel.candidate.mask.copy(),
+                last_bbox_xyxy=tuple(int(v) for v in sel.candidate.bbox_xyxy),
+                last_depth_m=float(np.median(valid_depth)) if len(valid_depth) > 0 else float(T[2, 3]),
+                last_update_time_s=time.time(),
             )
             state.id_history.append(sel.object_id)
             new_states.append(state)
@@ -1240,7 +1335,14 @@ class FoundationPoseTrackerNode(Node):
     def _track_objects(
         self, view: Any, states: list[ObjectTrackState], stamp,
     ) -> tuple[list[ObjectTrackState], np.ndarray]:
-        """Run FoundationPose tracking with local recovery before losing a track."""
+        """
+        Fast local tracking mode:
+        - NO full-image SAM
+        - NO DINO
+        - local ROI around previous bbox
+        - cheap depth-gated mask inside ROI
+        - local FP register on cropped inputs
+        """
         rgb = view.rgb
         depth = view.depth
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
@@ -1250,139 +1352,86 @@ class FoundationPoseTrackerNode(Node):
         pose_overlay = rgb.copy()
 
         for i, state in enumerate(states):
-            if state.T_object_camera is None:
-                self.get_logger().warn(
-                    f"[{cam_id}] TRACK [{i}] {state.object_id} missing previous pose"
-                )
+            if state.T_object_camera is None or state.fp_tracker is None or state.last_bbox_xyxy is None:
                 state.lost_count += 1
+                self.get_logger().warn(
+                    f"[{cam_id}] TRACK [{i}] {state.object_id} missing tracking state "
+                    f"(lost={state.lost_count})"
+                )
                 if state.lost_count < self.args.max_lost_count:
                     surviving.append(state)
                 continue
 
-            if state.fp_tracker is None:
-                self.get_logger().warn(
-                    f"[{cam_id}] TRACK [{i}] {state.object_id} missing fp_tracker"
-                )
+            obs = self._build_local_track_observation(rgb, depth, K, state)
+            rgb_crop, depth_crop, K_crop, mask_crop, new_bbox_xyxy, z_med, roi_bbox = obs
+
+            if rgb_crop is None:
                 state.lost_count += 1
+                self.get_logger().warn(
+                    f"[{cam_id}] TRACK [{i}] {state.object_id} local observation failed "
+                    f"(lost={state.lost_count})"
+                )
                 if state.lost_count < self.args.max_lost_count:
                     surviving.append(state)
                 continue
 
             t0 = time.perf_counter()
             try:
-                result = state.fp_tracker.track_pose(
+                result = state.fp_tracker.estimate_pose(
                     object_id=state.object_id,
                     mesh_path=state.mesh_path,
-                    rgb=rgb,
-                    depth=depth,
-                    K=K,
-                    T_object_camera_init=state.T_object_camera,
+                    rgb=rgb_crop,
+                    depth=depth_crop,
+                    K=K_crop,
+                    mask=mask_crop,
                 )
             except Exception as e:
-                self.get_logger().warn(
-                    f"[{cam_id}] TRACK [{i}] {state.object_id} FP exception: {e}"
-                )
                 state.lost_count += 1
+                self.get_logger().warn(
+                    f"[{cam_id}] TRACK [{i}] {state.object_id} local FP exception: {e} "
+                    f"(lost={state.lost_count})"
+                )
                 if state.lost_count < self.args.max_lost_count:
                     surviving.append(state)
                 continue
 
             dt_fp = (time.perf_counter() - t0) * 1000.0
 
+            T_new = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
             prev = np.asarray(state.T_object_camera, dtype=np.float32).reshape(4, 4)
-            T_raw = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
-
-            try:
-                T_inv = np.linalg.inv(T_raw)
-                inv_valid = True
-            except np.linalg.LinAlgError:
-                T_inv = None
-                inv_valid = False
-
-            convention = getattr(state, "track_pose_convention", "raw")
-
-            if convention == "inv":
-                if not inv_valid:
-                    state.lost_count += 1
-                    self.get_logger().warn(
-                        f"[{cam_id}] TRACK [{i}] {state.object_id} inverse pose unavailable "
-                        f"(lost={state.lost_count})"
-                    )
-                    if state.lost_count < self.args.max_lost_count:
-                        surviving.append(state)
-                    continue
-                T_new = T_inv
-            else:
-                T_new = T_raw
-
-            jump_raw = float(np.linalg.norm(T_raw[:3, 3] - prev[:3, 3]))
-            jump_inv = (
-                float(np.linalg.norm(T_inv[:3, 3] - prev[:3, 3]))
-                if inv_valid else float("inf")
-            )
             jump_m = float(np.linalg.norm(T_new[:3, 3] - prev[:3, 3]))
 
-            self.get_logger().info(
-                f"[{cam_id}] TRACK [{i}] {state.object_id} "
-                f"fp={dt_fp:.1f}ms convention={convention} "
-                f"jump_raw={jump_raw:.3f}m jump_inv={jump_inv:.3f}m used={jump_m:.3f}m"
-            )
-
             ok_pose, pose_msg = self._pose_reason(T_new)
-
-            need_recover = False
             if not ok_pose:
-                need_recover = True
-                self.get_logger().warn(
-                    f"[{cam_id}] TRACK [{i}] {state.object_id} pose suspicious: "
-                    f"{pose_msg} "
-                    f"prev_t=[{prev[0,3]:.3f}, {prev[1,3]:.3f}, {prev[2,3]:.3f}] "
-                    f"new_t=[{T_new[0,3]:.3f}, {T_new[1,3]:.3f}, {T_new[2,3]:.3f}] "
-                    f"(convention={convention})"
-                )
-            elif jump_m > self.args.max_translation_jump_m:
-                need_recover = True
-                self.get_logger().warn(
-                    f"[{cam_id}] TRACK [{i}] {state.object_id} jump suspicious: "
-                    f"{jump_m:.3f} m > {self.args.max_translation_jump_m:.3f} m "
-                    f"(convention={convention})"
-                )
-
-            if need_recover:
-                T_rec, recovered_convention = self._try_local_recover(view, state)
-                if T_rec is not None:
-                    state.T_object_camera = T_rec.copy()
-                    if recovered_convention is not None:
-                        state.track_pose_convention = recovered_convention
-                    state.lost_count = 0
-                    state.mode = "track"
-                    surviving.append(state)
-
-                    smoothed_id = vote_object_id(state.id_history)
-                    pose_overlay = self._draw_track_box(
-                        pose_overlay, state, i, mode=f"recover/{state.track_pose_convention}"
-                    )
-
-                    self._log_pose("TRACK RECOVER", cam_id, smoothed_id, i, T_rec, state.dino_score)
-                    self._publish_pose_track(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose_base_track(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose_base(cam_id, state.object_id, i, T_rec, stamp)
-
-                    self.get_logger().info(
-                        f"[{cam_id}] TRACK [{i}] RECOVERED obj={smoothed_id} "
-                        f"new_convention={state.track_pose_convention}"
-                    )
-                    continue
-
                 state.lost_count += 1
                 self.get_logger().warn(
-                    f"[{cam_id}] TRACK [{i}] {state.object_id} recovery failed "
+                    f"[{cam_id}] TRACK [{i}] {state.object_id} bad local pose: {pose_msg} "
                     f"(lost={state.lost_count})"
                 )
                 if state.lost_count < self.args.max_lost_count:
                     surviving.append(state)
                 continue
+
+            if jump_m > self.args.max_translation_jump_m:
+                state.lost_count += 1
+                self.get_logger().warn(
+                    f"[{cam_id}] TRACK [{i}] {state.object_id} jump suspicious: "
+                    f"{jump_m:.3f} m > {self.args.max_translation_jump_m:.3f} m "
+                    f"(lost={state.lost_count})"
+                )
+                if state.lost_count < self.args.max_lost_count:
+                    surviving.append(state)
+                continue
+
+            state.last_bbox_xyxy = new_bbox_xyxy
+            state.last_depth_m = float(z_med) if z_med is not None else float(T_new[2, 3])
+            state.last_update_time_s = time.time()
+            state.last_mask_area = int(mask_crop.sum())
+
+            h, w = rgb.shape[:2]
+            if roi_bbox is not None:
+                rx0, ry0, _, _ = roi_bbox
+                state.recovery_mask = self._make_global_mask_from_local(mask_crop, rx0, ry0, h, w)
 
             state.T_object_camera = T_new.copy()
             state.lost_count = 0
@@ -1391,9 +1440,14 @@ class FoundationPoseTrackerNode(Node):
 
             smoothed_id = vote_object_id(state.id_history)
 
-            state.T_object_camera = T_new.copy()
             pose_overlay = self._draw_track_box(
-                pose_overlay, state, i, mode=f"track/{convention}"
+                pose_overlay, state, i, mode="track_fast"
+            )
+
+            self.get_logger().info(
+                f"[{cam_id}] TRACK [{i}] {state.object_id} "
+                f"fp={dt_fp:.1f}ms jump={jump_m:.3f}m "
+                f"bbox={state.last_bbox_xyxy} mask_px={int(mask_crop.sum())}"
             )
 
             self._log_pose("TRACK POSE", cam_id, smoothed_id, i, T_new, state.dino_score)
@@ -1401,11 +1455,6 @@ class FoundationPoseTrackerNode(Node):
             self._publish_pose_base_track(cam_id, state.object_id, i, T_new, stamp)
             self._publish_pose(cam_id, state.object_id, i, T_new, stamp)
             self._publish_pose_base(cam_id, state.object_id, i, T_new, stamp)
-
-            self.get_logger().info(
-                f"[{cam_id}] TRACK [{i}] ACCEPT obj={smoothed_id} "
-                f"convention={convention} jump={jump_m:.3f}m"
-            )
 
         return surviving, pose_overlay
 
@@ -1447,7 +1496,7 @@ class FoundationPoseTrackerNode(Node):
                 return
             else:
                 self.get_logger().warn(
-                    f"[{cam_id}] all tracks lost, falling back to re-init"
+                    f"[{cam_id}] all tracks lost, falling back to global re-init"
                 )
 
         t_total = time.perf_counter()
@@ -1593,6 +1642,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-lost-count", type=int, default=8)
 
     p.add_argument("--min-depth-coverage", type=float, default=0.30)
+
+    # fast local tracking
+    p.add_argument("--track-roi-pad-px", type=int, default=70)
+    p.add_argument("--track-depth-band-m", type=float, default=0.08)
+    p.add_argument("--track-min-local-mask-px", type=int, default=500)
+    p.add_argument("--track-bbox-pad-after-update-px", type=int, default=20)
 
     return p.parse_args()
 
