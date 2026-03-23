@@ -252,7 +252,6 @@ class FoundationPoseWrapper:
             return
 
         mesh = self._trimesh.load(mesh_path)
-        print("DEBUG mesh extents BEFORE:", mesh.extents)
         # Center mesh at origin (required for correct FP pose)
         mesh.vertices -= mesh.centroid
         mesh_scale = self.cfg.mesh_scale

@@ -104,7 +104,7 @@ class MultiCamGrabber(Node):
         sync_slop_s: float = 0.015,
         use_best_effort_if_unsynced: bool = True,
         static_extrinsics_base_cam: Optional[dict[str, SE3]] = None,
-        rgb_depth_max_dt_s: float = 0.10,  # NEW: per-cam rgb-depth association tolerance
+        rgb_depth_max_dt_s: float = 0.10,
     ):
         super().__init__("multicam_grabber")
 
@@ -195,10 +195,6 @@ class MultiCamGrabber(Node):
         """
         Returns a synced list[View] in base frame if possible.
 
-        Implements:
-        - Option 1 readiness: fill View.rgb as HxWx3 uint8 RGB
-        - Option 2 readiness: provide RGB so fusion can mask pixels
-        - Option 3: stream sanity checks (rgb-depth dt, frozen RGB, shape checks)
         """
         if not self.ready():
             return None
@@ -277,7 +273,6 @@ class MultiCamGrabber(Node):
             # -----------------------------------------
             # 4) Option 3: shape sanity (throttled warn)
             # -----------------------------------------
-            # It's OK if shapes differ (depending on ZED settings), but warn to avoid silent mismatch.
             if rgb is not None:
                 Hd, Wd = depth_m.shape[:2]
                 Hr, Wr = rgb.shape[:2]
@@ -293,7 +288,6 @@ class MultiCamGrabber(Node):
             # -----------------------------------------
             # 5) Option 3: frozen RGB detection (cheap)
             # -----------------------------------------
-            # We compute a tiny signature from a subsample to detect "stuck" RGB stream.
             if rgb is not None:
                 st = self._rgb_frozen_state.get(cam_id)
                 if st is None:

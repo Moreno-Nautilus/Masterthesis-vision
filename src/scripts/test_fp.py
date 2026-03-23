@@ -1,7 +1,7 @@
-"""
-Learned perception pipeline: SAM → DINO → FoundationPose
-All outputs published as ROS topics for Foxglove visualization.
-"""
+
+# Learned perception pipeline: SAM → DINO → FoundationPose
+# All outputs published as ROS topics for Foxglove visualization.
+
 
 from __future__ import annotations
 
@@ -1029,18 +1029,8 @@ class FoundationPoseTrackerNode(Node):
                 # BEFORE calling estimate_pose
                 mask_depth = depth[mask]
                 valid_depth = mask_depth[np.isfinite(mask_depth) & (mask_depth > 0)]
-                print(f"[DEPTH CHECK] median={np.median(valid_depth):.3f} std={np.std(valid_depth):.3f}")
-                print(f"[DEPTH CHECK] Expecting object at ~0.58m, mesh is 0.12m wide")
-                print(f"[DEPTH CHECK] If mesh center is at depth={np.median(valid_depth):.3f}, mesh extends {np.median(valid_depth)-0.06:.3f} to {np.median(valid_depth)+0.06:.3f}")
-                # BEFORE calling estimate_pose
                 mask_depth = depth[mask]
                 valid_depth = mask_depth[np.isfinite(mask_depth) & (mask_depth > 0)]
-                self.get_logger().info(
-                    f"[FP INPUT DEBUG] {sel.object_id} "
-                    f"depth: min={np.min(valid_depth):.3f} median={np.median(valid_depth):.3f} max={np.max(valid_depth):.3f} "
-                    f"mask_area={int(mask.sum())} "
-                    f"K_fx={K[0,0]:.1f} K_fy={K[1,1]:.1f}"
-                )
                 result = tracker.estimate_pose(
                     object_id=sel.object_id,
                     mesh_path=mesh_path,
@@ -1067,14 +1057,10 @@ class FoundationPoseTrackerNode(Node):
                 # Check if we need to INVERT the pose
                 T_inv = np.linalg.inv(T)
                 t_inv = T_inv[:3, 3]
-                self.get_logger().info(
-                    f"[FP OUTPUT DEBUG INV] {sel.object_id} "
-                    f"t_inv={t_inv}"
-                )
+       
 
                 # Check if rotation makes sense
                 R = T[:3,:3]
-                print(f"[FP RESULT] R@R.T (should be I):\n{R @ R.T}")
                 R = T[:3, :3]
                 t = T[:3, 3]
                 trace = np.trace(R)
@@ -1111,17 +1097,6 @@ class FoundationPoseTrackerNode(Node):
                     T_base_inv = self._to_base_pose(cam_id, T_inv)
                 except Exception as e:
                     self.get_logger().warn(f"[{cam_id}] INIT base inv failed: {e}")
-
-            self.get_logger().info(
-                f"[{cam_id}] DEBUG INIT RAW {sel.object_id} "
-                f"t_cam=[{T[0,3]:.3f}, {T[1,3]:.3f}, {T[2,3]:.3f}]"
-            )
-
-            if T_inv is not None:
-                self.get_logger().info(
-                    f"[{cam_id}] DEBUG INIT INV {sel.object_id} "
-                    f"t_cam_inv=[{T_inv[0,3]:.3f}, {T_inv[1,3]:.3f}, {T_inv[2,3]:.3f}]"
-                )
 
             if T_base_raw is not None:
                 self.get_logger().info(
