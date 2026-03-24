@@ -13,7 +13,7 @@ class FoundationPoseConfig:
     repo_root: str = "external/FoundationPose"
     weights_dir: str = "external/FoundationPose/weights"
     debug_dir: str = "outputs/foundationpose/fp_internal_debug"
-    debug: int = 2
+    debug: int = 0
     est_refine_iter: int = 5
     mesh_scale: float = 0.01  # STL is in mm, convert to meters
 
@@ -166,7 +166,6 @@ class FoundationPoseWrapper:
         self._glctx = None
         self._scorer = None
         self._refiner = None
-        print(f"[FoundationPoseWrapper] mesh_scale={self.cfg.mesh_scale}")
 
     def _ensure_repo_on_path(self) -> None:
         if not self.repo_root.exists():
@@ -342,7 +341,7 @@ class FoundationPoseWrapper:
             max_rot_deg=10.0,
         )
         
-        print(f"[MINI-REGISTER] Generated {len(candidates)} candidates around prior")
+        # print(f"[MINI-REGISTER] Generated {len(candidates)} candidates around prior")
         
         # Convert candidates to the uncentered convention expected by FP scorer
         tf_to_center = self._est.get_tf_to_centered_mesh()
@@ -384,8 +383,8 @@ class FoundationPoseWrapper:
         self._est.pose_last = torch.from_numpy(best_pose_uncentered.copy()).cuda().float()
         
         elapsed = (time.time() - t0) * 1000
-        print(f"[MINI-REGISTER] Best score={best_score:.2f} idx={best_idx} time={elapsed:.1f}ms")
-        print(f"[MINI-REGISTER] t_in={T_init[:3, 3]} -> t_out={best_pose_centered[:3, 3]}")
+        # print(f"[MINI-REGISTER] Best score={best_score:.2f} idx={best_idx} time={elapsed:.1f}ms")
+        # print(f"[MINI-REGISTER] t_in={T_init[:3, 3]} -> t_out={best_pose_centered[:3, 3]}")
         
         return FoundationPoseResult(
             object_id=object_id,
@@ -468,7 +467,7 @@ class FoundationPoseWrapper:
         self._est.pose_last = torch.from_numpy(best_pose_uncentered).cuda().float()
         
         elapsed = (time.time() - t0) * 1000
-        print(f"[MINI-REGISTER FAST] {len(candidates)} candidates, best={best_idx}, time={elapsed:.1f}ms")
+        # print(f"[MINI-REGISTER FAST] {len(candidates)} candidates, best={best_idx}, time={elapsed:.1f}ms")
         
         return best_pose_centered.astype(np.float32)
 
@@ -559,17 +558,7 @@ class FoundationPoseWrapper:
         mask_bool = mask.astype(bool)
         d = depth[mask_bool]
         valid = d[np.isfinite(d) & (d > 0)]
-        if valid.size > 0:
-            print(
-                f"[estimate_pose depth] {object_id} "
-                f"mask_area={int(mask.sum())} "
-                f"depth_min={float(valid.min()):.3f} "
-                f"depth_med={float(np.median(valid)):.3f} "
-                f"depth_max={float(valid.max()):.3f}"
-            )
-        else:
-            print(f"[estimate_pose depth] {object_id} no valid depth in mask")
-
+        
         try:
             import torch
 
@@ -578,7 +567,7 @@ class FoundationPoseWrapper:
             if hasattr(self._refiner, "model") and self._refiner.model is not None:
                 self._refiner.model = self._refiner.model.float().cuda().eval()
             # RIGHT BEFORE self._est.register():
-            print(f"[DEBUG depth check] has_nan={np.isnan(depth).any()} has_inf={np.isinf(depth).any()} min={np.nanmin(depth):.3f} max={np.nanmax(depth):.3f}")
+            # print(f"[DEBUG depth check] has_nan={np.isnan(depth).any()} has_inf={np.isinf(depth).any()} min={np.nanmin(depth):.3f} max={np.nanmax(depth):.3f}")
             pose = self._est.register(
                 K=K,
                 rgb=rgb,
@@ -586,7 +575,7 @@ class FoundationPoseWrapper:
                 ob_mask=mask,
                 iteration=0,
             )
-            print("FP raw translation:", pose[:3, 3])
+            # print("FP raw translation:", pose[:3, 3])
         except Exception as e:
             raise RuntimeError(
                 f"FoundationPose register() failed for {object_id} "
@@ -601,10 +590,7 @@ class FoundationPoseWrapper:
         pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
 
         t_raw = pose[:3, 3].copy()
-        print(
-            f"[estimate_pose RAW] {object_id} "
-            f"t_raw=[{t_raw[0]:.3f}, {t_raw[1]:.3f}, {t_raw[2]:.3f}]"
-        )
+
 
         return FoundationPoseResult(
             object_id=object_id,

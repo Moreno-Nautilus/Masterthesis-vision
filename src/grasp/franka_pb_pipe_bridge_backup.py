@@ -84,8 +84,8 @@ class FrankaPbPipeBridge(Node):
         self.declare_parameter("centroid_offset_z", 0.0)
 
         # Surface clearances
-        self.declare_parameter("pregrasp_clearance_m", 0.10)
-        self.declare_parameter("grasp_clearance_m", 0.030)
+        self.declare_parameter("pregrasp_clearance_m", 0.080)
+        self.declare_parameter("grasp_clearance_m", 0.020)
 
         # Extra offset for TCP / gripper geometry
         self.declare_parameter("tcp_extra_offset_m", 0.0)
@@ -98,7 +98,7 @@ class FrankaPbPipeBridge(Node):
         self.declare_parameter("pitch", 0.0)
         self.declare_parameter("yaw", math.pi / 2.0)
 
-        # Neutral/base pose
+        # Neutral pose
         self.declare_parameter("neutral_x", 0.30)
         self.declare_parameter("neutral_y", 0.00)
         self.declare_parameter("neutral_z", 0.35)
@@ -302,6 +302,7 @@ class FrankaPbPipeBridge(Node):
                 float(msg.pose.position.z),
             ])
 
+        # No numpy dependency here
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         zs = [p[2] for p in pts]
@@ -332,24 +333,35 @@ class FrankaPbPipeBridge(Node):
     def _compute_pregrasp_and_grasp(self, msg: PoseStamped) -> tuple[TargetPose, TargetPose]:
         x_c, y_c, z_c = self._compute_target_center(msg)
 
+        radius = 0.5 * self.object_diameter_m
+        pre_offset = radius + self.pregrasp_clearance_m + self.tcp_extra_offset_m
+        grasp_offset = radius + self.grasp_clearance_m + self.tcp_extra_offset_m
+
+        if self.approach_axis == "x":
+            x_pre = x_c + self.approach_sign * pre_offset
+            y_pre = y_c
+            z_pre = z_c
+
+            x_grasp = x_c + self.approach_sign * grasp_offset
+            y_grasp = y_c
+            z_grasp = z_c
+        else:
+            x_pre = x_c
+            y_pre = y_c + self.approach_sign * pre_offset
+            z_pre = z_c
+
+            x_grasp = x_c
+            y_grasp = y_c + self.approach_sign * grasp_offset
+            z_grasp = z_c
+
         pregrasp = TargetPose(
-            x=x_c,
-            y=y_c,
-            z=z_c + self.pregrasp_clearance_m + self.tcp_extra_offset_m,
-            roll=self.roll,
-            pitch=self.pitch,
-            yaw=self.yaw,
+            x=x_pre, y=y_pre, z=z_pre,
+            roll=self.roll, pitch=self.pitch, yaw=self.yaw,
         )
-
         grasp = TargetPose(
-            x=x_c,
-            y=y_c,
-            z=z_c + self.grasp_clearance_m + self.tcp_extra_offset_m,
-            roll=self.roll,
-            pitch=self.pitch,
-            yaw=self.yaw,
+            x=x_grasp, y=y_grasp, z=z_grasp,
+            roll=self.roll, pitch=self.pitch, yaw=self.yaw,
         )
-
         return pregrasp, grasp
 
     def _compute_lift(self, grasp: TargetPose) -> TargetPose:
@@ -375,9 +387,6 @@ class FrankaPbPipeBridge(Node):
     # ------------------------------------------------------------------
     # Sending / logging
     # ------------------------------------------------------------------
-
-    def _is_timeout_msg(self, msg: str) -> bool:
-        return "timed out" in msg.lower()
 
     def _send_pose_blocking(self, target: TargetPose) -> tuple[bool, str]:
         self.get_logger().info(
@@ -485,11 +494,6 @@ class FrankaPbPipeBridge(Node):
         assert self.pregrasp_target is not None
         ok, msg = self._send_pose_blocking(self.pregrasp_target)
         if not ok:
-            if self._is_timeout_msg(msg):
-                self.stage = "pregrasp_sent"
-                response.success = True
-                response.message = f"Pregrasp likely sent ({msg})"
-                return response
             response.success = False
             response.message = f"Pregrasp failed: {msg}"
             return response
@@ -514,11 +518,6 @@ class FrankaPbPipeBridge(Node):
 
         ok, msg = self._send_pose_blocking(self.grasp_target)
         if not ok:
-            if self._is_timeout_msg(msg):
-                self.stage = "grasp_sent"
-                response.success = True
-                response.message = f"Grasp likely sent ({msg})"
-                return response
             response.success = False
             response.message = f"Grasp failed: {msg}"
             return response
@@ -543,11 +542,6 @@ class FrankaPbPipeBridge(Node):
 
         ok, msg = self._send_pose_blocking(self.lift_target)
         if not ok:
-            if self._is_timeout_msg(msg):
-                self.stage = "lift_sent"
-                response.success = True
-                response.message = f"Lift likely sent ({msg})"
-                return response
             response.success = False
             response.message = f"Lift failed: {msg}"
             return response
@@ -565,11 +559,6 @@ class FrankaPbPipeBridge(Node):
 
         ok, msg = self._send_pose_blocking(neutral)
         if not ok:
-            if self._is_timeout_msg(msg):
-                self.stage = "neutral_sent"
-                response.success = True
-                response.message = f"Neutral/base likely sent ({msg})"
-                return response
             response.success = False
             response.message = f"Neutral/base failed: {msg}"
             return response
