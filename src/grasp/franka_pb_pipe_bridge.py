@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
 import rclpy
+import rclpy.time
 from geometry_msgs.msg import PoseStamped
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_srvs.srv import Trigger
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
+from franka_msgs.action import Grasp
 from messages_fr3.srv import SetPose
 
 
@@ -39,7 +43,7 @@ class FrankaPbPipeBridge(Node):
     Features:
     - subscribes to one raw base-frame pose topic
     - assumes incoming pose is the CAD centroid in frame 'base'
-    - computes side pregrasp + grasp from centroid
+    - computes top-down pregrasp + grasp from centroid
     - supports dry-run mode
     - publishes debug target poses
     - checks target stability before freezing
@@ -63,29 +67,29 @@ class FrankaPbPipeBridge(Node):
         self.declare_parameter("dry_run", True)
 
         # Pose freshness
-        self.declare_parameter("min_pose_age_s", 1.0)
+        self.declare_parameter("min_pose_age_s", 5.0)
 
         # Stability / target lock
-        self.declare_parameter("lock_num_samples", 5)
+        self.declare_parameter("lock_num_samples", 3)
         self.declare_parameter("lock_max_spread_m", 0.01)
-        self.declare_parameter("lock_max_age_s", 1.5)
+        self.declare_parameter("lock_max_age_s", 8.0)
 
         # Object geometry
         self.declare_parameter("object_name", "pb_pipe")
         self.declare_parameter("object_diameter_m", 0.046)
 
-        # Approach direction in base frame
-        self.declare_parameter("approach_axis", "x")   # "x" or "y"
-        self.declare_parameter("approach_sign", -1.0)  # -1.0 or +1.0
+        # These remain declared for compatibility, but are not used in this top-down version
+        self.declare_parameter("approach_axis", "x")
+        self.declare_parameter("approach_sign", -1.0)
 
         # Shift from CAD centroid to desired grasp center
         self.declare_parameter("centroid_offset_x", 0.0)
         self.declare_parameter("centroid_offset_y", 0.0)
         self.declare_parameter("centroid_offset_z", 0.0)
 
-        # Surface clearances
+        # Surface clearances above object center
         self.declare_parameter("pregrasp_clearance_m", 0.10)
-        self.declare_parameter("grasp_clearance_m", 0.030)
+        self.declare_parameter("grasp_clearance_m", 0.025)
 
         # Extra offset for TCP / gripper geometry
         self.declare_parameter("tcp_extra_offset_m", 0.0)
@@ -113,6 +117,16 @@ class FrankaPbPipeBridge(Node):
         # Service timing
         self.declare_parameter("wait_for_service_timeout_s", 2.0)
         self.declare_parameter("set_pose_timeout_s", 15.0)
+
+        # Gripper action settings
+        self.declare_parameter("gripper_action_name", "/fr3_gripper/grasp")
+        self.declare_parameter("gripper_grasp_width", 0.043)
+        self.declare_parameter("gripper_grasp_speed", 0.03)
+        self.declare_parameter("gripper_grasp_force", 20.0)
+        self.declare_parameter("gripper_epsilon_inner", 0.01)
+        self.declare_parameter("gripper_epsilon_outer", 0.01)
+        self.declare_parameter("gripper_timeout_s", 10.0)
+        self.declare_parameter("grasp_settle_time_s", 1.0)
 
         # ------------------------------------------------------------------
         # Read parameters
@@ -164,6 +178,15 @@ class FrankaPbPipeBridge(Node):
             self.get_parameter("set_pose_timeout_s").value
         )
 
+        self.gripper_action_name = str(self.get_parameter("gripper_action_name").value)
+        self.gripper_grasp_width = float(self.get_parameter("gripper_grasp_width").value)
+        self.gripper_grasp_speed = float(self.get_parameter("gripper_grasp_speed").value)
+        self.gripper_grasp_force = float(self.get_parameter("gripper_grasp_force").value)
+        self.gripper_epsilon_inner = float(self.get_parameter("gripper_epsilon_inner").value)
+        self.gripper_epsilon_outer = float(self.get_parameter("gripper_epsilon_outer").value)
+        self.gripper_timeout_s = float(self.get_parameter("gripper_timeout_s").value)
+        self.grasp_settle_time_s = float(self.get_parameter("grasp_settle_time_s").value)
+
         if self.approach_axis not in ("x", "y"):
             raise ValueError("approach_axis must be 'x' or 'y'")
         if self.approach_sign not in (-1.0, 1.0):
@@ -194,6 +217,7 @@ class FrankaPbPipeBridge(Node):
         )
 
         self.pose_client = self.create_client(SetPose, self.service_name)
+        self.grasp_client = ActionClient(self, Grasp, self.gripper_action_name)
 
         self.srv_base = self.create_service(Trigger, "~/go_base", self._go_neutral_cb)
         self.srv_pregrasp = self.create_service(Trigger, "~/go_pregrasp", self._go_pregrasp_cb)
@@ -218,14 +242,14 @@ class FrankaPbPipeBridge(Node):
         )
         self.get_logger().info(
             f"object={self.object_name} diameter={self.object_diameter_m:.4f} "
-            f"approach_axis={self.approach_axis} approach_sign={self.approach_sign:+.0f}"
+            f"gripper_width={self.gripper_grasp_width:.4f}"
         )
         self.get_logger().info(
             f"neutral/base pose: x={self.neutral_x:.3f}, y={self.neutral_y:.3f}, z={self.neutral_z:.3f}"
         )
         self.get_logger().info(
             f"timeouts: wait_for_service={self.wait_for_service_timeout_s:.1f}s "
-            f"set_pose={self.set_pose_timeout_s:.1f}s"
+            f"set_pose={self.set_pose_timeout_s:.1f}s gripper={self.gripper_timeout_s:.1f}s"
         )
 
     # ------------------------------------------------------------------
@@ -418,6 +442,54 @@ class FrankaPbPipeBridge(Node):
 
         return True, "set_pose success=True"
 
+    def _close_gripper_blocking(self) -> tuple[bool, str]:
+        self.get_logger().info(
+            "Gripper grasp: "
+            f"width={self.gripper_grasp_width:.4f}, "
+            f"speed={self.gripper_grasp_speed:.4f}, "
+            f"force={self.gripper_grasp_force:.2f}, "
+            f"eps=[{self.gripper_epsilon_inner:.4f}, {self.gripper_epsilon_outer:.4f}]"
+        )
+
+        if self.dry_run:
+            return True, "dry_run=True, gripper not sent"
+
+        if not self.grasp_client.wait_for_server(timeout_sec=2.0):
+            return False, f"Gripper action '{self.gripper_action_name}' not available"
+
+        goal = Grasp.Goal()
+        goal.width = float(self.gripper_grasp_width)
+        goal.speed = float(self.gripper_grasp_speed)
+        goal.force = float(self.gripper_grasp_force)
+        goal.epsilon.inner = float(self.gripper_epsilon_inner)
+        goal.epsilon.outer = float(self.gripper_epsilon_outer)
+
+        send_future = self.grasp_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=2.0)
+
+        if not send_future.done():
+            return False, "Sending gripper goal timed out"
+
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            return False, "Gripper goal rejected"
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=self.gripper_timeout_s)
+
+        if not result_future.done():
+            return False, "Gripper grasp action timed out"
+
+        result_wrap = result_future.result()
+        if result_wrap is None:
+            return False, "Gripper returned no result"
+
+        result = result_wrap.result
+        if not bool(result.success):
+            return False, f"Gripper grasp failed: {result.error}"
+
+        return True, f"Gripper grasp success, current_width={result.current_width:.4f}"
+
     # ------------------------------------------------------------------
     # Freeze / reset
     # ------------------------------------------------------------------
@@ -515,17 +587,25 @@ class FrankaPbPipeBridge(Node):
         ok, msg = self._send_pose_blocking(self.grasp_target)
         if not ok:
             if self._is_timeout_msg(msg):
-                self.stage = "grasp_sent"
-                response.success = True
-                response.message = f"Grasp likely sent ({msg})"
+                self.get_logger().warn(f"Grasp pose timeout, continuing after settle time: {msg}")
+            else:
+                response.success = False
+                response.message = f"Grasp failed: {msg}"
                 return response
+
+        if self.grasp_settle_time_s > 0.0:
+            self.get_logger().info(f"Waiting {self.grasp_settle_time_s:.2f}s before closing gripper")
+            time.sleep(self.grasp_settle_time_s)
+
+        ok_g, msg_g = self._close_gripper_blocking()
+        if not ok_g:
             response.success = False
-            response.message = f"Grasp failed: {msg}"
+            response.message = f"Gripper failed: {msg_g}"
             return response
 
         self.stage = "grasp_sent"
         response.success = True
-        response.message = f"Grasp done ({msg})"
+        response.message = f"Grasp done ({msg_g})"
         return response
 
     def _go_lift_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:

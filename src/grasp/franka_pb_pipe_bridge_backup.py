@@ -66,7 +66,7 @@ class FrankaPbPipeBridge(Node):
         self.declare_parameter("min_pose_age_s", 1.0)
 
         # Stability / target lock
-        self.declare_parameter("lock_num_samples", 5)
+        self.declare_parameter("lock_num_samples", 1)
         self.declare_parameter("lock_max_spread_m", 0.01)
         self.declare_parameter("lock_max_age_s", 1.5)
 
@@ -104,7 +104,7 @@ class FrankaPbPipeBridge(Node):
         self.declare_parameter("neutral_z", 0.35)
         self.declare_parameter("neutral_roll", math.pi)
         self.declare_parameter("neutral_pitch", 0.0)
-        self.declare_parameter("neutral_yaw", math.pi / 2.0)
+        self.declare_parameter("neutral_yaw", -math.pi/2)
 
         # Safety bounds
         self.declare_parameter("min_allowed_z_m", 0.02)
