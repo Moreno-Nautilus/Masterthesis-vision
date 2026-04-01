@@ -8,7 +8,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-
+import os
+import time
 
 @dataclass
 class DINOIdentifierConfig:
@@ -50,6 +51,12 @@ class DINOIdentifier:
         self.reference_bank: list[ReferenceEmbedding] = []
         self.reference_matrix: np.ndarray | None = None
         self.reference_object_ids: list[str] = []
+        self.debug_dir = "/home/moreno/MasterThesis/outputs/DINODEBUG"
+        self.debug_enabled = False  # Set False to disable
+        if self.debug_enabled:
+            os.makedirs(self.debug_dir, exist_ok=True)
+            os.makedirs(f"{self.debug_dir}/query_crops", exist_ok=True)
+            os.makedirs(f"{self.debug_dir}/matches", exist_ok=True)
 
     def _build_model(self) -> torch.nn.Module:
         model = torch.hub.load("facebookresearch/dinov2", self.cfg.model_name)
@@ -186,6 +193,70 @@ class DINOIdentifier:
             scores_by_object=agg,
         )
 
+    # def classify_crop(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> DINOResult:
+    #     emb = self.embed_image(rgb, mask=mask)
+    #     return self.classify_embedding(emb)
+
     def classify_crop(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> DINOResult:
+        # Apply mask if enabled
+        print(f"[DINO DEBUG] classify_crop called, rgb shape: {rgb.shape}")
+
+        rgb_processed = self._apply_mask(rgb, mask)
+        
+        # Debug: save the crop before preprocessing
+        if self.debug_enabled:
+            ts = int(time.time() * 1000)
+            cv2.imwrite(
+                f"{self.debug_dir}/query_crops/crop_{ts}.png",
+                cv2.cvtColor(rgb_processed, cv2.COLOR_RGB2BGR)
+            )
+        
         emb = self.embed_image(rgb, mask=mask)
-        return self.classify_embedding(emb)
+        result = self.classify_embedding(emb)
+        
+        # Debug: save match visualization
+        if self.debug_enabled and result.score > 0.5:
+            self._save_match_debug(rgb_processed, result, ts)
+        
+        return result
+
+    def _save_match_debug(self, query_crop: np.ndarray, result: DINOResult, ts: int) -> None:
+        """Save side-by-side of query crop and best matching reference."""
+        # Find best matching reference image
+        best_ref = None
+        for ref in self.reference_bank:
+            if ref.object_id == result.object_id:
+                if best_ref is None:
+                    best_ref = ref
+                else:
+                    # Check if this ref has higher similarity
+                    sim = np.dot(result.embedding, ref.embedding)
+                    best_sim = np.dot(result.embedding, best_ref.embedding)
+                    if sim > best_sim:
+                        best_ref = ref
+        
+        if best_ref is None:
+            return
+        
+        # Load reference image
+        ref_bgr = cv2.imread(best_ref.image_path)
+        if ref_bgr is None:
+            return
+        ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Resize both to same height for comparison
+        h = 200
+        query_resized = cv2.resize(query_crop, (h, h))
+        ref_resized = cv2.resize(ref_rgb, (h, h))
+        
+        # Concatenate side by side
+        combined = np.hstack([query_resized, ref_resized])
+        
+        # Add text
+        cv2.putText(combined, f"{result.object_id}: {result.score:.3f}", 
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.imwrite(
+            f"{self.debug_dir}/matches/match_{ts}_{result.object_id}_{result.score:.2f}.png",
+            cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
+        )

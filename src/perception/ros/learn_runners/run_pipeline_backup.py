@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+import os
+import time
 
 import cv2
 import numpy as np
@@ -66,6 +67,7 @@ CAMERAS = [
 class ObjectTrackState:
     object_id: str
     mesh_path: str
+    # fp_tracker: Optional[FoundationPoseWrapper] = None  # REMOVED - now shared per camera
     mode: str = "search"  # "search" | "track"
     T_object_camera: Optional[np.ndarray] = None
     dino_score: float = 0.0
@@ -78,13 +80,30 @@ class ObjectTrackState:
     last_logged_T_base: Optional[np.ndarray] = None
     last_logged_convention: Optional[str] = None
 
-
 @dataclass
 class CandidateSelection:
     object_id: str
     score: float
     scores_by_object: dict[str, float]
     candidate: SAMMaskCandidate
+
+
+# @dataclass
+# class ObjectTrackState:
+#     object_id: str
+#     mesh_path: str
+#     fp_tracker: Optional[FoundationPoseWrapper] = None
+#     mode: str = "search"  # "search" | "track"
+#     T_object_camera: Optional[np.ndarray] = None
+#     dino_score: float = 0.0
+#     lost_count: int = 0
+#     last_mask_area: int = 0
+#     id_history: deque = field(default_factory=lambda: deque(maxlen=5))
+#     track_pose_convention: str = "raw"   # "raw" or "inv"
+#     recovery_mask: Optional[np.ndarray] = None
+
+#     last_logged_T_base: Optional[np.ndarray] = None
+#     last_logged_convention: Optional[str] = None
 
 
 @dataclass
@@ -95,7 +114,11 @@ class CameraSAMParams:
     max_bbox_area_ratio: float
     border_px: int
     max_border_fraction: float
-    roi_polygon: np.ndarray
+    roi_polygon: np.ndarray  # Nx2 polygon points
+    # roi_left_px: int
+    # roi_right_px: int
+    # roi_top_px: int
+    # roi_bottom_px: int
 
 
 def rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
@@ -109,7 +132,6 @@ def rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
     msg.step = int(rgb.shape[1] * 3)
     msg.data = rgb.tobytes()
     return msg
-
 
 def rotation_angle_deg(R1: np.ndarray, R2: np.ndarray) -> float:
     R_rel = R1.T @ R2
@@ -135,7 +157,6 @@ def should_log_track_update(
     drot = rotation_angle_deg(T_base_last[:3, :3], T_base_new[:3, :3])
 
     return (dt > trans_thresh_m) or (drot > rot_thresh_deg)
-
 
 def rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
@@ -178,6 +199,7 @@ def draw_roi_polygon(
 ) -> np.ndarray:
     out = image.copy()
     cv2.polylines(out, [polygon], isClosed=True, color=color, thickness=thickness)
+    # Put label near first point
     cv2.putText(
         out, label, (polygon[0, 0] + 8, polygon[0, 1] - 8),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
@@ -200,20 +222,12 @@ def T_to_pose_stamped(T: np.ndarray, frame_id: str, stamp) -> PoseStamped:
     msg.pose.orientation.w = float(q[3])
     return msg
 
-
 def parse_polygon_string(s: str) -> np.ndarray:
+    """Parse 'x1,y1,x2,y2,...' string to Nx2 polygon array."""
     vals = [int(v.strip()) for v in s.split(",")]
     if len(vals) % 2 != 0:
         raise ValueError(f"Polygon string must have even number of values: {s}")
     return np.array(vals, dtype=np.int32).reshape(-1, 2)
-
-
-def parse_xyxy_string(s: str) -> tuple[int, int, int, int]:
-    vals = [int(v.strip()) for v in s.split(",")]
-    if len(vals) != 4:
-        raise ValueError(f"ROI box string must have 4 ints: {s}")
-    return vals[0], vals[1], vals[2], vals[3]
-
 
 def draw_mask_overlay(
     rgb: np.ndarray,
@@ -227,9 +241,6 @@ def draw_mask_overlay(
     blended = ((1.0 - alpha) * out + alpha * color_arr).astype(np.uint8)
     return np.where(mask3, blended, out)
 
-def bbox_size_xyxy(b: tuple[int, int, int, int]) -> tuple[int, int]:
-    x0, y0, x1, y1 = b
-    return x1 - x0, y1 - y0
 
 def draw_bbox_label(
     image: np.ndarray,
@@ -331,13 +342,16 @@ def reject_large_masks(
 
 def reject_outside_roi_polygon(
     masks: list[SAMMaskCandidate],
-    polygon: np.ndarray,
+    polygon: np.ndarray,  # Nx2 array of points
 ) -> list[SAMMaskCandidate]:
+    """Keep only masks whose bbox center is inside the polygon."""
+    import cv2
     kept = []
     for m in masks:
         x0, y0, x1, y1 = m.bbox_xyxy
         cx = (x0 + x1) // 2
         cy = (y0 + y1) // 2
+        # pointPolygonTest returns >0 if inside, 0 on edge, <0 outside
         if cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False) >= 0:
             kept.append(m)
     return kept
@@ -394,171 +408,6 @@ def vote_object_id(history: deque) -> str:
         counts[obj_id] += 1
     return max(counts, key=counts.get)
 
-def bbox_containment_ratio(
-    inner: tuple[int, int, int, int],
-    outer: tuple[int, int, int, int],
-) -> float:
-    """
-    Fraction of 'inner' bbox area covered by 'outer' bbox.
-    1.0 means inner is fully contained inside outer.
-    """
-    ix0, iy0, ix1, iy1 = inner
-    ox0, oy0, ox1, oy1 = outer
-
-    ax0 = max(ix0, ox0)
-    ay0 = max(iy0, oy0)
-    ax1 = min(ix1, ox1)
-    ay1 = min(iy1, oy1)
-
-    iw = max(0, ax1 - ax0)
-    ih = max(0, ay1 - ay0)
-    inter = iw * ih
-    inner_area = max(1, (ix1 - ix0) * (iy1 - iy0))
-
-    return float(inter) / float(inner_area)
-
-def bbox_iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
-    ax0, ay0, ax1, ay1 = a
-    bx0, by0, bx1, by1 = b
-    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
-    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
-    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
-    inter = iw * ih
-    area_a = max(1, (ax1 - ax0) * (ay1 - ay0))
-    area_b = max(1, (bx1 - bx0) * (by1 - by0))
-    union = area_a + area_b - inter
-    return float(inter) / float(union) if union > 0 else 0.0
-
-
-def dedup_masks_by_bbox_iou(
-    masks: list[SAMMaskCandidate],
-    iou_thresh: float = 0.7,
-    containment_thresh: float = 0.9,
-) -> list[SAMMaskCandidate]:
-    """
-    Keep larger masks first.
-    Remove masks that either:
-    - overlap too much by IoU
-    - are almost fully contained inside an already-kept larger mask
-    """
-    out = []
-    masks_sorted = sorted(masks, key=lambda m: m.area, reverse=True)
-
-    for m in masks_sorted:
-        keep = True
-        for k in out:
-            if bbox_iou_xyxy(m.bbox_xyxy, k.bbox_xyxy) > iou_thresh:
-                keep = False
-                break
-            if bbox_containment_ratio(m.bbox_xyxy, k.bbox_xyxy) > containment_thresh:
-                keep = False
-                break
-        if keep:
-            out.append(m)
-
-    return out
-
-
-def crop_rgb_to_polygon_bbox(
-    rgb: np.ndarray,
-    polygon: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """
-    Crop image to polygon bounding box.
-
-    Returns:
-        rgb_crop
-        polygon_crop  (shifted into crop coordinates)
-        x0, y0        (crop origin in full-image coordinates)
-    """
-    h, w = rgb.shape[:2]
-    xs = polygon[:, 0]
-    ys = polygon[:, 1]
-
-    x0 = max(0, int(xs.min()))
-    y0 = max(0, int(ys.min()))
-    x1 = min(w, int(xs.max()) + 1)
-    y1 = min(h, int(ys.max()) + 1)
-
-    rgb_crop = rgb[y0:y1, x0:x1].copy()
-    polygon_crop = polygon.copy()
-    polygon_crop[:, 0] -= x0
-    polygon_crop[:, 1] -= y0
-
-    return rgb_crop, polygon_crop.astype(np.int32), x0, y0
-
-
-def lift_crop_masks_to_full_image(
-    crop_masks: list[SAMMaskCandidate],
-    full_h: int,
-    full_w: int,
-    x0: int,
-    y0: int,
-) -> list[SAMMaskCandidate]:
-    lifted = []
-    for c in crop_masks:
-        full_mask = np.zeros((full_h, full_w), dtype=c.mask.dtype)
-        h, w = c.mask.shape[:2]
-        full_mask[y0:y0+h, x0:x0+w] = c.mask
-
-        bx0, by0, bx1, by1 = c.bbox_xyxy
-        lifted.append(
-            SAMMaskCandidate(
-                mask=full_mask,
-                bbox_xyxy=(bx0 + x0, by0 + y0, bx1 + x0, by1 + y0),
-                area=int(c.area),
-                score=float(c.score),
-            )
-        )
-    return lifted
-
-
-def find_blue_blob_masks(
-    rgb: np.ndarray,
-    min_area: int = 20,
-    max_area: int = 3000,
-) -> list[np.ndarray]:
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-    lower = np.array([95, 90, 70], dtype=np.uint8)
-    upper = np.array([140, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-    out = []
-    for i in range(1, num_labels):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < min_area or area > max_area:
-            continue
-        comp = (labels == i).astype(np.uint8)
-        out.append(comp)
-    return out
-
-
-def blob_masks_to_candidates(blob_masks: list[np.ndarray]) -> list[SAMMaskCandidate]:
-    out = []
-    for m in blob_masks:
-        ys, xs = np.where(m > 0)
-        if xs.size == 0 or ys.size == 0:
-            continue
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        out.append(
-            SAMMaskCandidate(
-                mask=m.astype(bool),
-                bbox_xyxy=(x0, y0, x1, y1),
-                area=int(m.sum()),
-                score=1.0,
-            )
-        )
-    return out
-
 
 def batch_dino_classify(
     dino: DINOIdentifier,
@@ -567,22 +416,23 @@ def batch_dino_classify(
 ) -> list[DINOResult]:
     if not crops_rgb:
         return []
-
+    
     debug_dir = "/workspace/MasterThesis/outputs/DINODEBUG"
     os.makedirs(f"{debug_dir}/query_crops", exist_ok=True)
-    os.makedirs(f"{debug_dir}/matches", exist_ok=True)
+    os.makedirs(f"{debug_dir}/matches", exist_ok=True)  # ADD THIS
     ts = int(time.time() * 1000)
-
+    
     print(f"[DINO DEBUG] Saving {len(crops_rgb)} crops to {debug_dir}/query_crops/")
 
     tensors = []
     for i, (rgb, mask) in enumerate(zip(crops_rgb, crops_mask)):
         rgb_proc = dino._ensure_rgb(rgb)
         rgb_masked = dino._apply_mask(rgb_proc, mask)
-
+        
+        # DEBUG: Save the masked crop before preprocessing
         save_path = f"{debug_dir}/query_crops/crop_{ts}_{i}.png"
         cv2.imwrite(save_path, cv2.cvtColor(rgb_masked, cv2.COLOR_RGB2BGR))
-
+        
         t = dino._preprocess(rgb_masked)
         tensors.append(t)
 
@@ -607,7 +457,8 @@ def batch_dino_classify(
     for i, emb in enumerate(embeddings):
         res = dino.classify_embedding(emb)
         results.append(res)
-
+        
+        # DEBUG: Save side-by-side comparison with best matching reference
         best_ref_path = None
         best_sim = -1.0
         for ref in dino.reference_bank:
@@ -616,18 +467,22 @@ def batch_dino_classify(
                 if sim > best_sim:
                     best_sim = sim
                     best_ref_path = ref.image_path
-
+        
         if best_ref_path and os.path.exists(best_ref_path):
+            # Load reference image
             ref_bgr = cv2.imread(best_ref_path)
             if ref_bgr is not None:
+                # Load query crop we just saved
                 query_bgr = cv2.imread(f"{debug_dir}/query_crops/crop_{ts}_{i}.png")
                 if query_bgr is not None:
+                    # Resize both to same height
                     h = 150
                     q_h, q_w = query_bgr.shape[:2]
                     r_h, r_w = ref_bgr.shape[:2]
                     query_resized = cv2.resize(query_bgr, (int(q_w * h / q_h), h))
                     ref_resized = cv2.resize(ref_bgr, (int(r_w * h / r_h), h))
-
+                    
+                    # Pad to same width if needed
                     max_w = max(query_resized.shape[1], ref_resized.shape[1])
                     if query_resized.shape[1] < max_w:
                         pad = np.zeros((h, max_w - query_resized.shape[1], 3), dtype=np.uint8)
@@ -635,18 +490,19 @@ def batch_dino_classify(
                     if ref_resized.shape[1] < max_w:
                         pad = np.zeros((h, max_w - ref_resized.shape[1], 3), dtype=np.uint8)
                         ref_resized = np.hstack([ref_resized, pad])
-
+                    
+                    # Stack vertically: query on top, reference below
                     combined = np.vstack([query_resized, ref_resized])
-
-                    cv2.putText(combined, f"Q: crop_{i}", (5, 20),
+                    
+                    # Add label
+                    cv2.putText(combined, f"Q: crop_{i}", (5, 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     cv2.putText(combined, f"R: {res.object_id} ({res.score:.3f})", (5, h + 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
+                    
                     cv2.imwrite(f"{debug_dir}/matches/match_{ts}_{i}_{res.object_id}_{res.score:.2f}.png", combined)
 
     return results
-
 
 class ProjectedMaskProvider:
     def get_mask(self, view: Any, object_id_hint: str | None = None) -> np.ndarray:
@@ -684,6 +540,10 @@ class FoundationPoseTrackerNode(Node):
                 border_px=args.cam1_sam_border_px,
                 max_border_fraction=args.cam1_sam_max_border_fraction,
                 roi_polygon=parse_polygon_string(args.cam1_roi_polygon),
+                # roi_left_px=args.cam1_roi_left_px,
+                # roi_right_px=args.cam1_roi_right_px,
+                # roi_top_px=args.cam1_roi_top_px,
+                # roi_bottom_px=args.cam1_roi_bottom_px,
             ),
             "zed2i_2": CameraSAMParams(
                 min_mask_area=args.cam2_sam_min_mask_area,
@@ -693,6 +553,10 @@ class FoundationPoseTrackerNode(Node):
                 border_px=args.cam2_sam_border_px,
                 max_border_fraction=args.cam2_sam_max_border_fraction,
                 roi_polygon=parse_polygon_string(args.cam2_roi_polygon),
+                # roi_left_px=args.cam2_roi_left_px,
+                # roi_right_px=args.cam2_roi_right_px,
+                # roi_top_px=args.cam2_roi_top_px,
+                # roi_bottom_px=args.cam2_roi_bottom_px,
             ),
         }
 
@@ -711,8 +575,6 @@ class FoundationPoseTrackerNode(Node):
         )
 
         self.sam_by_cam: dict[str, SAMSegmenter] = {}
-        self.sam_tiny_by_cam: dict[str, SAMSegmenter] = {}
-
         if args.mask_source == "sam":
             for cam in CAMERAS:
                 cam_params = self.cam_sam_params[cam.cam_id]
@@ -725,20 +587,6 @@ class FoundationPoseTrackerNode(Node):
                         max_image_side=args.sam_max_image_side,
                         min_mask_area=cam_params.min_mask_area,
                         min_bbox_side_px=cam_params.min_bbox_side_px,
-                        attach_rgb_crops=False,
-                    )
-                )
-
-            if args.tiny_objects_enabled:
-                self.sam_tiny_by_cam["zed2i_2"] = SAMSegmenter(
-                    SAMSegmenterConfig(
-                        repo_root=args.sam_repo_root,
-                        checkpoint=args.sam_checkpoint,
-                        model_cfg=args.sam_model_cfg,
-                        device=args.device,
-                        max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
-                        min_mask_area=args.tiny_sam_min_mask_area,
-                        min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
                         attach_rgb_crops=False,
                     )
                 )
@@ -942,137 +790,124 @@ class FoundationPoseTrackerNode(Node):
 
         return T_base_cam @ T_object_camera
 
-    def _generate_tiny_object_masks_cam2(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
-        if "zed2i_2" not in self.sam_tiny_by_cam:
-            return []
+    # def _generate_and_filter_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
+    #     if cam_id not in self.sam_by_cam:
+    #         return []
 
-        x0, y0, x1, y1 = parse_xyxy_string(self.args.cam2_tiny_roi)
-        h, w = rgb.shape[:2]
-        x0 = max(0, min(x0, w - 1))
-        x1 = max(x0 + 1, min(x1, w))
-        y0 = max(0, min(y0, h - 1))
-        y1 = max(y0 + 1, min(y1, h))
+    #     sam = self.sam_by_cam[cam_id]
+    #     cam_params = self.cam_sam_params[cam_id]
 
-        crop = rgb[y0:y1, x0:x1].copy()
-        if crop.size == 0:
-            return []
+    #     masks = sam.generate_auto(rgb)
 
-        sam = self.sam_tiny_by_cam["zed2i_2"]
-        masks = sam.generate_auto(crop)
-        self.get_logger().info(f"[zed2i_2] Tiny-object SAM raw masks: {len(masks)}")
+    #     self.get_logger().info(f"[{cam_id}] SAM generated {len(masks)} raw masks")
 
-        if not masks:
-            return []
+    #     # DEBUG: Save all raw masks visualization
+    #     debug_dir = "/workspace/MasterThesis/outputs/SAMDEBUG"
+    #     os.makedirs(debug_dir, exist_ok=True)
+    #     vis = rgb.copy()
+    #     for i, m in enumerate(masks):
+    #         color = self.palette[i % len(self.palette)]
+    #         vis = draw_mask_overlay(vis, m.mask, color=color, alpha=0.3)
+    #         x0, y0, x1, y1 = m.bbox_xyxy
+    #         cv2.rectangle(vis, (x0, y0), (x1, y1), color, 1)
+    #         cv2.putText(vis, f"{i}:{m.area}", (x0, max(10, y0-5)), 
+    #                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+    #     # Draw ROI polygon too
+    #     cv2.polylines(vis, [cam_params.roi_polygon], True, (255, 255, 255), 2)
+    #     ts = int(time.time() * 1000)
+    #     cv2.imwrite(f"{debug_dir}/raw_masks_{cam_id}_{ts}.png", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+    #     self.get_logger().info(f"[{cam_id}] Saved raw masks to {debug_dir}/raw_masks_{cam_id}_{ts}.png")
 
-        ch, cw = crop.shape[:2]
-        masks = reject_large_masks(
-            masks,
-            ch,
-            cw,
-            max_mask_area_ratio=self.args.tiny_max_mask_area_ratio,
-            max_bbox_area_ratio=self.args.tiny_max_bbox_area_ratio,
-        )
+    #     if not masks:
+    #         return []
 
-        masks = [
-            m for m in masks
-            if m.area >= self.args.tiny_sam_min_mask_area
-            and (m.bbox_xyxy[2] - m.bbox_xyxy[0]) >= self.args.tiny_sam_min_bbox_side_px
-            and (m.bbox_xyxy[3] - m.bbox_xyxy[1]) >= self.args.tiny_sam_min_bbox_side_px
-        ]
+    #     h, w = rgb.shape[:2]
 
-        lifted = lift_crop_masks_to_full_image(masks, h, w, x0, y0)
-        self.get_logger().info(f"[zed2i_2] Tiny-object SAM kept masks: {len(lifted)}")
-        return lifted
+    #     sorted_by_area = sorted(masks, key=lambda m: m.area)
+    #     self.get_logger().info(f"[{cam_id}] Smallest 5 masks BEFORE filtering:")
+    #     for m in sorted_by_area[:5]:
+    #         self.get_logger().info(f"[{cam_id}]   area={m.area} bbox={m.bbox_xyxy}")
 
+
+    #     masks_after_size = reject_large_masks(
+    #         masks,
+    #         h,
+    #         w,
+    #         max_mask_area_ratio=cam_params.max_mask_area_ratio,
+    #         max_bbox_area_ratio=cam_params.max_bbox_area_ratio,
+    #     )
+
+    #     self.get_logger().info(f"[{cam_id}] After size filter: {len(masks_after_size)}")
+
+    #     masks_after_border = reject_border_masks(
+    #         masks_after_size,
+    #         border_px=cam_params.border_px,
+    #         max_border_fraction=cam_params.max_border_fraction,
+    #     )
+    #     self.get_logger().info(f"[{cam_id}] After border filter: {len(masks_after_border)}")
+
+
+    #     # x_min = cam_params.roi_left_px
+    #     # x_max = w - cam_params.roi_right_px
+    #     # y_min = cam_params.roi_top_px
+    #     # y_max = h - cam_params.roi_bottom_px
+
+    #     masks_after_roi = reject_outside_roi_polygon(masks_after_border, cam_params.roi_polygon)
+    #     self.get_logger().info(f"[{cam_id}] After ROI filter: {len(masks_after_roi)}")
+
+    #     for i, m in enumerate(masks_after_roi[:10]):  # first 10
+    #         self.get_logger().info(f"[{cam_id}]   mask[{i}] area={m.area} bbox={m.bbox_xyxy}")
+
+    #     return masks_after_roi
     def _generate_and_filter_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
         if cam_id not in self.sam_by_cam:
             return []
 
         sam = self.sam_by_cam[cam_id]
         cam_params = self.cam_sam_params[cam_id]
-        full_h, full_w = rgb.shape[:2]
-        polygon_full = cam_params.roi_polygon
+        h, w = rgb.shape[:2]
+        polygon = cam_params.roi_polygon
 
-        # Crop to ROI bounding rectangle BEFORE SAM
-        rgb_crop, polygon_crop, crop_x0, crop_y0 = crop_rgb_to_polygon_bbox(rgb, polygon_full)
-        crop_h, crop_w = rgb_crop.shape[:2]
+        # Black out everything outside polygon
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(roi_mask, [polygon], 255)
+        rgb_masked = rgb.copy()
+        rgb_masked[roi_mask == 0] = 0
 
-        # Optional black-out outside polygon, but only inside the cropped box
-        roi_mask_crop = np.zeros((crop_h, crop_w), dtype=np.uint8)
-        cv2.fillPoly(roi_mask_crop, [polygon_crop], 255)
-        rgb_crop_masked = rgb_crop.copy()
-        rgb_crop_masked[roi_mask_crop == 0] = 0
+        # Run SAM on masked image
+        masks = sam.generate_auto(rgb_masked)
+        self.get_logger().info(f"[{cam_id}] SAM generated {len(masks)} masks (ROI-masked input)")
 
-        masks_crop = sam.generate_auto(rgb_crop_masked)
-        self.get_logger().info(
-            f"[{cam_id}] SAM generated {len(masks_crop)} masks on ROI crop "
-            f"({crop_w}x{crop_h}) from full image ({full_w}x{full_h})"
-        )
-
+        # DEBUG: Save all raw masks visualization
         debug_dir = "/workspace/MasterThesis/outputs/SAMDEBUG"
         os.makedirs(debug_dir, exist_ok=True)
-        vis = rgb_crop.copy()
-        for i, m in enumerate(masks_crop):
+        vis = rgb.copy()  # Use original RGB for visualization
+        for i, m in enumerate(masks):
             color = self.palette[i % len(self.palette)]
             vis = draw_mask_overlay(vis, m.mask, color=color, alpha=0.3)
             x0, y0, x1, y1 = m.bbox_xyxy
             cv2.rectangle(vis, (x0, y0), (x1, y1), color, 1)
-            cv2.putText(vis, f"{i}:{m.area}", (x0, max(10, y0 - 5)),
+            cv2.putText(vis, f"{i}:{m.area}", (x0, max(10, y0-5)), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-        cv2.polylines(vis, [polygon_crop], True, (255, 255, 255), 2)
+        cv2.polylines(vis, [polygon], True, (255, 255, 255), 2)
         ts = int(time.time() * 1000)
         cv2.imwrite(f"{debug_dir}/raw_masks_{cam_id}_{ts}.png", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+        self.get_logger().info(f"[{cam_id}] Saved raw masks to {debug_dir}/raw_masks_{cam_id}_{ts}.png")
 
-        if not masks_crop:
-            masks = []
-        else:
-            masks_crop = reject_large_masks(
-                masks_crop,
-                crop_h,
-                crop_w,
-                cam_params.max_mask_area_ratio,
-                cam_params.max_bbox_area_ratio,
-            )
-            self.get_logger().info(f"[{cam_id}] After size filter: {len(masks_crop)}")
+        if not masks:
+            return []
 
-            masks_crop = reject_border_masks(
-                masks_crop,
-                cam_params.border_px,
-                cam_params.max_border_fraction
-            )
-            self.get_logger().info(f"[{cam_id}] After border filter: {len(masks_crop)}")
+        # Filter by size
+        masks = reject_large_masks(masks, h, w,
+            cam_params.max_mask_area_ratio, cam_params.max_bbox_area_ratio)
+        self.get_logger().info(f"[{cam_id}] After size filter: {len(masks)}")
 
-            masks_crop = reject_outside_roi_polygon(masks_crop, polygon_crop)
-            self.get_logger().info(f"[{cam_id}] After ROI filter: {len(masks_crop)}")
-
-            masks = lift_crop_masks_to_full_image(
-                masks_crop, full_h, full_w, crop_x0, crop_y0
-            )
-
-        masks = sorted(masks, key=lambda m: m.area)
-
-        if cam_id == "zed2i_2" and self.args.tiny_objects_enabled:
-            tiny_masks = self._generate_tiny_object_masks_cam2(rgb)
-            self.get_logger().info(f"[{cam_id}] Tiny-object SAM produced {len(tiny_masks)} masks")
-            masks.extend(tiny_masks)
-
-        if cam_id == "zed2i_2" and self.args.blue_blob_proposals_enabled:
-            blue_blobs = find_blue_blob_masks(
-                rgb,
-                min_area=self.args.blue_blob_min_area,
-                max_area=self.args.blue_blob_max_area,
-            )
-            blue_candidates = blob_masks_to_candidates(blue_blobs)
-            self.get_logger().info(f"[{cam_id}] Blue blob proposals: {len(blue_candidates)}")
-            masks.extend(blue_candidates)
-
-        masks = reject_outside_roi_polygon(masks, cam_params.roi_polygon)
-        self.get_logger().info(f"[{cam_id}] After ROI filter: {len(masks)}")
-
-        masks = dedup_masks_by_bbox_iou(masks, iou_thresh=self.args.mask_dedup_iou)
-        self.get_logger().info(f"[{cam_id}] After dedup: {len(masks)}")
+        # Filter by border
+        masks = reject_border_masks(masks, cam_params.border_px, cam_params.max_border_fraction)
+        self.get_logger().info(f"[{cam_id}] After border filter: {len(masks)}")
 
         return masks
+
     def _classify_masks_batched(
         self,
         rgb: np.ndarray,
@@ -1103,57 +938,27 @@ class FoundationPoseTrackerNode(Node):
             return []
 
         out: list[CandidateSelection] = []
-        img_area = float(rgb.shape[0] * rgb.shape[1])
-
         for j, res in enumerate(dino_results):
             mask_idx = valid_indices[j]
             cand = masks[mask_idx]
 
-            raw_best_score = float(res.score)
+            best_score = float(res.score)
             sorted_scores = sorted(
                 res.scores_by_object.items(), key=lambda kv: kv[1], reverse=True
             )
             second_score = float(sorted_scores[1][1]) if len(sorted_scores) > 1 else -1.0
-            margin = raw_best_score - second_score
+            margin = best_score - second_score
 
             object_id = res.object_id
-            if raw_best_score < self.args.dino_min_score:
+            if best_score < self.args.dino_min_score:
                 object_id = "unknown"
             if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
                 object_id = "unknown"
 
-            bw, bh = bbox_size_xyxy(cand.bbox_xyxy)
-            bbox_max_side = max(bw, bh)
-
-            # Large object priors
-            if object_id == "cooling_base":
-                if bbox_max_side < self.args.cooling_base_min_bbox_side_px:
-                    object_id = "unknown"
-
-            # if object_id == "cooling_f":
-            #     if bbox_max_side < self.args.cooling_f_min_bbox_side_px:
-            #         object_id = "unknown"
-
-            # # Small object prior
-            # if object_id == "cooling_screw":
-            #     if bbox_max_side > self.args.cooling_screw_max_bbox_side_px:
-            #         object_id = "unknown"
-
-            area_ratio = float(cand.area) / img_area
-            x0, y0, x1, y1 = cand.bbox_xyxy
-            bbox_area = max(1, (x1 - x0) * (y1 - y0))
-            fill_ratio = float(cand.area) / float(bbox_area)
-
-            final_score = (
-                raw_best_score
-                - self.args.area_penalty_weight * area_ratio
-                + self.args.fill_ratio_weight * fill_ratio
-            )
-
             out.append(
                 CandidateSelection(
                     object_id=object_id,
-                    score=final_score,
+                    score=best_score,
                     scores_by_object={k: float(v) for k, v in res.scores_by_object.items()},
                     candidate=cand,
                 )
@@ -1179,7 +984,7 @@ class FoundationPoseTrackerNode(Node):
             mask = sel.candidate.mask.astype(bool)
 
             overlap = np.logical_and(mask, used_pixels).sum()
-            if mask.sum() > 0 and float(overlap) / float(mask.sum()) > 0.15: # 0.3
+            if mask.sum() > 0 and float(overlap) / float(mask.sum()) > 0.3:
                 continue
 
             coverage = mask_depth_coverage(
@@ -1255,13 +1060,13 @@ class FoundationPoseTrackerNode(Node):
         vis = rgb.copy()
 
         cam_params = self.cam_sam_params[cam_id]
-        vis = draw_roi_polygon(vis, cam_params.roi_polygon, label=f"ROI {cam_id}")
+        h, w = rgb.shape[:2]
+        # x_min = cam_params.roi_left_px
+        # x_max = w - cam_params.roi_right_px
+        # y_min = cam_params.roi_top_px
+        # y_max = h - cam_params.roi_bottom_px
 
-        if cam_id == "zed2i_2" and self.args.tiny_objects_enabled:
-            x0, y0, x1, y1 = parse_xyxy_string(self.args.cam2_tiny_roi)
-            cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 255), 2)
-            cv2.putText(vis, "tiny_roi", (x0, max(20, y0 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        vis = draw_roi_polygon(vis, cam_params.roi_polygon, label=f"ROI {cam_id}")
 
         for i, cand in enumerate(masks[:self.args.max_candidate_draw]):
             color = self.palette[i % len(self.palette)]
@@ -1354,6 +1159,7 @@ class FoundationPoseTrackerNode(Node):
 
         return T_rec, recovered_convention
 
+
     def _initialize_objects(
         self,
         view: Any,
@@ -1365,6 +1171,7 @@ class FoundationPoseTrackerNode(Node):
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
         cam_id = view.cam_id
 
+        # Use shared tracker for this camera
         tracker = self.fp_tracker_by_cam[cam_id]
 
         new_states: list[ObjectTrackState] = []
@@ -1426,6 +1233,7 @@ class FoundationPoseTrackerNode(Node):
             state = ObjectTrackState(
                 object_id=sel.object_id,
                 mesh_path=mesh_path,
+                # fp_tracker removed - using shared tracker
                 mode="track",
                 T_object_camera=T.copy(),
                 dino_score=float(sel.score),
@@ -1480,6 +1288,7 @@ class FoundationPoseTrackerNode(Node):
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
         cam_id = view.cam_id
 
+        # Use shared tracker for this camera
         tracker = self.fp_tracker_by_cam[cam_id]
 
         surviving: list[ObjectTrackState] = []
@@ -1634,6 +1443,7 @@ class FoundationPoseTrackerNode(Node):
 
         return surviving, pose_overlay
 
+
     def _process_single_view(self, view: Any) -> None:
         cam_id = view.cam_id
 
@@ -1672,7 +1482,9 @@ class FoundationPoseTrackerNode(Node):
             return
 
         masks = self._generate_and_filter_masks(rgb, cam_id)
+
         self.get_logger().info(f"[{cam_id}] SAM raw masks after filtering: {len(masks)}")
+
 
         if not masks:
             sam_overlay_cached = self.last_sam_overlay.get(cam_id, rgb)
@@ -1758,12 +1570,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--dino-model-name", default="dinov2_vitb14")
     p.add_argument("--dino-min-score", type=float, default=0.65)
-    p.add_argument("--dino-min-margin", type=float, default=0.0)
-    p.add_argument("--area-penalty-weight", type=float, default=1.5)
-    p.add_argument("--fill-ratio-weight", type=float, default=0.15)
-    p.add_argument("--cooling-base-min-bbox-side-px", type=int, default=140)
-    p.add_argument("--cooling-screw-max-bbox-side-px", type=int, default=90)
-    p.add_argument("--cooling-f-min-bbox-side-px", type=int, default=60)
+    p.add_argument("--dino-min-margin", type=float, default=0.005)
 
     p.add_argument("--sam-repo-root", default="external/sam2")
     p.add_argument(
@@ -1771,43 +1578,41 @@ def parse_args() -> argparse.Namespace:
         default="external/sam2/checkpoints/sam2.1_hiera_base_plus.pt",
     )
     p.add_argument("--sam-model-cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
-    p.add_argument("--sam-max-image-side", type=int, default=1536)
+    p.add_argument("--sam-max-image-side", type=int, default=1024)#1024
 
+    # Camera 1 SAM/filter params
     p.add_argument("--cam1-sam-min-mask-area", type=int, default=150)
     p.add_argument("--cam1-sam-min-bbox-side-px", type=int, default=10)
     p.add_argument("--cam1-sam-max-mask-area-ratio", type=float, default=0.007)
     p.add_argument("--cam1-sam-max-bbox-area-ratio", type=float, default=0.007)
     p.add_argument("--cam1-sam-border-px", type=int, default=6)
     p.add_argument("--cam1-sam-max-border-fraction", type=float, default=0.00)
+    # p.add_argument("--cam1-roi-left-px", type=int, default=200)
+    # p.add_argument("--cam1-roi-right-px", type=int, default=500)
+    # p.add_argument("--cam1-roi-top-px", type=int, default=100)
+    # p.add_argument("--cam1-roi-bottom-px", type=int, default=50)
 
-    p.add_argument("--cam2-sam-min-mask-area", type=int, default=20)
-    p.add_argument("--cam2-sam-min-bbox-side-px", type=int, default=3)
+    # Camera 2 SAM/filter params = current values
+    p.add_argument("--cam2-sam-min-mask-area", type=int, default=150)
+    p.add_argument("--cam2-sam-min-bbox-side-px", type=int, default=10)
     p.add_argument("--cam2-sam-max-mask-area-ratio", type=float, default=0.06)
     p.add_argument("--cam2-sam-max-bbox-area-ratio", type=float, default=0.06)
     p.add_argument("--cam2-sam-border-px", type=int, default=6)
     p.add_argument("--cam2-sam-max-border-fraction", type=float, default=0.00)
-
-    p.add_argument("--cam1-roi-polygon", type=str,
-        default="950,104,210,530,735,1080,1160,1080,1250,560,1630,320",
+    # Camera 1 polygon ROI (list of x,y points defining table corners)
+    p.add_argument("--cam1-roi-polygon", type=str, 
+        default="950,104,210,530,735,1080,1160,1080,1250,560,1630,320",  # placeholder - you'll calibrate this
         help="Comma-separated x1,y1,x2,y2,... polygon points for cam1 ROI")
 
+    # Camera 2 polygon ROI
     p.add_argument("--cam2-roi-polygon", type=str,
-        default="300,530,1120,185,1813,480,1480,1080,850,1080",
+        default="300,530,1120,185,1813,480,1480,1080,850,1080",  # placeholder
         help="Comma-separated x1,y1,x2,y2,... polygon points for cam2 ROI")
 
-    p.add_argument("--tiny-objects-enabled", action="store_true")
-    p.add_argument("--cam2-tiny-roi", type=str, default="700,500,1350,1080",
-                   help="x0,y0,x1,y1 crop for tiny-object SAM pass")
-    p.add_argument("--tiny-sam-max-image-side", type=int, default=1920)
-    p.add_argument("--tiny-sam-min-mask-area", type=int, default=8)
-    p.add_argument("--tiny-sam-min-bbox-side-px", type=int, default=2)
-    p.add_argument("--tiny-max-mask-area-ratio", type=float, default=0.01)
-    p.add_argument("--tiny-max-bbox-area-ratio", type=float, default=0.02)
-
-    p.add_argument("--blue-blob-proposals-enabled", action="store_true")
-    p.add_argument("--blue-blob-min-area", type=int, default=20)
-    p.add_argument("--blue-blob-max-area", type=int, default=3000)
-    p.add_argument("--mask-dedup-iou", type=float, default=0.6)
+    # p.add_argument("--cam2-roi-left-px", type=int, default=250)
+    # p.add_argument("--cam2-roi-right-px", type=int, default=250)
+    # p.add_argument("--cam2-roi-top-px", type=int, default=120)
+    # p.add_argument("--cam2-roi-bottom-px", type=int, default=10)
 
     p.add_argument("--fp-repo-root", default="external/FoundationPose")
     p.add_argument("--fp-weights-dir", default="external/FoundationPose/weights")
@@ -1822,10 +1627,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-valid-z-m", type=float, default=10.00)
     p.add_argument("--max-translation-jump-m", type=float, default=0.80)
 
-    p.add_argument("--max-objects", type=int, default=10)
-    p.add_argument("--max-lost-count", type=int, default=10)
+    p.add_argument("--max-objects", type=int, default=8)
+    p.add_argument("--max-lost-count", type=int, default=8)
 
-    p.add_argument("--min-depth-coverage", type=float, default=0.50)
+    p.add_argument("--min-depth-coverage", type=float, default=0.30)
     p.add_argument("--track-log-trans-thresh-m", type=float, default=0.005)
     p.add_argument("--track-log-rot-thresh-deg", type=float, default=4.0)
 
