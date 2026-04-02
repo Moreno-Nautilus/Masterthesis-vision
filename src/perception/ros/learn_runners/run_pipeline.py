@@ -1757,7 +1757,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-root", default="outputs/foundationpose")
 
     p.add_argument("--dino-model-name", default="dinov2_vitb14")
-    p.add_argument("--dino-min-score", type=float, default=0.65)
+    p.add_argument("--dino-min-score", type=float, default=0.60)
     p.add_argument("--dino-min-margin", type=float, default=0.0)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)

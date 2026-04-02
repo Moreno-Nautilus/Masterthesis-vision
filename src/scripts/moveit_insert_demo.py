@@ -147,15 +147,20 @@ class MoveItInsertStages(Node):
             "/perception/fp/pose_base/zed2i_2/cooling_base_0",
         )
 
-        self.declare_parameter("hole_x_m", -0.0332)
-        self.declare_parameter("hole_y_m", 0.020)
-        self.declare_parameter("hole_z_m", 0.03)
+        self.declare_parameter("hole_x_m", -0.0309)
+        self.declare_parameter("hole_y_m", 0.0157)
+        self.declare_parameter("hole_z_m", 0.025)
 
         self.declare_parameter("preinsert_dz_m", 0.04)
         self.declare_parameter("insert_dz_m", 0.02)
         self.declare_parameter("seat_dz_m", 0.01)
 
-        self.declare_parameter("ee_to_screw_tip_z_m", 0.06)
+        self.declare_parameter("ee_to_screw_tip_z_m", 0.00)
+
+        self.declare_parameter("retreat_x_m", 0.4)
+        self.declare_parameter("retreat_y_m", 0.0)
+        self.declare_parameter("retreat_z_m", 0.3)
+
         self.declare_parameter("post_execute_sleep_s", 1.0)
 
         self.declare_parameter("ik_timeout_s", 2.0)
@@ -185,6 +190,11 @@ class MoveItInsertStages(Node):
         self.seat_dz_m = float(self.get_parameter("seat_dz_m").value)
 
         self.ee_to_screw_tip_z_m = float(self.get_parameter("ee_to_screw_tip_z_m").value)
+
+        self.retreat_x_m = float(self.get_parameter("retreat_x_m").value)
+        self.retreat_y_m = float(self.get_parameter("retreat_y_m").value)
+        self.retreat_z_m = float(self.get_parameter("retreat_z_m").value)
+
         self.post_execute_sleep_s = float(self.get_parameter("post_execute_sleep_s").value)
 
         self.ik_timeout_s = float(self.get_parameter("ik_timeout_s").value)
@@ -245,10 +255,12 @@ class MoveItInsertStages(Node):
         self.pub_preinsert = self.create_publisher(PoseStamped, "/assembly/preinsert_pose", 10)
         self.pub_insert = self.create_publisher(PoseStamped, "/assembly/insert_pose", 10)
         self.pub_seat = self.create_publisher(PoseStamped, "/assembly/seat_pose", 10)
+        self.pub_retreat = self.create_publisher(PoseStamped, "/assembly/retreat_pose", 10)
 
         self.pub_preinsert_ee = self.create_publisher(PoseStamped, "/assembly/preinsert_ee_pose", 10)
         self.pub_insert_ee = self.create_publisher(PoseStamped, "/assembly/insert_ee_pose", 10)
         self.pub_seat_ee = self.create_publisher(PoseStamped, "/assembly/seat_ee_pose", 10)
+        self.pub_retreat_ee = self.create_publisher(PoseStamped, "/assembly/retreat_ee_pose", 10)
 
         self.pub_next_stage_ee = self.create_publisher(PoseStamped, "/assembly/next_stage_ee_pose", 10)
         self.pub_next_stage_tip = self.create_publisher(PoseStamped, "/assembly/next_stage_screw_tip_pose", 10)
@@ -308,9 +320,12 @@ class MoveItInsertStages(Node):
         self.pub_insert_ee.publish(T_to_pose(targets["T_base_insert_ee"], "base", stamp))
         self.pub_seat_ee.publish(T_to_pose(targets["T_base_seat_ee"], "base", stamp))
 
+        retreat_tip_pose, retreat_ee_pose = self._make_retreat_targets()
+        self.pub_retreat.publish(retreat_tip_pose)
+        self.pub_retreat_ee.publish(retreat_ee_pose)
+
     def _compute_targets(self, msg: PoseStamped) -> dict[str, np.ndarray] | None:
         T_base_cooling_base = pose_to_T(msg)
-        R_base_cooling_base = T_base_cooling_base[:3, :3]
         p_base_cooling_base = T_base_cooling_base[:3, 3]
 
         p_base_hole = p_base_cooling_base + self.hole_offset
@@ -375,24 +390,53 @@ class MoveItInsertStages(Node):
         stamp = self.get_clock().now().to_msg()
         return T_to_pose(targets[key], "base", stamp)
 
+    def _make_retreat_targets(self) -> tuple[PoseStamped, PoseStamped]:
+        T_base_retreat_tip = np.eye(4, dtype=np.float64)
+        T_base_retreat_tip[:3, :3] = self.R_insert_fixed
+        T_base_retreat_tip[0, 3] = self.retreat_x_m
+        T_base_retreat_tip[1, 3] = self.retreat_y_m
+        T_base_retreat_tip[2, 3] = self.retreat_z_m
+
+        T_base_retreat_ee = T_base_retreat_tip @ self.T_screw_tip_ee
+
+        stamp = self.get_clock().now().to_msg()
+        retreat_tip_pose = T_to_pose(T_base_retreat_tip, "base", stamp)
+        retreat_ee_pose = T_to_pose(T_base_retreat_ee, "base", stamp)
+        return retreat_tip_pose, retreat_ee_pose
+
+    def _make_retreat_pose(self) -> PoseStamped:
+        _, retreat_ee_pose = self._make_retreat_targets()
+        return retreat_ee_pose
+
     def _publish_next_intent(self, targets: dict[str, np.ndarray], next_stage: str) -> None:
         stage_to_ee_key = {
             "preinsert": "T_base_preinsert_ee",
             "insert": "T_base_insert_ee",
             "seat": "T_base_seat_ee",
-            "retreat": "T_base_preinsert_ee",
         }
         stage_to_tip_key = {
             "preinsert": "T_base_preinsert",
             "insert": "T_base_insert",
             "seat": "T_base_seat",
-            "retreat": "T_base_preinsert",
         }
+
+        stamp = self.get_clock().now().to_msg()
+
+        if next_stage == "retreat":
+            retreat_tip_pose, retreat_ee_pose = self._make_retreat_targets()
+            self.pub_next_stage_ee.publish(retreat_ee_pose)
+            self.pub_next_stage_tip.publish(retreat_tip_pose)
+            self.pub_next_stage_name.publish(String(data="retreat"))
+            self.get_logger().info(
+                f"Next intended stage: retreat | "
+                f"EE xyz=({retreat_ee_pose.pose.position.x:.4f}, "
+                f"{retreat_ee_pose.pose.position.y:.4f}, "
+                f"{retreat_ee_pose.pose.position.z:.4f})"
+            )
+            return
 
         if next_stage not in stage_to_ee_key:
             return
-
-        stamp = self.get_clock().now().to_msg()
 
         ee_pose = T_to_pose(targets[stage_to_ee_key[next_stage]], "base", stamp)
         tip_pose = T_to_pose(targets[stage_to_tip_key[next_stage]], "base", stamp)
@@ -461,7 +505,6 @@ class MoveItInsertStages(Node):
         mpr.max_velocity_scaling_factor = self.velocity_scale
         mpr.max_acceleration_scaling_factor = self.acceleration_scale
 
-        # let MoveIt use current state
         mpr.start_state.is_diff = True
 
         goal = Constraints()
@@ -597,13 +640,7 @@ class MoveItInsertStages(Node):
     def _retreat_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
 
-        targets, msg = self._get_latched_targets()
-        if targets is None:
-            response.success = False
-            response.message = msg
-            return response
-
-        pose_msg = self._pose_from_target_key(targets, "T_base_preinsert_ee")
+        pose_msg = self._make_retreat_pose()
         ok, msg = self._plan_and_execute_pose(pose_msg, "retreat")
         response.success = ok
         response.message = msg
