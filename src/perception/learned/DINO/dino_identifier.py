@@ -164,6 +164,7 @@ class DINOIdentifier:
         self.reference_bank = refs
         self.reference_matrix = np.stack([r.embedding for r in refs], axis=0)
         self.reference_object_ids = [r.object_id for r in refs]
+        
 
     def classify_embedding(self, embedding: np.ndarray) -> DINOResult:
         if self.reference_matrix is None or len(self.reference_bank) == 0:
@@ -181,8 +182,13 @@ class DINOIdentifier:
         for sim, obj_id in zip(sims, self.reference_object_ids):
             scores_by_object.setdefault(obj_id, []).append(float(sim))
 
-        # aggregate by max similarity per object
-        agg = {k: max(v) for k, v in scores_by_object.items()}
+        top_k = 3
+        agg = {}
+        for obj_id, vals in scores_by_object.items():
+            vals_sorted = sorted(vals, reverse=True)
+            k = min(top_k, len(vals_sorted))
+            agg[obj_id] = float(np.mean(vals_sorted[:k]))
+
         best_obj = max(agg, key=agg.get)
         best_score = agg[best_obj]
 
@@ -192,6 +198,34 @@ class DINOIdentifier:
             embedding=embedding.squeeze(0),
             scores_by_object=agg,
         )
+
+    # def classify_embedding(self, embedding: np.ndarray) -> DINOResult:
+    #     if self.reference_matrix is None or len(self.reference_bank) == 0:
+    #         raise RuntimeError("Reference bank is empty. Build or set it first.")
+
+    #     embedding = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+
+    #     if self.cfg.normalize_embeddings:
+    #         norm = np.linalg.norm(embedding, axis=1, keepdims=True) + 1e-12
+    #         embedding = embedding / norm
+
+    #     sims = (embedding @ self.reference_matrix.T).reshape(-1)
+
+    #     scores_by_object: dict[str, list[float]] = {}
+    #     for sim, obj_id in zip(sims, self.reference_object_ids):
+    #         scores_by_object.setdefault(obj_id, []).append(float(sim))
+
+    #     # aggregate by max similarity per object
+    #     agg = {k: max(v) for k, v in scores_by_object.items()}
+    #     best_obj = max(agg, key=agg.get)
+    #     best_score = agg[best_obj]
+
+    #     return DINOResult(
+    #         object_id=best_obj,
+    #         score=float(best_score),
+    #         embedding=embedding.squeeze(0),
+    #         scores_by_object=agg,
+    #     )
 
     # def classify_crop(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> DINOResult:
     #     emb = self.embed_image(rgb, mask=mask)

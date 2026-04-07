@@ -1073,6 +1073,7 @@ class FoundationPoseTrackerNode(Node):
         self.get_logger().info(f"[{cam_id}] After dedup: {len(masks)}")
 
         return masks
+
     def _classify_masks_batched(
         self,
         rgb: np.ndarray,
@@ -1109,14 +1110,32 @@ class FoundationPoseTrackerNode(Node):
             mask_idx = valid_indices[j]
             cand = masks[mask_idx]
 
-            raw_best_score = float(res.score)
             sorted_scores = sorted(
                 res.scores_by_object.items(), key=lambda kv: kv[1], reverse=True
             )
-            second_score = float(sorted_scores[1][1]) if len(sorted_scores) > 1 else -1.0
-            margin = raw_best_score - second_score
 
-            object_id = res.object_id
+            top1_name, top1_score = sorted_scores[0]
+            top2_name, top2_score = sorted_scores[1] if len(sorted_scores) > 1 else ("", -1.0)
+
+            raw_best_score = float(top1_score)
+            object_id = top1_name
+
+            top_dbg = ", ".join([f"{k}:{v:.3f}" for k, v in sorted_scores[:4]])
+            if object_id in {"cooling_f", "cooling_screw"} or raw_best_score < 0.80:
+                self.get_logger().info(f"DINO cand {j} | top scores: {top_dbg}")
+
+            # Pairwise near-tie resolver for cooling_f vs cooling_screw
+            pair_is_cf_cs = {top1_name, top2_name} == {"cooling_f", "cooling_screw"}
+            pair_gap = float(top1_score - top2_score)
+
+            if pair_is_cf_cs and pair_gap < 0.05:
+                object_id = "cooling_screw"
+                raw_best_score = float(res.scores_by_object["cooling_screw"])
+
+            # Margin based on the original top-2 ranking
+            second_score = float(top2_score)
+            margin = float(top1_score - second_score)
+
             if raw_best_score < self.args.dino_min_score:
                 object_id = "unknown"
             if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
@@ -1129,15 +1148,6 @@ class FoundationPoseTrackerNode(Node):
             if object_id == "cooling_base":
                 if bbox_max_side < self.args.cooling_base_min_bbox_side_px:
                     object_id = "unknown"
-
-            # if object_id == "cooling_f":
-            #     if bbox_max_side < self.args.cooling_f_min_bbox_side_px:
-            #         object_id = "unknown"
-
-            # # Small object prior
-            # if object_id == "cooling_screw":
-            #     if bbox_max_side > self.args.cooling_screw_max_bbox_side_px:
-            #         object_id = "unknown"
 
             area_ratio = float(cand.area) / img_area
             x0, y0, x1, y1 = cand.bbox_xyxy
