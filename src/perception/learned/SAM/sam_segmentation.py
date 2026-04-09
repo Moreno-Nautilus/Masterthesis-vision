@@ -38,12 +38,18 @@ class SAMSegmenterConfig:
     attach_rgb_crops: bool = True
 
     # automatic mask generation
-    auto_points_per_side: int = 48 #64
+    auto_points_per_side: int = 64 #48
     auto_pred_iou_thresh: float = 0.70 #0.60
-    auto_stability_score_thresh: float = 0.75 #0.65
+    auto_stability_score_thresh: float = 0.65 #0.75
     auto_crop_n_layers: int = 1
     auto_crop_n_points_downscale_factor: int = 2
-    auto_min_mask_region_area: int = 150 #200
+    auto_min_mask_region_area: int = 150 #200 
+
+    # Shadow rejection (HSV-based)
+    shadow_filter_enabled: bool = True
+    min_saturation: int = 60           # Reject masks with mean saturation below this (0-255)
+    min_value: int = 80                # Reject very dark regions
+    max_value_for_low_sat: int = 220   # Shadows are mid-brightness + low saturation
 
 
 class SAMSegmenter:
@@ -150,11 +156,13 @@ class SAMSegmenter:
         x0, y0, x1, y1 = bbox_xyxy
         return rgb[y0:y1, x0:x1].copy()
 
+
     def _filter_mask(
         self,
         mask: np.ndarray,
         score: float,
         image_shape: tuple[int, int],
+        rgb: np.ndarray | None = None,
     ) -> bool:
         h, w = image_shape
         area = int(mask.sum())
@@ -173,7 +181,59 @@ class SAMSegmenter:
         if not np.isfinite(score):
             return False
 
+        # Reject overly elongated masks (likely merged objects or artifacts)
+        aspect_ratio = max(bw, bh) / (min(bw, bh) + 1e-6)
+        if aspect_ratio > 2.5:  # Tune if needed - screws shouldn't be more than 4:1
+            return False
+
+        # Reject masks where fill ratio is too low (bbox much larger than mask)
+        bbox_area = bw * bh
+        if bbox_area > 0:
+            fill_ratio = area / bbox_area
+            if fill_ratio < 0.20:  # Mask should fill at least 20% of its bbox
+                return False
+
+        # NEW: HSV-based shadow rejection
+        if self.cfg.shadow_filter_enabled and rgb is not None:
+            import cv2
+            # Get pixels within the mask
+            mask_bool = mask.astype(bool)
+            masked_pixels = rgb[mask_bool]
+            
+            if len(masked_pixels) > 10:  # Need enough pixels to analyze
+                # Convert to HSV (need to reshape for cv2)
+                # Create a small image from masked pixels for conversion
+                pixels_rgb = masked_pixels.reshape(1, -1, 3).astype(np.uint8)
+                pixels_hsv = cv2.cvtColor(pixels_rgb, cv2.COLOR_RGB2HSV)
+                pixels_hsv = pixels_hsv.reshape(-1, 3)
+                
+                mean_saturation = pixels_hsv[:, 1].mean()
+                mean_value = pixels_hsv[:, 2].mean()
+                
+                # Reject low-saturation regions that aren't very dark (shadows on white table)
+                # Real blue objects have saturation, shadows don't
+                if mean_saturation < self.cfg.min_saturation:
+                    if mean_value > self.cfg.min_value and mean_value < self.cfg.max_value_for_low_sat:
+                        return False  # Low saturation + mid brightness = shadow
+
+        # Reject masks that cover multiple disconnected or weakly connected regions
+        if area > 5000 and rgb is not None:
+            import cv2
+            from scipy import ndimage
+            
+            mask_uint8 = mask.astype(np.uint8)
+            labeled, num_features = ndimage.label(mask_uint8)
+            if num_features > 1:
+                return False  # Multiple disconnected regions
+            
+            # Check for "necking" - mask that pinches thin (merged objects)
+            eroded = cv2.erode(mask_uint8, np.ones((5, 5), np.uint8), iterations=3)
+            _, num_after_erode = ndimage.label(eroded)
+            if num_after_erode > 1:
+                return False  # Eroding splits it = weakly connected
+
         return True
+
 
     def generate_from_points(
         self,
@@ -263,7 +323,7 @@ class SAMSegmenter:
 
             score = float(item.get("predicted_iou", 0.0))
 
-            if not self._filter_mask(mask, score, (h0, w0)):
+            if not self._filter_mask(mask, score, (h0, w0), rgb = rgb):
                 continue
 
             bbox = self._bbox_from_mask(mask)
@@ -303,7 +363,7 @@ class SAMSegmenter:
             else:
                 mask = mask_small > 0
 
-            if not self._filter_mask(mask, float(score), (h0, w0)):
+            if not self._filter_mask(mask, float(score), (h0, w0), rgb = rgb_original):
                 continue
 
             bbox = self._bbox_from_mask(mask)

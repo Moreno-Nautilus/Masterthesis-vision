@@ -231,6 +231,53 @@ def bbox_size_xyxy(b: tuple[int, int, int, int]) -> tuple[int, int]:
     x0, y0, x1, y1 = b
     return x1 - x0, y1 - y0
 
+
+def nms_by_position(
+    states: list[ObjectTrackState],
+    position_threshold: float = 0.03,
+) -> list[ObjectTrackState]:
+    """Remove duplicate detections of same object class that are too close."""
+    if len(states) <= 1:
+        return states
+
+    # Group by object class
+    by_class: dict[str, list[ObjectTrackState]] = {}
+    for s in states:
+        by_class.setdefault(s.object_id, []).append(s)
+
+    kept: list[ObjectTrackState] = []
+    for obj_id, obj_states in by_class.items():
+        if len(obj_states) == 1:
+            kept.extend(obj_states)
+            continue
+
+        # Sort by dino_score descending
+        obj_states = sorted(obj_states, key=lambda x: x.dino_score, reverse=True)
+        
+        keep_mask = [True] * len(obj_states)
+        for i in range(len(obj_states)):
+            if not keep_mask[i]:
+                continue
+            if obj_states[i].T_object_camera is None:
+                continue
+            pos_i = obj_states[i].T_object_camera[:3, 3]
+            
+            for j in range(i + 1, len(obj_states)):
+                if not keep_mask[j]:
+                    continue
+                if obj_states[j].T_object_camera is None:
+                    continue
+                pos_j = obj_states[j].T_object_camera[:3, 3]
+                
+                dist = np.linalg.norm(pos_i - pos_j)
+                if dist < position_threshold:
+                    keep_mask[j] = False  # Suppress lower-scoring duplicate
+
+        kept.extend([s for s, k in zip(obj_states, keep_mask) if k])
+
+    return kept
+
+
 def draw_bbox_label(
     image: np.ndarray,
     bbox_xyxy: tuple[int, int, int, int],
@@ -1127,21 +1174,55 @@ class FoundationPoseTrackerNode(Node):
             # Pairwise near-tie resolver for cooling_f vs cooling_screw
             pair_is_cf_cs = {top1_name, top2_name} == {"cooling_f", "cooling_screw"}
             pair_gap = float(top1_score - top2_score)
+            geometric_resolved = False
 
-            if pair_is_cf_cs and pair_gap < 0.05:
-                object_id = "cooling_screw"
-                raw_best_score = float(res.scores_by_object["cooling_screw"])
+            if pair_is_cf_cs and pair_gap < 0.15:
+                # Use aspect ratio to decide: F is more elongated, screws are compact
+                bw_tmp, bh_tmp = bbox_size_xyxy(cand.bbox_xyxy)
+                aspect = max(bw_tmp, bh_tmp) / (min(bw_tmp, bh_tmp) + 1e-6)
+                
+                if aspect > 2.2:  # Elongated = likely F
+                    object_id = "cooling_f"
+                    raw_best_score = float(res.scores_by_object["cooling_f"])
+                else:  # Compact = likely screw
+                    object_id = "cooling_screw"
+                    raw_best_score = float(res.scores_by_object["cooling_screw"])
+                geometric_resolved = True  # Skip margin check for this one
 
             # Margin based on the original top-2 ranking
             second_score = float(top2_score)
             margin = float(top1_score - second_score)
 
-            if raw_best_score < self.args.dino_min_score:
-                object_id = "unknown"
-            if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
-                object_id = "unknown"
+            # if raw_best_score < self.args.dino_min_score:
+            #     object_id = "unknown"
+            # if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
+            #     object_id = "unknown"
 
+            # bw, bh = bbox_size_xyxy(cand.bbox_xyxy)
+            # Size-aware + margin-based classification
             bw, bh = bbox_size_xyxy(cand.bbox_xyxy)
+            bbox_area = bw * bh
+            is_small_object = bbox_area < 5000  # ~100x100 pixels, tune as needed
+
+            if is_small_object:
+                # Small objects (screws): accept lower absolute score if margin is decent
+                min_score_for_small = 0.40
+                min_margin_for_small = 0.02
+                if raw_best_score < min_score_for_small:
+                    object_id = "unknown"
+                elif margin < min_margin_for_small and not geometric_resolved:
+                    object_id = "unknown"
+                    
+                if object_id != "unknown":
+                    self.get_logger().info(
+                        f"DINO small obj ACCEPT: {object_id} score={raw_best_score:.3f} margin={margin:.3f} bbox={bw}x{bh}"
+                    )
+            else:
+                # Larger objects: use original thresholds
+                if raw_best_score < self.args.dino_min_score:
+                    object_id = "unknown"
+                if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
+                    object_id = "unknown"
             bbox_max_side = max(bw, bh)
 
             # Large object priors
@@ -1153,7 +1234,8 @@ class FoundationPoseTrackerNode(Node):
             x0, y0, x1, y1 = cand.bbox_xyxy
             bbox_area = max(1, (x1 - x0) * (y1 - y0))
             fill_ratio = float(cand.area) / float(bbox_area)
-
+            if object_id == "unknown":
+                self.get_logger().info(f"UNKNOWN: score={raw_best_score:.3f}, margin={margin:.3f}, bbox={bw}x{bh}")
             final_score = (
                 raw_best_score
                 - self.args.area_penalty_weight * area_ratio
@@ -1206,21 +1288,45 @@ class FoundationPoseTrackerNode(Node):
 
         return selected
 
-    def _pose_reason(self, T: np.ndarray) -> tuple[bool, str]:
-        R = T[:3, :3]
-        t = T[:3, 3]
+    # def _pose_reason(self, T: np.ndarray) -> tuple[bool, str]:
+    #     R = T[:3, :3]
+    #     t = T[:3, 3]
+
+    #     trace = np.trace(R)
+    #     if trace < -1.5:
+    #         return False, f"flipped_orientation trace={trace:.3f}"
+
+    #     z = t[2]
+    #     if z < 0.005 or z > 1.5:
+    #         return False, f"bad_z z={z:.3f}"
+
+    #     t_mag = np.linalg.norm(t)
+    #     if t_mag < 0.4 or t_mag > 0.9:
+    #         return False, f"bad_distance mag={t_mag:.3f}"
+
+    #     return True, "ok"
+
+    def _pose_reason(self, T_camera: np.ndarray, cam_id: str) -> tuple[bool, str]:
+        R = T_camera[:3, :3]
+        t_cam = T_camera[:3, 3]
 
         trace = np.trace(R)
         if trace < -1.5:
             return False, f"flipped_orientation trace={trace:.3f}"
 
-        z = t[2]
-        if z < 0.01 or z > 1.5:
-            return False, f"bad_z z={z:.3f}"
-
-        t_mag = np.linalg.norm(t)
+        # Camera-frame checks (distance from camera)
+        t_mag = np.linalg.norm(t_cam)
         if t_mag < 0.4 or t_mag > 0.9:
             return False, f"bad_distance mag={t_mag:.3f}"
+
+        # Base-frame z check (height above table)
+        try:
+            T_base = self._to_base_pose(cam_id, T_camera)
+            z_base = T_base[2, 3]
+            if z_base < 0.001 or z_base > 0.5:
+                return False, f"bad_z_base z={z_base:.3f}"
+        except Exception:
+            pass  # If transform fails, skip base-frame check
 
         return True, "ok"
 
@@ -1336,7 +1442,7 @@ class FoundationPoseTrackerNode(Node):
 
         T_rec = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
 
-        ok_pose, _ = self._pose_reason(T_rec)
+        ok_pose, _ = self._pose_reason(T_rec, view.cam_id)
         if not ok_pose:
             return None, None
 
@@ -1402,7 +1508,7 @@ class FoundationPoseTrackerNode(Node):
 
             T = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
 
-            ok_pose, reason = self._pose_reason(T)
+            ok_pose, reason = self._pose_reason(T, cam_id)
             if not ok_pose:
                 self.get_logger().info(
                     f"[{cam_id}] INIT reject [{i}] {sel.object_id} | {reason}"
@@ -1552,7 +1658,7 @@ class FoundationPoseTrackerNode(Node):
                 T_new = T_raw
 
             jump_m = float(np.linalg.norm(T_new[:3, 3] - prev[:3, 3]))
-            ok_pose, reason = self._pose_reason(T_new)
+            ok_pose, reason = self._pose_reason(T_new, cam_id)
 
             need_recover = False
             recover_reason = ""
@@ -1714,6 +1820,8 @@ class FoundationPoseTrackerNode(Node):
 
         new_states, pose_overlay = self._initialize_objects(view, selected, stamp)
 
+        new_states = nms_by_position(new_states, position_threshold=0.03)
+
         if self.args.run_mode == "track":
             self.track_states[cam_id] = new_states
         else:
@@ -1767,7 +1875,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-root", default="outputs/foundationpose")
 
     p.add_argument("--dino-model-name", default="dinov2_vitb14")
-    p.add_argument("--dino-min-score", type=float, default=0.60)
+    p.add_argument("--dino-min-score", type=float, default=0.55) #0.6
     p.add_argument("--dino-min-margin", type=float, default=0.0)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
@@ -1832,7 +1940,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-valid-z-m", type=float, default=10.00)
     p.add_argument("--max-translation-jump-m", type=float, default=0.80)
 
-    p.add_argument("--max-objects", type=int, default=10)
+    p.add_argument("--max-objects", type=int, default=15)
     p.add_argument("--max-lost-count", type=int, default=10)
 
     p.add_argument("--min-depth-coverage", type=float, default=0.50)
