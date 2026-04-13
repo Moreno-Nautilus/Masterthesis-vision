@@ -1407,8 +1407,8 @@ class FoundationPoseTrackerNode(Node):
                     cfg = RealtimeTrackerConfig(
                         cutie_cfg=CutieConfig(max_internal_size=480),
                         icp_cfg=ICPConfig(
-                            variant=ICPVariant.POINT_TO_POINT,
-                            max_correspondence_distance=0.05,
+                            variant=ICPVariant.GENERALIZED,
+                            max_correspondence_distance=0.10,
                             voxel_size=0.002,
                         ),
                         min_icp_fitness=0.20,

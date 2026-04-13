@@ -164,7 +164,77 @@ class ICPRefiner:
         colors = np.asarray(cloud.colors, dtype=np.float32) if cloud.has_colors() else None
         
         self.set_model_cloud(vertices, colors, normals)
+
+    # CLAUDE DEPTH TO CLOUD  
+    # def _depth_to_cloud(
+    #     self,
+    #     depth: np.ndarray,
+    #     rgb: np.ndarray,
+    #     mask: np.ndarray,
+    #     K: np.ndarray,
+    # ) -> "open3d.geometry.PointCloud":
+    #     """Convert masked depth image to colored point cloud."""
+    #     o3d = self._o3d
         
+    #     H, W = depth.shape
+        
+    #     # Create pixel coordinate grid
+    #     u = np.arange(W)
+    #     v = np.arange(H)
+    #     u, v = np.meshgrid(u, v)
+        
+    #     # Apply mask
+    #     mask_bool = mask.astype(bool)
+    #     z = depth[mask_bool]
+    #     u = u[mask_bool]
+    #     v = v[mask_bool]
+        
+    #     # Filter invalid depth
+    #     valid = (z > 0.01) & (z < 2.0) & np.isfinite(z)
+    #     z = z[valid]
+    #     u = u[valid]
+    #     v = v[valid]
+        
+    #     if len(z) < 10:
+    #         # Not enough points
+    #         return o3d.geometry.PointCloud()
+        
+    #     # Unproject to 3D
+    #     fx, fy = K[0, 0], K[1, 1]
+    #     cx, cy = K[0, 2], K[1, 2]
+        
+    #     x = (u - cx) * z / fx
+    #     y = (v - cy) * z / fy
+        
+    #     points = np.stack([x, y, z], axis=1).astype(np.float64)
+        
+    #     # Get colors
+    #     rgb_masked = rgb[mask_bool][valid]
+    #     colors = rgb_masked.astype(np.float64) / 255.0
+        
+    #     # Create cloud
+    #     cloud = o3d.geometry.PointCloud()
+    #     cloud.points = o3d.utility.Vector3dVector(points)
+    #     cloud.colors = o3d.utility.Vector3dVector(colors)
+        
+    #     # Estimate normals
+    #     cloud.estimate_normals(
+    #         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+    #     )
+        
+    #     # Optional: outlier removal
+    #     if self.cfg.remove_statistical_outliers:
+    #         cloud, _ = cloud.remove_statistical_outlier(
+    #             nb_neighbors=self.cfg.nb_neighbors,
+    #             std_ratio=self.cfg.std_ratio,
+    #         )
+            
+    #     # Optional: downsample
+    #     if self.cfg.voxel_size is not None:
+    #         cloud = cloud.voxel_down_sample(self.cfg.voxel_size)
+            
+    #     return cloud
+    # GPT DEPTH TO CLOUD
     def _depth_to_cloud(
         self,
         depth: np.ndarray,
@@ -172,68 +242,66 @@ class ICPRefiner:
         mask: np.ndarray,
         K: np.ndarray,
     ) -> "open3d.geometry.PointCloud":
-        """Convert masked depth image to colored point cloud."""
         o3d = self._o3d
-        
+
         H, W = depth.shape
-        
-        # Create pixel coordinate grid
+
         u = np.arange(W)
         v = np.arange(H)
         u, v = np.meshgrid(u, v)
-        
-        # Apply mask
+
         mask_bool = mask.astype(bool)
         z = depth[mask_bool]
         u = u[mask_bool]
         v = v[mask_bool]
-        
-        # Filter invalid depth
+
         valid = (z > 0.01) & (z < 2.0) & np.isfinite(z)
         z = z[valid]
         u = u[valid]
         v = v[valid]
-        
+
         if len(z) < 10:
-            # Not enough points
             return o3d.geometry.PointCloud()
-        
-        # Unproject to 3D
+
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
-        
+
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy
-        
         points = np.stack([x, y, z], axis=1).astype(np.float64)
-        
-        # Get colors
+
         rgb_masked = rgb[mask_bool][valid]
         colors = rgb_masked.astype(np.float64) / 255.0
-        
-        # Create cloud
+
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(points)
         cloud.colors = o3d.utility.Vector3dVector(colors)
-        
-        # Estimate normals
-        cloud.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
-        )
-        
-        # Optional: outlier removal
+
+        # 1) clean first
         if self.cfg.remove_statistical_outliers:
             cloud, _ = cloud.remove_statistical_outlier(
                 nb_neighbors=self.cfg.nb_neighbors,
                 std_ratio=self.cfg.std_ratio,
             )
-            
-        # Optional: downsample
+
         if self.cfg.voxel_size is not None:
             cloud = cloud.voxel_down_sample(self.cfg.voxel_size)
-            
+
+        # 2) THEN estimate normals on the final cloud
+        if len(cloud.points) >= 10:
+            normal_radius = max(0.01, 3.0 * (self.cfg.voxel_size or 0.002))
+            cloud.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                    radius=normal_radius,
+                    max_nn=30,
+                )
+            )
+            cloud.orient_normals_towards_camera_location(
+                camera_location=np.array([0.0, 0.0, 0.0])
+            )
+
         return cloud
-    
+
     def refine(
         self,
         depth: np.ndarray,
@@ -266,14 +334,52 @@ class ICPRefiner:
         # Transform model cloud by initial pose - MAKE A COPY
         model_transformed = o3d.geometry.PointCloud(self._model_cloud_down)
         model_transformed.transform(T_init.astype(np.float64))
-        
+
+        model_transformed.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+        )
+        model_transformed.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
+
+        # Orient model normals toward camera (camera is at origin in camera frame)
+        observed_cloud.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
+        # # Fix degenerate normals - renormalize
+        # obs_normals_arr = np.asarray(observed_cloud.normals)
+        # magnitudes = np.linalg.norm(obs_normals_arr, axis=1, keepdims=True)
+        # # Replace near-zero normals with [0, 0, -1] (pointing toward camera)
+        # bad_mask = magnitudes.flatten() < 0.1
+        # obs_normals_arr[bad_mask] = [0.0, 0.0, -1.0]
+        # # Renormalize all
+        # magnitudes = np.linalg.norm(obs_normals_arr, axis=1, keepdims=True)
+        # magnitudes[magnitudes < 1e-6] = 1.0  # Avoid division by zero
+        # obs_normals_arr = obs_normals_arr / magnitudes
+        # observed_cloud.normals = o3d.utility.Vector3dVector(obs_normals_arr)
+
         # Debug prints
         obs_pts = np.asarray(observed_cloud.points)
         trans_pts = np.asarray(model_transformed.points)
         print(f"[ICP DEBUG] observed: {len(obs_pts)} pts, bounds: {obs_pts.min(axis=0)} to {obs_pts.max(axis=0)}")
         print(f"[ICP DEBUG] model: {len(trans_pts)} pts, bounds: {trans_pts.min(axis=0)} to {trans_pts.max(axis=0)}")
         print(f"[ICP DEBUG] observed has_normals: {observed_cloud.has_normals()}, model has_normals: {model_transformed.has_normals()}")
-        
+        obs_normals = np.asarray(observed_cloud.normals)
+        model_normals = np.asarray(model_transformed.normals)
+        print(f"[ICP DEBUG] observed normals z-mean: {obs_normals[:, 2].mean():.3f}")
+        print(f"[ICP DEBUG] model normals z-mean: {model_normals[:, 2].mean():.3f}")
+        print(f"[ICP DEBUG] observed normals sample: {obs_normals[:3]}")
+        print(f"[ICP DEBUG] model normals sample: {model_normals[:3]}")
+        from scipy.spatial import cKDTree
+        tree = cKDTree(trans_pts)
+        distances, _ = tree.query(obs_pts, k=1)
+        print(f"[ICP DEBUG] min distance between clouds: {distances.min():.4f}m, max: {distances.max():.4f}m, mean: {distances.mean():.4f}m")
+
+        obs_norms_mag = np.linalg.norm(obs_normals, axis=1)
+        model_norms_mag = np.linalg.norm(model_normals, axis=1)
+        print(f"[ICP DEBUG] observed normals magnitude: min={obs_norms_mag.min():.4f}, max={obs_norms_mag.max():.4f}")
+        print(f"[ICP DEBUG] model normals magnitude: min={model_norms_mag.min():.4f}, max={model_norms_mag.max():.4f}")
+        print(f"[ICP DEBUG] target (model) has {len(model_transformed.normals)} normals")
+        print(f"[ICP DEBUG] source (observed) has {len(observed_cloud.normals)} normals")
+        o3d.io.write_point_cloud("/tmp/observed.pcd", observed_cloud)
+        o3d.io.write_point_cloud("/tmp/model.pcd", model_transformed)
+        print("[ICP DEBUG] Saved clouds to /tmp/observed.pcd and /tmp/model.pcd")
         # Build convergence criteria
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
             max_iteration=self.cfg.max_iterations,
