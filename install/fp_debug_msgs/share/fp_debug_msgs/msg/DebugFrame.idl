@@ -1,0 +1,38 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from fp_debug_msgs/msg/DebugFrame.msg
+// generated code does not contain a copyright notice
+
+#include "builtin_interfaces/msg/Time.idl"
+#include "fp_debug_msgs/msg/DebugCandidate.idl"
+#include "fp_debug_msgs/msg/DebugPoseItem.idl"
+
+module fp_debug_msgs {
+  module msg {
+    typedef int32 int32__4[4];
+    struct DebugFrame {
+      builtin_interfaces::msg::Time stamp;
+
+      string cam_id;
+
+      int32 max_candidate_draw;
+
+      boolean show_axes;
+
+      sequence<int32> roi_polygon_xy_flat;
+
+      boolean has_tiny_roi;
+
+      int32__4 tiny_roi_xyxy;
+
+      boolean update_sam;
+
+      boolean update_dino;
+
+      sequence<fp_debug_msgs::msg::DebugCandidate> sam_candidates;
+
+      sequence<fp_debug_msgs::msg::DebugCandidate> dino_ranked_candidates;
+
+      sequence<fp_debug_msgs::msg::DebugPoseItem> pose_items;
+    };
+  };
+};

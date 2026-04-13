@@ -336,10 +336,11 @@ class FoundationPoseWrapper:
         # Generate candidate poses around the prior
         candidates = generate_pose_perturbations_compact(
             T_init,
-            n_samples=32,
+            n_samples=16,
             max_trans_m=0.04,
             max_rot_deg=10.0,
         )
+
         
         # print(f"[MINI-REGISTER] Generated {len(candidates)} candidates around prior")
         

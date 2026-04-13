@@ -1,0 +1,8 @@
+msg/DebugCandidate.idl
+msg/DebugCandidate.msg
+msg/DebugFrame.idl
+msg/DebugFrame.msg
+msg/DebugMaskCrop.idl
+msg/DebugMaskCrop.msg
+msg/DebugPoseItem.idl
+msg/DebugPoseItem.msg

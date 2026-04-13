@@ -1323,7 +1323,7 @@ class FoundationPoseTrackerNode(Node):
         try:
             T_base = self._to_base_pose(cam_id, T_camera)
             z_base = T_base[2, 3]
-            if z_base < 0.001 or z_base > 0.5:
+            if z_base < 0.0 or z_base > 0.5:
                 return False, f"bad_z_base z={z_base:.3f}"
         except Exception:
             pass  # If transform fails, skip base-frame check
@@ -1394,6 +1394,23 @@ class FoundationPoseTrackerNode(Node):
             txt = f"{sel.object_id} {sel.score:.2f}"
             vis = draw_bbox_label(vis, sel.candidate.bbox_xyxy, txt, color, font_scale=0.55)
         return vis
+    
+    def _publish_pose_overlay_only(
+        self,
+        cam_id: str,
+        stamp,
+        pose_overlay: np.ndarray,
+    ) -> None:
+        t0 = time.time()
+        msg = rgb_numpy_to_imgmsg(pose_overlay, frame_id=cam_id, stamp=stamp)
+        t1 = time.time()
+        self.pub_pose_overlay[cam_id].publish(msg)
+        t2 = time.time()
+        print(f"[DEBUG] imgmsg build: {(t1 - t0)*1000:.1f}ms")
+        print(f"[DEBUG] ros publish: {(t2 - t1)*1000:.1f}ms")
+        # self.pub_pose_overlay[cam_id].publish(
+        #     rgb_numpy_to_imgmsg(pose_overlay, frame_id=cam_id, stamp=stamp)
+        # )
 
     def _publish_overlays(
         self,
@@ -1613,6 +1630,8 @@ class FoundationPoseTrackerNode(Node):
                 continue
 
             try:
+                import time
+                t0 = time.time()
                 result = tracker.track_pose(
                     object_id=state.object_id,
                     mesh_path=state.mesh_path,
@@ -1621,6 +1640,8 @@ class FoundationPoseTrackerNode(Node):
                     K=K,
                     T_object_camera_init=state.T_object_camera,
                 )
+                elapsed_ms = (time.time() - t0) * 1000
+                self.get_logger().info(f"[{cam_id}] track_pose {state.object_id}: {elapsed_ms:.1f}ms")
             except Exception:
                 state.lost_count += 1
                 if state.lost_count < self.args.max_lost_count:
@@ -1751,6 +1772,8 @@ class FoundationPoseTrackerNode(Node):
         return surviving, pose_overlay
 
     def _process_single_view(self, view: Any) -> None:
+        import time
+        t_start = time.time()
         cam_id = view.cam_id
 
         if view.rgb is None or view.depth is None:
@@ -1764,22 +1787,32 @@ class FoundationPoseTrackerNode(Node):
         states = self.track_states[cam_id]
 
         if self.args.run_mode == "track" and states and all(s.mode == "track" for s in states):
+            t1 = time.time()
             surviving, pose_overlay = self._track_objects(view, states, stamp)
+            print(f"[DEBUG] _track_objects: {(time.time()-t1)*1000:.1f}ms")
 
             if surviving:
                 self.track_states[cam_id] = surviving
 
+                t2 = time.time()
                 sam_overlay_cached = self.last_sam_overlay.get(cam_id, rgb)
                 dino_overlay_cached = self.last_dino_overlay.get(cam_id, rgb)
+                print(f"[DEBUG] overlay cache: {(time.time()-t2)*1000:.1f}ms")
 
-                self._publish_overlays(
-                    cam_id,
-                    stamp,
-                    rgb,
-                    sam_overlay=sam_overlay_cached,
-                    dino_overlay=dino_overlay_cached,
-                    pose_overlay=pose_overlay,
-                )
+                t3 = time.time()
+                if self.frame_counter % 4 == 0:
+                    self._publish_pose_overlay_only(cam_id, stamp, pose_overlay)
+                # self._publish_overlays(
+                #     cam_id,
+                #     stamp,
+                #     rgb,
+                #     sam_overlay=sam_overlay_cached,
+                #     dino_overlay=dino_overlay_cached,
+                #     pose_overlay=pose_overlay,
+                # )
+
+                print(f"[DEBUG] _publish_overlays: {(time.time()-t3)*1000:.1f}ms")
+                print(f"[TRACK PATH] total time: {(time.time() - t_start)*1000:.1f}ms")
                 return
             else:
                 self.get_logger().info(f"[{cam_id}] TRACK -> REINIT")
@@ -1847,6 +1880,9 @@ class FoundationPoseTrackerNode(Node):
         signature = self._views_signature(views)
         if signature == self.last_signature:
             return
+
+        print(f"[TICK] New frame at {time.time():.3f}") 
+
         self.last_signature = signature
 
         self.busy = True
@@ -1910,7 +1946,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated x1,y1,x2,y2,... polygon points for cam1 ROI")
 
     p.add_argument("--cam2-roi-polygon", type=str,
-        default="300,530,1120,185,1813,480,1480,1080,850,1080",
+        default="430,410,1190,160,1920,500,1920,780,1720,1080,940,1080",
         help="Comma-separated x1,y1,x2,y2,... polygon points for cam2 ROI")
 
     p.add_argument("--tiny-objects-enabled", action="store_true")
@@ -1951,6 +1987,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    torch.cuda.empty_cache()
     args = parse_args()
 
     rclpy.init()

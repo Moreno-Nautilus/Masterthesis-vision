@@ -181,6 +181,19 @@ class MultiCamGrabber(Node):
 
     def ready(self) -> bool:
         for c in self.cameras:
+            has_depth_msg = c.cam_id in self._depth_msg
+            has_K_depth = c.cam_id in self._K_depth
+            has_rgb_msg = c.cam_id in self._rgb_msg
+            has_K_rgb = c.cam_id in self._K_rgb
+
+            # print(
+            #     f"[READY DEBUG] {c.cam_id} "
+            #     f"depth_msg={has_depth_msg} "
+            #     f"K_depth={has_K_depth} "
+            #     f"rgb_msg={has_rgb_msg} "
+            #     f"K_rgb={has_K_rgb}"
+            # )
+
             if c.cam_id not in self._depth_msg:
                 return False
             if c.cam_id not in self._K_depth:
@@ -326,5 +339,4 @@ class MultiCamGrabber(Node):
                     stamp_s=t_d,
                 )
             )
-
         return views
