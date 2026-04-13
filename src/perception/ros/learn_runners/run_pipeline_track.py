@@ -36,7 +36,9 @@ from src.perception.learned.SAM.sam_segmentation import (
     SAMSegmenterConfig,
 )
 from src.perception.ros.multicam_grabber import CameraTopics, MultiCamGrabber
-
+from src.perception.tracking.realtime_tracker import RealtimeTracker, RealtimeTrackerConfig
+from src.perception.tracking.cutie_tracker import CutieConfig
+from src.perception.tracking.icp_refiner import ICPConfig, ICPVariant
 
 FAST_QOS = QoSProfile(
     depth=1,
@@ -648,6 +650,10 @@ class FoundationPoseTrackerNode(Node):
                     mesh_scale=args.mesh_scale,
                 )
             )
+        
+        # Real-time tracker (CuteVOS + ICP) — one per camera
+        self.realtime_trackers: dict[str, RealtimeTracker] = {}
+        self.rt_active: dict[str, bool] = {c.cam_id: False for c in CAMERAS}
 
         self.pub_pose_base: dict[str, Any] = {}
         self.pub_pose_base_init: dict[str, Any] = {}
@@ -1384,143 +1390,98 @@ class FoundationPoseTrackerNode(Node):
         states: list[ObjectTrackState],
         stamp,
     ) -> list[ObjectTrackState]:
+        """Track objects using CuteVOS + Colored ICP."""
+        cam_id = view.cam_id
         rgb = view.rgb
         depth = view.depth
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
-        cam_id = view.cam_id
 
-        tracker = self.fp_tracker_by_cam[cam_id]
         surviving: list[ObjectTrackState] = []
 
         for i, state in enumerate(states):
-            if state.T_object_camera is None:
-                state.lost_count += 1
-                if state.lost_count < self.args.max_lost_count:
-                    surviving.append(state)
-                else:
-                    self.get_logger().info(f"[{cam_id}] LOST [{i}] {state.object_id}")
-                continue
+            tracker_key = f"{cam_id}_{state.object_id}_{i}"
 
-            try:
-                t0 = time.time()
-                result = tracker.track_pose(
-                    object_id=state.object_id,
-                    mesh_path=state.mesh_path,
-                    rgb=rgb,
-                    depth=depth,
-                    K=K,
-                    T_object_camera_init=state.T_object_camera,
-                )
-                elapsed_ms = (time.time() - t0) * 1000
-                self.get_logger().info(f"[{cam_id}] track_pose {state.object_id}: {elapsed_ms:.1f}ms")
-            except Exception:
-                state.lost_count += 1
-                if state.lost_count < self.args.max_lost_count:
-                    surviving.append(state)
-                else:
-                    self.get_logger().info(f"[{cam_id}] LOST [{i}] {state.object_id}")
-                continue
-
-            prev = np.asarray(state.T_object_camera, dtype=np.float32).reshape(4, 4)
-            T_raw = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
-
-            try:
-                T_inv = np.linalg.inv(T_raw)
-                inv_valid = True
-            except np.linalg.LinAlgError:
-                T_inv = None
-                inv_valid = False
-
-            convention = getattr(state, "track_pose_convention", "raw")
-
-            if convention == "inv":
-                if not inv_valid:
-                    state.lost_count += 1
-                    if state.lost_count < self.args.max_lost_count:
-                        surviving.append(state)
-                    else:
-                        self.get_logger().info(f"[{cam_id}] LOST [{i}] {state.object_id}")
-                    continue
-                T_new = T_inv
-            else:
-                T_new = T_raw
-
-            jump_m = float(np.linalg.norm(T_new[:3, 3] - prev[:3, 3]))
-            ok_pose, reason = self._pose_reason(T_new, cam_id)
-
-            need_recover = False
-            recover_reason = ""
-            if not ok_pose:
-                need_recover = True
-                recover_reason = reason
-            elif jump_m > self.args.max_translation_jump_m:
-                need_recover = True
-                recover_reason = f"jump={jump_m:.3f}m"
-
-            if need_recover:
-                T_rec, recovered_convention = self._try_local_recover(view, state, tracker)
-                if T_rec is not None:
-                    state.T_object_camera = T_rec.copy()
-                    if recovered_convention is not None:
-                        state.track_pose_convention = recovered_convention
-                    state.lost_count = 0
-                    state.mode = f"recover/{state.track_pose_convention}"
-                    surviving.append(state)
-
-                    smoothed_id = vote_object_id(state.id_history)
-                    self._publish_pose_base_track(cam_id, state.object_id, i, T_rec, stamp)
-                    self._publish_pose_base(cam_id, state.object_id, i, T_rec, stamp)
-                    self._log_base_pose(
-                        "RECOVER",
-                        cam_id,
-                        smoothed_id,
-                        i,
-                        T_rec,
-                        extra=f"convention={state.track_pose_convention}",
+            # Initialize real-time tracker if not active
+            if tracker_key not in self.realtime_trackers:
+                try:
+                    cfg = RealtimeTrackerConfig(
+                        cutie_cfg=CutieConfig(max_internal_size=480),
+                        icp_cfg=ICPConfig(
+                            variant=ICPVariant.POINT_TO_POINT,
+                            max_correspondence_distance=0.05,
+                            voxel_size=0.002,
+                        ),
+                        min_icp_fitness=0.20,
+                        max_translation_per_frame=0.05,
+                        lost_frames_before_reinit=5,
+                        verbose=False,
                     )
-                    state.last_logged_T_base = self._safe_to_base_pose(cam_id, T_rec).copy()
-                    state.last_logged_convention = state.track_pose_convention
+                    rt = RealtimeTracker(cfg)
+
+                    # Get mask from last known pose projection or recovery mask
+                    init_mask = state.recovery_mask
+                    if init_mask is None or init_mask.sum() < 100:
+                        # No mask — can't init RT tracker, fall back to re-init
+                        self.get_logger().warn(f"[{cam_id}] No mask for RT init, requesting re-init")
+                        continue
+                    
+                    init_mask = np.asarray(init_mask).astype(bool)
+                    if init_mask.ndim != 2:
+                        self.get_logger().warn(f"[{cam_id}] Mask has wrong dims: {init_mask.shape}")
+                        continue
+
+                    print(f"[DEBUG] init_mask shape={init_mask.shape}, rgb shape={rgb.shape}")
+
+                    rt.initialize(
+                        rgb=rgb,
+                        depth=depth,
+                        mask=init_mask,
+                        T_init=state.T_object_camera,
+                        K=K,
+                        mesh_path=state.mesh_path,
+                    )
+                    self.realtime_trackers[tracker_key] = rt
+                    self.get_logger().info(f"[{cam_id}] RT tracker initialized for {state.object_id}")
+                except Exception as e:
+                    self.get_logger().warn(f"[{cam_id}] RT init failed: {e}")
                     continue
 
-                state.lost_count += 1
-                if state.lost_count < self.args.max_lost_count:
-                    surviving.append(state)
-                else:
-                    self.get_logger().info(
-                        f"[{cam_id}] LOST [{i}] {state.object_id} | {recover_reason}"
-                    )
+            # Run tracking
+            rt = self.realtime_trackers[tracker_key]
+            t0 = time.time()
+
+            try:
+                result = rt.track(rgb, depth, K)
+            except Exception as e:
+                self.get_logger().warn(f"[{cam_id}] RT track failed: {e}")
+                del self.realtime_trackers[tracker_key]
                 continue
 
+            elapsed_ms = (time.time() - t0) * 1000
+            self.get_logger().info(
+                f"[{cam_id}] RT track {state.object_id}: {elapsed_ms:.1f}ms "
+                f"fitness={result.icp_fitness:.2f}"
+            )
+
+            if not result.valid:
+                self.get_logger().warn(f"[{cam_id}] RT lost {state.object_id}: {result.message}")
+                del self.realtime_trackers[tracker_key]
+                # Don't add to surviving — will trigger re-init
+                continue
+
+            # Update state
+            T_new = result.T_object_camera
             state.T_object_camera = T_new.copy()
+            state.recovery_mask = result.mask  # Update mask for next frame
             state.lost_count = 0
-            state.mode = f"track/{convention}"
+            state.mode = "track/rt"
             surviving.append(state)
 
-            smoothed_id = vote_object_id(state.id_history)
+            # Publish
             self._publish_pose_base_track(cam_id, state.object_id, i, T_new, stamp)
             self._publish_pose_base(cam_id, state.object_id, i, T_new, stamp)
 
-            T_base_new = self._safe_to_base_pose(cam_id, T_new)
-            if should_log_track_update(
-                T_base_new=T_base_new,
-                T_base_last=state.last_logged_T_base,
-                convention_new=convention,
-                convention_last=state.last_logged_convention,
-                trans_thresh_m=self.args.track_log_trans_thresh_m,
-                rot_thresh_deg=self.args.track_log_rot_thresh_deg,
-            ):
-                self._log_base_pose(
-                    "TRACK",
-                    cam_id,
-                    smoothed_id,
-                    i,
-                    T_new,
-                    extra=f"convention={convention}",
-                )
-                state.last_logged_T_base = T_base_new.copy()
-                state.last_logged_convention = convention
-
-        return surviving
+        return surviving    
 
     def _process_single_view(self, view: Any) -> None:
         t_start = time.time()
@@ -1583,6 +1544,8 @@ class FoundationPoseTrackerNode(Node):
                 pose_items=[],
             )
             self.pub_debug_frame[cam_id].publish(frame)
+            print(f"[DEBUG] Published debug frame for {cam_id}")
+
             return
 
         ranked = self._classify_masks_batched(rgb, masks)
@@ -1603,6 +1566,8 @@ class FoundationPoseTrackerNode(Node):
                 pose_items=[],
             )
             self.pub_debug_frame[cam_id].publish(frame)
+            print(f"[DEBUG] Published debug frame for {cam_id}")
+
             return
 
         new_states = self._initialize_objects(view, selected, stamp)
@@ -1629,6 +1594,8 @@ class FoundationPoseTrackerNode(Node):
             pose_items=pose_items,
         )
         self.pub_debug_frame[cam_id].publish(frame)
+        print(f"[DEBUG] Published debug frame for {cam_id}")
+
 
         if new_states:
             self.get_logger().info(
