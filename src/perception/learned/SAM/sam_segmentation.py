@@ -38,10 +38,10 @@ class SAMSegmenterConfig:
     attach_rgb_crops: bool = True
 
     # automatic mask generation
-    auto_points_per_side: int = 64 #48
+    auto_points_per_side: int = 64 #64
     auto_pred_iou_thresh: float = 0.70 #0.60
     auto_stability_score_thresh: float = 0.65 #0.75
-    auto_crop_n_layers: int = 1
+    auto_crop_n_layers: int = 0 # WAS 1
     auto_crop_n_points_downscale_factor: int = 2
     auto_min_mask_region_area: int = 150 #200 
 
@@ -342,6 +342,48 @@ class SAMSegmenter:
 
         out.sort(key=lambda x: (x.score, x.area), reverse=True)
         return out
+
+    def generate_auto_on_crop(
+        self,
+        rgb_full: np.ndarray,
+        crop_xyxy: tuple[int, int, int, int],
+        reuse_embedding: bool = False,
+    ) -> list[SAMMaskCandidate]:
+        """
+        Generate masks for a crop region, optionally reusing the full-image embedding.
+        
+        Args:
+            rgb_full: Full RGB image
+            crop_xyxy: (x0, y0, x1, y1) crop region in full image coords
+            reuse_embedding: If True, assumes set_image was already called on rgb_full
+        """
+        x0, y0, x1, y1 = crop_xyxy
+        rgb_crop = rgb_full[y0:y1, x0:x1].copy()
+        
+        if rgb_crop.size == 0:
+            return []
+        
+        # Generate masks on the crop
+        masks_crop = self.generate_auto(rgb_crop)
+        
+        # Lift masks back to full image coordinates
+        h_full, w_full = rgb_full.shape[:2]
+        lifted = []
+        for m in masks_crop:
+            full_mask = np.zeros((h_full, w_full), dtype=bool)
+            full_mask[y0:y1, x0:x1] = m.mask
+            
+            bx0, by0, bx1, by1 = m.bbox_xyxy
+            lifted.append(
+                SAMMaskCandidate(
+                    mask=full_mask,
+                    bbox_xyxy=(bx0 + x0, by0 + y0, bx1 + x0, by1 + y0),
+                    area=m.area,
+                    score=m.score,
+                    crop_rgb=m.crop_rgb,
+                )
+            )
+        return lifted
 
     def _postprocess_masks(
         self,

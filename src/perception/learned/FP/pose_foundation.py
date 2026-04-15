@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import sys
+import pickle
+import hashlib
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -204,6 +207,29 @@ class FoundationPoseWrapper:
         self._PoseRefinePredictor = PoseRefinePredictor
 
         self._imports_ready = True
+
+    def _get_mesh_cache_path(self, mesh_path: str) -> Path:
+        """Get cache path for preprocessed mesh data."""
+        mesh_hash = hashlib.md5(f"{mesh_path}_{self.cfg.mesh_scale}".encode()).hexdigest()[:12]
+        cache_dir = Path("/workspace/MasterThesis/cache/fp_meshes")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"{Path(mesh_path).stem}_{mesh_hash}.pkl"
+
+    def preload_mesh(self, mesh_path: str, object_id: str = None) -> None:
+        """Pre-cache mesh."""
+        if object_id is None:
+            object_id = Path(mesh_path).stem
+        
+        mesh_file = Path(mesh_path)
+        if not mesh_file.exists():
+            print(f"[FoundationPose] Failed to pre-cache {object_id}: Mesh file does not exist: {mesh_path}")
+            return
+        
+        try:
+            self._build_estimator(object_id=object_id, mesh_path=mesh_path)
+            print(f"[FoundationPose] Pre-cached mesh for {object_id}")
+        except Exception as e:
+            print(f"[FoundationPose] Failed to pre-cache {object_id}: {e}")
 
     @staticmethod
     def _sanitize_rgb(rgb: np.ndarray) -> np.ndarray:
