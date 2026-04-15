@@ -323,7 +323,7 @@ class RealtimeTracker:
         translation = np.linalg.norm(t_new - t_prev)
         
         print(f"[Motion DEBUG] t_prev={t_prev}, t_new={t_new}")
-        print(f"[Motion DEBUG] delta={translation*1000:.1f}mm, threshold={self.cfg.max_translation_per_frame*1000:.1f}mm")
+        #print(f"[Motion DEBUG] delta={translation*1000:.1f}mm, threshold={self.cfg.max_translation_per_frame*1000:.1f}mm")
         
         if translation > self.cfg.max_translation_per_frame:
             return False
@@ -337,7 +337,7 @@ class RealtimeTracker:
         cos_angle = np.clip(cos_angle, -1, 1)
         angle_deg = np.degrees(np.arccos(cos_angle))
         
-        print(f"[Motion DEBUG] rotation delta={angle_deg:.1f}°, threshold={self.cfg.max_rotation_per_frame_deg:.1f}°")
+        # print(f"[Motion DEBUG] rotation delta={angle_deg:.1f}°, threshold={self.cfg.max_rotation_per_frame_deg:.1f}°")
         
         if angle_deg > self.cfg.max_rotation_per_frame_deg:
             return False

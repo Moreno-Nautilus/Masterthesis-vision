@@ -141,6 +141,30 @@ class ICPRefiner:
         print(f"[ICPRefiner] Model cloud set: {len(self._model_cloud.points)} pts "
               f"-> {len(self._model_cloud_down.points)} pts (downsampled)")
     
+    # def set_model_from_mesh(self, mesh_path: str, num_points: int = 5000, scale: float = 0.01) -> None:
+    #     """Load model cloud by sampling points from mesh."""
+    #     self._lazy_import()
+    #     o3d = self._o3d
+        
+    #     mesh = o3d.io.read_triangle_mesh(mesh_path)
+        
+    #     # Center the mesh (same as FP does)
+    #     mesh.translate(-mesh.get_center())
+        
+    #     # Scale from mm to meters (same as FP)
+    #     mesh.scale(scale, center=(0, 0, 0))
+        
+    #     mesh.compute_vertex_normals()
+        
+    #     # Sample points
+    #     cloud = mesh.sample_points_uniformly(number_of_points=num_points)
+        
+    #     vertices = np.asarray(cloud.points, dtype=np.float32)
+    #     normals = np.asarray(cloud.normals, dtype=np.float32)
+    #     colors = np.asarray(cloud.colors, dtype=np.float32) if cloud.has_colors() else None
+        
+    #     self.set_model_cloud(vertices, colors, normals)
+
     def set_model_from_mesh(self, mesh_path: str, num_points: int = 5000, scale: float = 0.01) -> None:
         """Load model cloud by sampling points from mesh."""
         self._lazy_import()
@@ -158,6 +182,11 @@ class ICPRefiner:
         
         # Sample points
         cloud = mesh.sample_points_uniformly(number_of_points=num_points)
+        
+        # NEW: Re-center based on center of mass of sampled points
+        pts = np.asarray(cloud.points)
+        center_of_mass = pts.mean(axis=0)
+        cloud.translate(-center_of_mass)
         
         vertices = np.asarray(cloud.points, dtype=np.float32)
         normals = np.asarray(cloud.normals, dtype=np.float32)
@@ -303,151 +332,113 @@ class ICPRefiner:
         return cloud
 
     def refine(
-        self,
-        depth: np.ndarray,
-        rgb: np.ndarray,
-        mask: np.ndarray,
-        K: np.ndarray,
-        T_init: np.ndarray,
-    ) -> ICPResult:
-        if self._model_cloud is None:
-            raise RuntimeError("Call set_model_cloud() first")
+            self,
+            depth: np.ndarray,
+            rgb: np.ndarray,
+            mask: np.ndarray,
+            K: np.ndarray,
+            T_init: np.ndarray,
+        ) -> ICPResult:
+            if self._model_cloud is None:
+                raise RuntimeError("Call set_model_cloud() first")
+                
+            self._lazy_import()
+            o3d = self._o3d
             
-        self._lazy_import()
-        o3d = self._o3d
-        
-        t0 = time.time()
-        
-        # Extract observed point cloud from depth + mask
-        observed_cloud = self._depth_to_cloud(depth, rgb, mask, K)
-        
-        if len(observed_cloud.points) < 50:
+            t0 = time.time()
+            
+            # Extract observed point cloud from depth + mask
+            observed_cloud = self._depth_to_cloud(depth, rgb, mask, K)
+            
+            if len(observed_cloud.points) < 50:
+                return ICPResult(
+                    T_refined=T_init.copy(),
+                    fitness=0.0,
+                    inlier_rmse=float('inf'),
+                    num_inliers=0,
+                    converged=False,
+                    elapsed_ms=(time.time() - t0) * 1000,
+                )
+            
+            # Transform model cloud by initial pose - MAKE A COPY
+            model_transformed = o3d.geometry.PointCloud(self._model_cloud_down)
+            model_transformed.transform(T_init.astype(np.float64))
+
+            model_transformed.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+            )
+            model_transformed.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
+
+            # Orient observed normals toward camera (camera is at origin in camera frame)
+            observed_cloud.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
+
+            # Build convergence criteria
+            criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=self.cfg.max_iterations,
+                relative_fitness=self.cfg.relative_fitness,
+                relative_rmse=self.cfg.relative_rmse,
+            )
+            
+            # Run ICP based on variant
+            if self.cfg.variant == ICPVariant.POINT_TO_POINT:
+                result = o3d.pipelines.registration.registration_icp(
+                    source=model_transformed,
+                    target=observed_cloud,
+                    max_correspondence_distance=self.cfg.max_correspondence_distance,
+                    init=np.eye(4),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                    criteria=criteria,
+                )
+                
+            elif self.cfg.variant == ICPVariant.POINT_TO_PLANE:
+                result = o3d.pipelines.registration.registration_icp(
+                    source=model_transformed,
+                    target=observed_cloud,
+                    max_correspondence_distance=self.cfg.max_correspondence_distance,
+                    init=np.eye(4),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    criteria=criteria,
+                )
+                
+            elif self.cfg.variant == ICPVariant.COLORED:
+                result = o3d.pipelines.registration.registration_colored_icp(
+                    source=model_transformed,
+                    target=observed_cloud,
+                    max_correspondence_distance=self.cfg.max_correspondence_distance,
+                    init=np.eye(4),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationForColoredICP(
+                        lambda_geometric=self.cfg.lambda_geometric,
+                    ),
+                    criteria=criteria,
+                )
+                
+            elif self.cfg.variant == ICPVariant.GENERALIZED:
+                result = o3d.pipelines.registration.registration_generalized_icp(
+                    source=model_transformed,
+                    target=observed_cloud,
+                    max_correspondence_distance=self.cfg.max_correspondence_distance,
+                    init=np.eye(4),
+                    criteria=criteria,
+                )
+            else:
+                raise ValueError(f"Unknown ICP variant: {self.cfg.variant}")
+            
+            # Compose final transformation: T_refined = T_icp @ T_init
+            T_icp = np.asarray(result.transformation, dtype=np.float64)
+            T_refined = T_icp @ T_init.astype(np.float64)
+            
+            elapsed_ms = (time.time() - t0) * 1000
+            converged = result.fitness > 0.3 and result.inlier_rmse < 0.005
+            
             return ICPResult(
-                T_refined=T_init.copy(),
-                fitness=0.0,
-                inlier_rmse=float('inf'),
-                num_inliers=0,
-                converged=False,
-                elapsed_ms=(time.time() - t0) * 1000,
+                T_refined=T_refined.astype(np.float32),
+                fitness=float(result.fitness),
+                inlier_rmse=float(result.inlier_rmse),
+                num_inliers=len(result.correspondence_set),
+                converged=converged,
+                elapsed_ms=elapsed_ms,
             )
-        
-        # Transform model cloud by initial pose - MAKE A COPY
-        model_transformed = o3d.geometry.PointCloud(self._model_cloud_down)
-        model_transformed.transform(T_init.astype(np.float64))
-
-        model_transformed.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
-        )
-        model_transformed.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
-
-        # Orient model normals toward camera (camera is at origin in camera frame)
-        observed_cloud.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
-        # # Fix degenerate normals - renormalize
-        # obs_normals_arr = np.asarray(observed_cloud.normals)
-        # magnitudes = np.linalg.norm(obs_normals_arr, axis=1, keepdims=True)
-        # # Replace near-zero normals with [0, 0, -1] (pointing toward camera)
-        # bad_mask = magnitudes.flatten() < 0.1
-        # obs_normals_arr[bad_mask] = [0.0, 0.0, -1.0]
-        # # Renormalize all
-        # magnitudes = np.linalg.norm(obs_normals_arr, axis=1, keepdims=True)
-        # magnitudes[magnitudes < 1e-6] = 1.0  # Avoid division by zero
-        # obs_normals_arr = obs_normals_arr / magnitudes
-        # observed_cloud.normals = o3d.utility.Vector3dVector(obs_normals_arr)
-
-        # Debug prints
-        obs_pts = np.asarray(observed_cloud.points)
-        trans_pts = np.asarray(model_transformed.points)
-        print(f"[ICP DEBUG] observed: {len(obs_pts)} pts, bounds: {obs_pts.min(axis=0)} to {obs_pts.max(axis=0)}")
-        print(f"[ICP DEBUG] model: {len(trans_pts)} pts, bounds: {trans_pts.min(axis=0)} to {trans_pts.max(axis=0)}")
-        print(f"[ICP DEBUG] observed has_normals: {observed_cloud.has_normals()}, model has_normals: {model_transformed.has_normals()}")
-        obs_normals = np.asarray(observed_cloud.normals)
-        model_normals = np.asarray(model_transformed.normals)
-        print(f"[ICP DEBUG] observed normals z-mean: {obs_normals[:, 2].mean():.3f}")
-        print(f"[ICP DEBUG] model normals z-mean: {model_normals[:, 2].mean():.3f}")
-        print(f"[ICP DEBUG] observed normals sample: {obs_normals[:3]}")
-        print(f"[ICP DEBUG] model normals sample: {model_normals[:3]}")
-        from scipy.spatial import cKDTree
-        tree = cKDTree(trans_pts)
-        distances, _ = tree.query(obs_pts, k=1)
-        print(f"[ICP DEBUG] min distance between clouds: {distances.min():.4f}m, max: {distances.max():.4f}m, mean: {distances.mean():.4f}m")
-
-        obs_norms_mag = np.linalg.norm(obs_normals, axis=1)
-        model_norms_mag = np.linalg.norm(model_normals, axis=1)
-        print(f"[ICP DEBUG] observed normals magnitude: min={obs_norms_mag.min():.4f}, max={obs_norms_mag.max():.4f}")
-        print(f"[ICP DEBUG] model normals magnitude: min={model_norms_mag.min():.4f}, max={model_norms_mag.max():.4f}")
-        print(f"[ICP DEBUG] target (model) has {len(model_transformed.normals)} normals")
-        print(f"[ICP DEBUG] source (observed) has {len(observed_cloud.normals)} normals")
-        o3d.io.write_point_cloud("/tmp/observed.pcd", observed_cloud)
-        o3d.io.write_point_cloud("/tmp/model.pcd", model_transformed)
-        print("[ICP DEBUG] Saved clouds to /tmp/observed.pcd and /tmp/model.pcd")
-        # Build convergence criteria
-        criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
-            max_iteration=self.cfg.max_iterations,
-            relative_fitness=self.cfg.relative_fitness,
-            relative_rmse=self.cfg.relative_rmse,
-        )
-        
-        # Run ICP based on variant
-        if self.cfg.variant == ICPVariant.POINT_TO_POINT:
-            result = o3d.pipelines.registration.registration_icp(
-                source=model_transformed,
-                target=observed_cloud,
-                max_correspondence_distance=self.cfg.max_correspondence_distance,
-                init=np.eye(4),
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                criteria=criteria,
-            )
-            
-        elif self.cfg.variant == ICPVariant.POINT_TO_PLANE:
-            result = o3d.pipelines.registration.registration_icp(
-                source=model_transformed,
-                target=observed_cloud,
-                max_correspondence_distance=self.cfg.max_correspondence_distance,
-                init=np.eye(4),
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=criteria,
-            )
-            
-        elif self.cfg.variant == ICPVariant.COLORED:
-            result = o3d.pipelines.registration.registration_colored_icp(
-                source=model_transformed,
-                target=observed_cloud,
-                max_correspondence_distance=self.cfg.max_correspondence_distance,
-                init=np.eye(4),
-                estimation_method=o3d.pipelines.registration.TransformationEstimationForColoredICP(
-                    lambda_geometric=self.cfg.lambda_geometric,
-                ),
-                criteria=criteria,
-            )
-            
-        elif self.cfg.variant == ICPVariant.GENERALIZED:
-            result = o3d.pipelines.registration.registration_generalized_icp(
-                source=model_transformed,
-                target=observed_cloud,
-                max_correspondence_distance=self.cfg.max_correspondence_distance,
-                init=np.eye(4),
-                criteria=criteria,
-            )
-        else:
-            raise ValueError(f"Unknown ICP variant: {self.cfg.variant}")
-        
-        print(f"[ICP DEBUG] result: fitness={result.fitness:.4f}, rmse={result.inlier_rmse:.6f}, correspondences={len(result.correspondence_set)}")
-        
-        # Compose final transformation: T_refined = T_icp @ T_init
-        T_icp = np.asarray(result.transformation, dtype=np.float64)
-        T_refined = T_icp @ T_init.astype(np.float64)
-        
-        elapsed_ms = (time.time() - t0) * 1000
-        converged = result.fitness > 0.3 and result.inlier_rmse < 0.005
-        
-        return ICPResult(
-            T_refined=T_refined.astype(np.float32),
-            fitness=float(result.fitness),
-            inlier_rmse=float(result.inlier_rmse),
-            num_inliers=len(result.correspondence_set),
-            converged=converged,
-            elapsed_ms=elapsed_ms,
-        )
+    
 # =============================================================================
 # FilterReg fallback (more robust, ~25ms)
 # =============================================================================

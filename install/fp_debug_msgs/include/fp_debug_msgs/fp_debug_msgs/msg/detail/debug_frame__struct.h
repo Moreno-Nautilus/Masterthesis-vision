@@ -21,6 +21,7 @@ extern "C"
 // Member 'stamp'
 #include "builtin_interfaces/msg/detail/time__struct.h"
 // Member 'cam_id'
+// Member 'track_object_id'
 #include "rosidl_runtime_c/string.h"
 // Member 'roi_polygon_xy_flat'
 #include "rosidl_runtime_c/primitives_sequence.h"
@@ -29,6 +30,8 @@ extern "C"
 #include "fp_debug_msgs/msg/detail/debug_candidate__struct.h"
 // Member 'pose_items'
 #include "fp_debug_msgs/msg/detail/debug_pose_item__struct.h"
+// Member 'track_mask'
+#include "fp_debug_msgs/msg/detail/debug_mask_crop__struct.h"
 
 /// Struct defined in msg/DebugFrame in the package fp_debug_msgs.
 typedef struct fp_debug_msgs__msg__DebugFrame
@@ -45,6 +48,13 @@ typedef struct fp_debug_msgs__msg__DebugFrame
   fp_debug_msgs__msg__DebugCandidate__Sequence sam_candidates;
   fp_debug_msgs__msg__DebugCandidate__Sequence dino_ranked_candidates;
   fp_debug_msgs__msg__DebugPoseItem__Sequence pose_items;
+  /// Tracking mask from Cutie (when in track mode)
+  bool has_track_mask;
+  int32_t track_mask_bbox_xyxy[4];
+  fp_debug_msgs__msg__DebugMaskCrop track_mask;
+  rosidl_runtime_c__String track_object_id;
+  float track_icp_fitness;
+  float track_icp_rmse_mm;
 } fp_debug_msgs__msg__DebugFrame;
 
 // Struct for a sequence of fp_debug_msgs__msg__DebugFrame.

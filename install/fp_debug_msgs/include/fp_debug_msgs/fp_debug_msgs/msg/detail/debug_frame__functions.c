@@ -15,6 +15,7 @@
 // Member `stamp`
 #include "builtin_interfaces/msg/detail/time__functions.h"
 // Member `cam_id`
+// Member `track_object_id`
 #include "rosidl_runtime_c/string_functions.h"
 // Member `roi_polygon_xy_flat`
 #include "rosidl_runtime_c/primitives_sequence_functions.h"
@@ -23,6 +24,8 @@
 #include "fp_debug_msgs/msg/detail/debug_candidate__functions.h"
 // Member `pose_items`
 #include "fp_debug_msgs/msg/detail/debug_pose_item__functions.h"
+// Member `track_mask`
+#include "fp_debug_msgs/msg/detail/debug_mask_crop__functions.h"
 
 bool
 fp_debug_msgs__msg__DebugFrame__init(fp_debug_msgs__msg__DebugFrame * msg)
@@ -66,6 +69,20 @@ fp_debug_msgs__msg__DebugFrame__init(fp_debug_msgs__msg__DebugFrame * msg)
     fp_debug_msgs__msg__DebugFrame__fini(msg);
     return false;
   }
+  // has_track_mask
+  // track_mask_bbox_xyxy
+  // track_mask
+  if (!fp_debug_msgs__msg__DebugMaskCrop__init(&msg->track_mask)) {
+    fp_debug_msgs__msg__DebugFrame__fini(msg);
+    return false;
+  }
+  // track_object_id
+  if (!rosidl_runtime_c__String__init(&msg->track_object_id)) {
+    fp_debug_msgs__msg__DebugFrame__fini(msg);
+    return false;
+  }
+  // track_icp_fitness
+  // track_icp_rmse_mm
   return true;
 }
 
@@ -93,6 +110,14 @@ fp_debug_msgs__msg__DebugFrame__fini(fp_debug_msgs__msg__DebugFrame * msg)
   fp_debug_msgs__msg__DebugCandidate__Sequence__fini(&msg->dino_ranked_candidates);
   // pose_items
   fp_debug_msgs__msg__DebugPoseItem__Sequence__fini(&msg->pose_items);
+  // has_track_mask
+  // track_mask_bbox_xyxy
+  // track_mask
+  fp_debug_msgs__msg__DebugMaskCrop__fini(&msg->track_mask);
+  // track_object_id
+  rosidl_runtime_c__String__fini(&msg->track_object_id);
+  // track_icp_fitness
+  // track_icp_rmse_mm
 }
 
 bool
@@ -163,6 +188,36 @@ fp_debug_msgs__msg__DebugFrame__are_equal(const fp_debug_msgs__msg__DebugFrame *
   {
     return false;
   }
+  // has_track_mask
+  if (lhs->has_track_mask != rhs->has_track_mask) {
+    return false;
+  }
+  // track_mask_bbox_xyxy
+  for (size_t i = 0; i < 4; ++i) {
+    if (lhs->track_mask_bbox_xyxy[i] != rhs->track_mask_bbox_xyxy[i]) {
+      return false;
+    }
+  }
+  // track_mask
+  if (!fp_debug_msgs__msg__DebugMaskCrop__are_equal(
+      &(lhs->track_mask), &(rhs->track_mask)))
+  {
+    return false;
+  }
+  // track_object_id
+  if (!rosidl_runtime_c__String__are_equal(
+      &(lhs->track_object_id), &(rhs->track_object_id)))
+  {
+    return false;
+  }
+  // track_icp_fitness
+  if (lhs->track_icp_fitness != rhs->track_icp_fitness) {
+    return false;
+  }
+  // track_icp_rmse_mm
+  if (lhs->track_icp_rmse_mm != rhs->track_icp_rmse_mm) {
+    return false;
+  }
   return true;
 }
 
@@ -224,6 +279,28 @@ fp_debug_msgs__msg__DebugFrame__copy(
   {
     return false;
   }
+  // has_track_mask
+  output->has_track_mask = input->has_track_mask;
+  // track_mask_bbox_xyxy
+  for (size_t i = 0; i < 4; ++i) {
+    output->track_mask_bbox_xyxy[i] = input->track_mask_bbox_xyxy[i];
+  }
+  // track_mask
+  if (!fp_debug_msgs__msg__DebugMaskCrop__copy(
+      &(input->track_mask), &(output->track_mask)))
+  {
+    return false;
+  }
+  // track_object_id
+  if (!rosidl_runtime_c__String__copy(
+      &(input->track_object_id), &(output->track_object_id)))
+  {
+    return false;
+  }
+  // track_icp_fitness
+  output->track_icp_fitness = input->track_icp_fitness;
+  // track_icp_rmse_mm
+  output->track_icp_rmse_mm = input->track_icp_rmse_mm;
   return true;
 }
 

@@ -258,7 +258,7 @@ class FoundationPoseExternalVisualizer(Node):
         self.pub_sam = self.create_publisher(Image, self.args.sam_out_topic, FAST_QOS)
         self.pub_dino = self.create_publisher(Image, self.args.dino_out_topic, FAST_QOS)
         self.pub_pose = self.create_publisher(Image, self.args.pose_out_topic, FAST_QOS)
-
+        self.pub_track = self.create_publisher(Image, self.args.track_out_topic, FAST_QOS)
         self.timer = self.create_timer(self.args.timer_period_s, self._tick)
 
     def _on_rgb(self, msg: Image) -> None:
@@ -325,6 +325,60 @@ class FoundationPoseExternalVisualizer(Node):
 
         return out
 
+    def _make_track_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
+        """Create overlay showing Cutie tracking mask, axes, and ICP metrics."""
+        out = rgb.copy()
+        
+        if dbg.has_track_mask:
+            bbox = tuple(int(v) for v in dbg.track_mask_bbox_xyxy)
+            color = (0, 255, 128)  # Bright green for tracking
+            
+            # Draw the tracking mask
+            overlay_mask_crop_in_bbox(out, bbox, dbg.track_mask, color, alpha=0.35)
+            
+            # Draw bbox with tracking info
+            label = f"TRACK: {dbg.track_object_id}"
+            draw_bbox_label_inplace(out, bbox, label, color, font_scale=0.7)
+            
+            # Draw ICP metrics in top-left
+            metrics_lines = [
+                f"ICP fitness: {dbg.track_icp_fitness:.2f}",
+                f"ICP rmse: {dbg.track_icp_rmse_mm:.1f}mm",
+            ]
+            y = 32
+            for line in metrics_lines:
+                cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 90), 1, cv2.LINE_AA)
+                y += 28
+        else:
+            # No tracking active
+            cv2.putText(out, "MODE: INIT/SEARCH", (20, 32), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+        
+        # Draw pose axes and base coordinates from pose_items (same as pose overlay)
+        for i, item in enumerate(dbg.pose_items):
+            # Draw axes if we have camera intrinsics
+            if dbg.show_axes and self.K is not None:
+                T_cam = pose_msg_to_T(item.pose_camera)
+                draw_axes_from_pose_inplace(out, self.K, T_cam, axis_len_m=float(item.axis_len_m), thickness=2)
+            
+            # Draw base pose text
+            T_base = pose_msg_to_T(item.pose_base)
+            t = T_base[:3, 3]
+            
+            # Position text below ICP metrics
+            y_start = 100 + i * 80
+            lines = [
+                f"[{i}] {item.mode}: {item.object_id}",
+                f"  base: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]",
+            ]
+            for line in lines:
+                cv2.putText(out, line, (20, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(out, line, (20, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+                y_start += 24
+        
+        return out
+
     def _tick(self) -> None:
         if self.latest_frame is None or self.latest_debug is None:
             return
@@ -342,6 +396,8 @@ class FoundationPoseExternalVisualizer(Node):
         sam_overlay = self._make_sam_overlay(rgb, dbg)
         dino_overlay = self._make_dino_overlay(rgb, dbg)
         pose_overlay = self._make_pose_overlay(rgb, dbg)
+        track_overlay = self._make_track_overlay(rgb, dbg)
+
 
         if self.args.output_scale != 1.0:
             new_w = max(1, int(round(rgb.shape[1] * self.args.output_scale)))
@@ -350,11 +406,13 @@ class FoundationPoseExternalVisualizer(Node):
             sam_overlay = cv2.resize(sam_overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
             dino_overlay = cv2.resize(dino_overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
             pose_overlay = cv2.resize(pose_overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            track_overlay = cv2.resize(track_overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         self.pub_raw.publish(rgb_numpy_to_imgmsg(rgb, self.args.cam_id, stamp))
         self.pub_sam.publish(rgb_numpy_to_imgmsg(sam_overlay, self.args.cam_id, stamp))
         self.pub_dino.publish(rgb_numpy_to_imgmsg(dino_overlay, self.args.cam_id, stamp))
         self.pub_pose.publish(rgb_numpy_to_imgmsg(pose_overlay, self.args.cam_id, stamp))
+        self.pub_track.publish(rgb_numpy_to_imgmsg(track_overlay, self.args.cam_id, stamp))
 
 
 def parse_args() -> argparse.Namespace:
@@ -368,6 +426,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sam-out-topic", type=str, default="/perception/fp/sam_overlay/zed2i_2_external")
     p.add_argument("--dino-out-topic", type=str, default="/perception/fp/dino_overlay/zed2i_2_external")
     p.add_argument("--pose-out-topic", type=str, default="/perception/fp/pose_overlay/zed2i_2_external")
+    p.add_argument("--track-out-topic", type=str, default="/perception/fp/track_overlay/zed2i_2_external")
 
     p.add_argument("--timer-period-s", type=float, default=0.2)  # 5 Hz
     p.add_argument("--max-sync-dt-s", type=float, default=0.25)

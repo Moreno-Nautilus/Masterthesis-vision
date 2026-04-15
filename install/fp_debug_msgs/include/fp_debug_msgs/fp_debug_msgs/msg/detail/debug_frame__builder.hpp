@@ -21,16 +21,112 @@ namespace msg
 namespace builder
 {
 
+class Init_DebugFrame_track_icp_rmse_mm
+{
+public:
+  explicit Init_DebugFrame_track_icp_rmse_mm(::fp_debug_msgs::msg::DebugFrame & msg)
+  : msg_(msg)
+  {}
+  ::fp_debug_msgs::msg::DebugFrame track_icp_rmse_mm(::fp_debug_msgs::msg::DebugFrame::_track_icp_rmse_mm_type arg)
+  {
+    msg_.track_icp_rmse_mm = std::move(arg);
+    return std::move(msg_);
+  }
+
+private:
+  ::fp_debug_msgs::msg::DebugFrame msg_;
+};
+
+class Init_DebugFrame_track_icp_fitness
+{
+public:
+  explicit Init_DebugFrame_track_icp_fitness(::fp_debug_msgs::msg::DebugFrame & msg)
+  : msg_(msg)
+  {}
+  Init_DebugFrame_track_icp_rmse_mm track_icp_fitness(::fp_debug_msgs::msg::DebugFrame::_track_icp_fitness_type arg)
+  {
+    msg_.track_icp_fitness = std::move(arg);
+    return Init_DebugFrame_track_icp_rmse_mm(msg_);
+  }
+
+private:
+  ::fp_debug_msgs::msg::DebugFrame msg_;
+};
+
+class Init_DebugFrame_track_object_id
+{
+public:
+  explicit Init_DebugFrame_track_object_id(::fp_debug_msgs::msg::DebugFrame & msg)
+  : msg_(msg)
+  {}
+  Init_DebugFrame_track_icp_fitness track_object_id(::fp_debug_msgs::msg::DebugFrame::_track_object_id_type arg)
+  {
+    msg_.track_object_id = std::move(arg);
+    return Init_DebugFrame_track_icp_fitness(msg_);
+  }
+
+private:
+  ::fp_debug_msgs::msg::DebugFrame msg_;
+};
+
+class Init_DebugFrame_track_mask
+{
+public:
+  explicit Init_DebugFrame_track_mask(::fp_debug_msgs::msg::DebugFrame & msg)
+  : msg_(msg)
+  {}
+  Init_DebugFrame_track_object_id track_mask(::fp_debug_msgs::msg::DebugFrame::_track_mask_type arg)
+  {
+    msg_.track_mask = std::move(arg);
+    return Init_DebugFrame_track_object_id(msg_);
+  }
+
+private:
+  ::fp_debug_msgs::msg::DebugFrame msg_;
+};
+
+class Init_DebugFrame_track_mask_bbox_xyxy
+{
+public:
+  explicit Init_DebugFrame_track_mask_bbox_xyxy(::fp_debug_msgs::msg::DebugFrame & msg)
+  : msg_(msg)
+  {}
+  Init_DebugFrame_track_mask track_mask_bbox_xyxy(::fp_debug_msgs::msg::DebugFrame::_track_mask_bbox_xyxy_type arg)
+  {
+    msg_.track_mask_bbox_xyxy = std::move(arg);
+    return Init_DebugFrame_track_mask(msg_);
+  }
+
+private:
+  ::fp_debug_msgs::msg::DebugFrame msg_;
+};
+
+class Init_DebugFrame_has_track_mask
+{
+public:
+  explicit Init_DebugFrame_has_track_mask(::fp_debug_msgs::msg::DebugFrame & msg)
+  : msg_(msg)
+  {}
+  Init_DebugFrame_track_mask_bbox_xyxy has_track_mask(::fp_debug_msgs::msg::DebugFrame::_has_track_mask_type arg)
+  {
+    msg_.has_track_mask = std::move(arg);
+    return Init_DebugFrame_track_mask_bbox_xyxy(msg_);
+  }
+
+private:
+  ::fp_debug_msgs::msg::DebugFrame msg_;
+};
+
 class Init_DebugFrame_pose_items
 {
 public:
   explicit Init_DebugFrame_pose_items(::fp_debug_msgs::msg::DebugFrame & msg)
   : msg_(msg)
   {}
-  ::fp_debug_msgs::msg::DebugFrame pose_items(::fp_debug_msgs::msg::DebugFrame::_pose_items_type arg)
+  Init_DebugFrame_has_track_mask pose_items(::fp_debug_msgs::msg::DebugFrame::_pose_items_type arg)
   {
     msg_.pose_items = std::move(arg);
-    return std::move(msg_);
+    return Init_DebugFrame_has_track_mask(msg_);
   }
 
 private:

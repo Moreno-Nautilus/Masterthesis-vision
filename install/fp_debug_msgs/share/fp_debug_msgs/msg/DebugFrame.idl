@@ -4,6 +4,7 @@
 
 #include "builtin_interfaces/msg/Time.idl"
 #include "fp_debug_msgs/msg/DebugCandidate.idl"
+#include "fp_debug_msgs/msg/DebugMaskCrop.idl"
 #include "fp_debug_msgs/msg/DebugPoseItem.idl"
 
 module fp_debug_msgs {
@@ -33,6 +34,20 @@ module fp_debug_msgs {
       sequence<fp_debug_msgs::msg::DebugCandidate> dino_ranked_candidates;
 
       sequence<fp_debug_msgs::msg::DebugPoseItem> pose_items;
+
+      @verbatim (language="comment", text=
+        "Tracking mask from Cutie (when in track mode)")
+      boolean has_track_mask;
+
+      int32__4 track_mask_bbox_xyxy;
+
+      fp_debug_msgs::msg::DebugMaskCrop track_mask;
+
+      string track_object_id;
+
+      float track_icp_fitness;
+
+      float track_icp_rmse_mm;
     };
   };
 };

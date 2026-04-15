@@ -18,6 +18,7 @@
 // Member `stamp`
 #include "builtin_interfaces/msg/detail/time__rosidl_typesupport_introspection_c.h"
 // Member `cam_id`
+// Member `track_object_id`
 #include "rosidl_runtime_c/string_functions.h"
 // Member `roi_polygon_xy_flat`
 #include "rosidl_runtime_c/primitives_sequence_functions.h"
@@ -31,6 +32,10 @@
 #include "fp_debug_msgs/msg/debug_pose_item.h"
 // Member `pose_items`
 #include "fp_debug_msgs/msg/detail/debug_pose_item__rosidl_typesupport_introspection_c.h"
+// Member `track_mask`
+#include "fp_debug_msgs/msg/debug_mask_crop.h"
+// Member `track_mask`
+#include "fp_debug_msgs/msg/detail/debug_mask_crop__rosidl_typesupport_introspection_c.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -316,7 +321,52 @@ bool fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__resize_
   return fp_debug_msgs__msg__DebugPoseItem__Sequence__init(member, size);
 }
 
-static rosidl_typesupport_introspection_c__MessageMember fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_member_array[12] = {
+size_t fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__size_function__DebugFrame__track_mask_bbox_xyxy(
+  const void * untyped_member)
+{
+  (void)untyped_member;
+  return 4;
+}
+
+const void * fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__get_const_function__DebugFrame__track_mask_bbox_xyxy(
+  const void * untyped_member, size_t index)
+{
+  const int32_t * member =
+    (const int32_t *)(untyped_member);
+  return &member[index];
+}
+
+void * fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__get_function__DebugFrame__track_mask_bbox_xyxy(
+  void * untyped_member, size_t index)
+{
+  int32_t * member =
+    (int32_t *)(untyped_member);
+  return &member[index];
+}
+
+void fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__fetch_function__DebugFrame__track_mask_bbox_xyxy(
+  const void * untyped_member, size_t index, void * untyped_value)
+{
+  const int32_t * item =
+    ((const int32_t *)
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__get_const_function__DebugFrame__track_mask_bbox_xyxy(untyped_member, index));
+  int32_t * value =
+    (int32_t *)(untyped_value);
+  *value = *item;
+}
+
+void fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__assign_function__DebugFrame__track_mask_bbox_xyxy(
+  void * untyped_member, size_t index, const void * untyped_value)
+{
+  int32_t * item =
+    ((int32_t *)
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__get_function__DebugFrame__track_mask_bbox_xyxy(untyped_member, index));
+  const int32_t * value =
+    (const int32_t *)(untyped_value);
+  *item = *value;
+}
+
+static rosidl_typesupport_introspection_c__MessageMember fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_member_array[18] = {
   {
     "stamp",  // name
     rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE,  // type
@@ -520,13 +570,115 @@ static rosidl_typesupport_introspection_c__MessageMember fp_debug_msgs__msg__Deb
     fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__fetch_function__DebugFrame__pose_items,  // fetch(index, &value) function pointer
     fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__assign_function__DebugFrame__pose_items,  // assign(index, value) function pointer
     fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__resize_function__DebugFrame__pose_items  // resize(index) function pointer
+  },
+  {
+    "has_track_mask",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_BOOLEAN,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(fp_debug_msgs__msg__DebugFrame, has_track_mask),  // bytes offset in struct
+    NULL,  // default value
+    NULL,  // size() function pointer
+    NULL,  // get_const(index) function pointer
+    NULL,  // get(index) function pointer
+    NULL,  // fetch(index, &value) function pointer
+    NULL,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
+  },
+  {
+    "track_mask_bbox_xyxy",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_INT32,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message
+    true,  // is array
+    4,  // array size
+    false,  // is upper bound
+    offsetof(fp_debug_msgs__msg__DebugFrame, track_mask_bbox_xyxy),  // bytes offset in struct
+    NULL,  // default value
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__size_function__DebugFrame__track_mask_bbox_xyxy,  // size() function pointer
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__get_const_function__DebugFrame__track_mask_bbox_xyxy,  // get_const(index) function pointer
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__get_function__DebugFrame__track_mask_bbox_xyxy,  // get(index) function pointer
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__fetch_function__DebugFrame__track_mask_bbox_xyxy,  // fetch(index, &value) function pointer
+    fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__assign_function__DebugFrame__track_mask_bbox_xyxy,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
+  },
+  {
+    "track_mask",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message (initialized later)
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(fp_debug_msgs__msg__DebugFrame, track_mask),  // bytes offset in struct
+    NULL,  // default value
+    NULL,  // size() function pointer
+    NULL,  // get_const(index) function pointer
+    NULL,  // get(index) function pointer
+    NULL,  // fetch(index, &value) function pointer
+    NULL,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
+  },
+  {
+    "track_object_id",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_STRING,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(fp_debug_msgs__msg__DebugFrame, track_object_id),  // bytes offset in struct
+    NULL,  // default value
+    NULL,  // size() function pointer
+    NULL,  // get_const(index) function pointer
+    NULL,  // get(index) function pointer
+    NULL,  // fetch(index, &value) function pointer
+    NULL,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
+  },
+  {
+    "track_icp_fitness",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_FLOAT,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(fp_debug_msgs__msg__DebugFrame, track_icp_fitness),  // bytes offset in struct
+    NULL,  // default value
+    NULL,  // size() function pointer
+    NULL,  // get_const(index) function pointer
+    NULL,  // get(index) function pointer
+    NULL,  // fetch(index, &value) function pointer
+    NULL,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
+  },
+  {
+    "track_icp_rmse_mm",  // name
+    rosidl_typesupport_introspection_c__ROS_TYPE_FLOAT,  // type
+    0,  // upper bound of string
+    NULL,  // members of sub message
+    false,  // is array
+    0,  // array size
+    false,  // is upper bound
+    offsetof(fp_debug_msgs__msg__DebugFrame, track_icp_rmse_mm),  // bytes offset in struct
+    NULL,  // default value
+    NULL,  // size() function pointer
+    NULL,  // get_const(index) function pointer
+    NULL,  // get(index) function pointer
+    NULL,  // fetch(index, &value) function pointer
+    NULL,  // assign(index, value) function pointer
+    NULL  // resize(index) function pointer
   }
 };
 
 static const rosidl_typesupport_introspection_c__MessageMembers fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_members = {
   "fp_debug_msgs__msg",  // message namespace
   "DebugFrame",  // message name
-  12,  // number of fields
+  18,  // number of fields
   sizeof(fp_debug_msgs__msg__DebugFrame),
   fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_member_array,  // message members
   fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_init_function,  // function to initialize message memory (memory has to be allocated)
@@ -552,6 +704,8 @@ ROSIDL_TYPESUPPORT_INTERFACE__MESSAGE_SYMBOL_NAME(rosidl_typesupport_introspecti
     ROSIDL_TYPESUPPORT_INTERFACE__MESSAGE_SYMBOL_NAME(rosidl_typesupport_introspection_c, fp_debug_msgs, msg, DebugCandidate)();
   fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_member_array[11].members_ =
     ROSIDL_TYPESUPPORT_INTERFACE__MESSAGE_SYMBOL_NAME(rosidl_typesupport_introspection_c, fp_debug_msgs, msg, DebugPoseItem)();
+  fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_member_array[14].members_ =
+    ROSIDL_TYPESUPPORT_INTERFACE__MESSAGE_SYMBOL_NAME(rosidl_typesupport_introspection_c, fp_debug_msgs, msg, DebugMaskCrop)();
   if (!fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_type_support_handle.typesupport_identifier) {
     fp_debug_msgs__msg__DebugFrame__rosidl_typesupport_introspection_c__DebugFrame_message_type_support_handle.typesupport_identifier =
       rosidl_typesupport_introspection_c__identifier;

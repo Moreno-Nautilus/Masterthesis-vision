@@ -24,6 +24,8 @@
 #include "fp_debug_msgs/msg/detail/debug_candidate__struct.hpp"
 // Member 'pose_items'
 #include "fp_debug_msgs/msg/detail/debug_pose_item__struct.hpp"
+// Member 'track_mask'
+#include "fp_debug_msgs/msg/detail/debug_mask_crop__struct.hpp"
 
 #ifndef _WIN32
 # define DEPRECATED__fp_debug_msgs__msg__DebugFrame __attribute__((deprecated))
@@ -44,7 +46,8 @@ struct DebugFrame_
   using Type = DebugFrame_<ContainerAllocator>;
 
   explicit DebugFrame_(rosidl_runtime_cpp::MessageInitialization _init = rosidl_runtime_cpp::MessageInitialization::ALL)
-  : stamp(_init)
+  : stamp(_init),
+    track_mask(_init)
   {
     if (rosidl_runtime_cpp::MessageInitialization::ALL == _init ||
       rosidl_runtime_cpp::MessageInitialization::ZERO == _init)
@@ -56,13 +59,21 @@ struct DebugFrame_
       std::fill<typename std::array<int32_t, 4>::iterator, int32_t>(this->tiny_roi_xyxy.begin(), this->tiny_roi_xyxy.end(), 0l);
       this->update_sam = false;
       this->update_dino = false;
+      this->has_track_mask = false;
+      std::fill<typename std::array<int32_t, 4>::iterator, int32_t>(this->track_mask_bbox_xyxy.begin(), this->track_mask_bbox_xyxy.end(), 0l);
+      this->track_object_id = "";
+      this->track_icp_fitness = 0.0f;
+      this->track_icp_rmse_mm = 0.0f;
     }
   }
 
   explicit DebugFrame_(const ContainerAllocator & _alloc, rosidl_runtime_cpp::MessageInitialization _init = rosidl_runtime_cpp::MessageInitialization::ALL)
   : stamp(_alloc, _init),
     cam_id(_alloc),
-    tiny_roi_xyxy(_alloc)
+    tiny_roi_xyxy(_alloc),
+    track_mask_bbox_xyxy(_alloc),
+    track_mask(_alloc, _init),
+    track_object_id(_alloc)
   {
     if (rosidl_runtime_cpp::MessageInitialization::ALL == _init ||
       rosidl_runtime_cpp::MessageInitialization::ZERO == _init)
@@ -74,6 +85,11 @@ struct DebugFrame_
       std::fill<typename std::array<int32_t, 4>::iterator, int32_t>(this->tiny_roi_xyxy.begin(), this->tiny_roi_xyxy.end(), 0l);
       this->update_sam = false;
       this->update_dino = false;
+      this->has_track_mask = false;
+      std::fill<typename std::array<int32_t, 4>::iterator, int32_t>(this->track_mask_bbox_xyxy.begin(), this->track_mask_bbox_xyxy.end(), 0l);
+      this->track_object_id = "";
+      this->track_icp_fitness = 0.0f;
+      this->track_icp_rmse_mm = 0.0f;
     }
   }
 
@@ -114,6 +130,24 @@ struct DebugFrame_
   using _pose_items_type =
     std::vector<fp_debug_msgs::msg::DebugPoseItem_<ContainerAllocator>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<fp_debug_msgs::msg::DebugPoseItem_<ContainerAllocator>>>;
   _pose_items_type pose_items;
+  using _has_track_mask_type =
+    bool;
+  _has_track_mask_type has_track_mask;
+  using _track_mask_bbox_xyxy_type =
+    std::array<int32_t, 4>;
+  _track_mask_bbox_xyxy_type track_mask_bbox_xyxy;
+  using _track_mask_type =
+    fp_debug_msgs::msg::DebugMaskCrop_<ContainerAllocator>;
+  _track_mask_type track_mask;
+  using _track_object_id_type =
+    std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>>;
+  _track_object_id_type track_object_id;
+  using _track_icp_fitness_type =
+    float;
+  _track_icp_fitness_type track_icp_fitness;
+  using _track_icp_rmse_mm_type =
+    float;
+  _track_icp_rmse_mm_type track_icp_rmse_mm;
 
   // setters for named parameter idiom
   Type & set__stamp(
@@ -186,6 +220,42 @@ struct DebugFrame_
     const std::vector<fp_debug_msgs::msg::DebugPoseItem_<ContainerAllocator>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<fp_debug_msgs::msg::DebugPoseItem_<ContainerAllocator>>> & _arg)
   {
     this->pose_items = _arg;
+    return *this;
+  }
+  Type & set__has_track_mask(
+    const bool & _arg)
+  {
+    this->has_track_mask = _arg;
+    return *this;
+  }
+  Type & set__track_mask_bbox_xyxy(
+    const std::array<int32_t, 4> & _arg)
+  {
+    this->track_mask_bbox_xyxy = _arg;
+    return *this;
+  }
+  Type & set__track_mask(
+    const fp_debug_msgs::msg::DebugMaskCrop_<ContainerAllocator> & _arg)
+  {
+    this->track_mask = _arg;
+    return *this;
+  }
+  Type & set__track_object_id(
+    const std::basic_string<char, std::char_traits<char>, typename std::allocator_traits<ContainerAllocator>::template rebind_alloc<char>> & _arg)
+  {
+    this->track_object_id = _arg;
+    return *this;
+  }
+  Type & set__track_icp_fitness(
+    const float & _arg)
+  {
+    this->track_icp_fitness = _arg;
+    return *this;
+  }
+  Type & set__track_icp_rmse_mm(
+    const float & _arg)
+  {
+    this->track_icp_rmse_mm = _arg;
     return *this;
   }
 
@@ -265,6 +335,24 @@ struct DebugFrame_
       return false;
     }
     if (this->pose_items != other.pose_items) {
+      return false;
+    }
+    if (this->has_track_mask != other.has_track_mask) {
+      return false;
+    }
+    if (this->track_mask_bbox_xyxy != other.track_mask_bbox_xyxy) {
+      return false;
+    }
+    if (this->track_mask != other.track_mask) {
+      return false;
+    }
+    if (this->track_object_id != other.track_object_id) {
+      return false;
+    }
+    if (this->track_icp_fitness != other.track_icp_fitness) {
+      return false;
+    }
+    if (this->track_icp_rmse_mm != other.track_icp_rmse_mm) {
       return false;
     }
     return true;

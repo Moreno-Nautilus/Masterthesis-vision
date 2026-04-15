@@ -22,6 +22,8 @@
 #include "fp_debug_msgs/msg/detail/debug_candidate__traits.hpp"
 // Member 'pose_items'
 #include "fp_debug_msgs/msg/detail/debug_pose_item__traits.hpp"
+// Member 'track_mask'
+#include "fp_debug_msgs/msg/detail/debug_mask_crop__traits.hpp"
 
 namespace fp_debug_msgs
 {
@@ -170,6 +172,59 @@ inline void to_flow_style_yaml(
       }
       out << "]";
     }
+    out << ", ";
+  }
+
+  // member: has_track_mask
+  {
+    out << "has_track_mask: ";
+    rosidl_generator_traits::value_to_yaml(msg.has_track_mask, out);
+    out << ", ";
+  }
+
+  // member: track_mask_bbox_xyxy
+  {
+    if (msg.track_mask_bbox_xyxy.size() == 0) {
+      out << "track_mask_bbox_xyxy: []";
+    } else {
+      out << "track_mask_bbox_xyxy: [";
+      size_t pending_items = msg.track_mask_bbox_xyxy.size();
+      for (auto item : msg.track_mask_bbox_xyxy) {
+        rosidl_generator_traits::value_to_yaml(item, out);
+        if (--pending_items > 0) {
+          out << ", ";
+        }
+      }
+      out << "]";
+    }
+    out << ", ";
+  }
+
+  // member: track_mask
+  {
+    out << "track_mask: ";
+    to_flow_style_yaml(msg.track_mask, out);
+    out << ", ";
+  }
+
+  // member: track_object_id
+  {
+    out << "track_object_id: ";
+    rosidl_generator_traits::value_to_yaml(msg.track_object_id, out);
+    out << ", ";
+  }
+
+  // member: track_icp_fitness
+  {
+    out << "track_icp_fitness: ";
+    rosidl_generator_traits::value_to_yaml(msg.track_icp_fitness, out);
+    out << ", ";
+  }
+
+  // member: track_icp_rmse_mm
+  {
+    out << "track_icp_rmse_mm: ";
+    rosidl_generator_traits::value_to_yaml(msg.track_icp_rmse_mm, out);
   }
   out << "}";
 }  // NOLINT(readability/fn_size)
@@ -342,6 +397,75 @@ inline void to_block_style_yaml(
         to_block_style_yaml(item, out, indentation + 2);
       }
     }
+  }
+
+  // member: has_track_mask
+  {
+    if (indentation > 0) {
+      out << std::string(indentation, ' ');
+    }
+    out << "has_track_mask: ";
+    rosidl_generator_traits::value_to_yaml(msg.has_track_mask, out);
+    out << "\n";
+  }
+
+  // member: track_mask_bbox_xyxy
+  {
+    if (indentation > 0) {
+      out << std::string(indentation, ' ');
+    }
+    if (msg.track_mask_bbox_xyxy.size() == 0) {
+      out << "track_mask_bbox_xyxy: []\n";
+    } else {
+      out << "track_mask_bbox_xyxy:\n";
+      for (auto item : msg.track_mask_bbox_xyxy) {
+        if (indentation > 0) {
+          out << std::string(indentation, ' ');
+        }
+        out << "- ";
+        rosidl_generator_traits::value_to_yaml(item, out);
+        out << "\n";
+      }
+    }
+  }
+
+  // member: track_mask
+  {
+    if (indentation > 0) {
+      out << std::string(indentation, ' ');
+    }
+    out << "track_mask:\n";
+    to_block_style_yaml(msg.track_mask, out, indentation + 2);
+  }
+
+  // member: track_object_id
+  {
+    if (indentation > 0) {
+      out << std::string(indentation, ' ');
+    }
+    out << "track_object_id: ";
+    rosidl_generator_traits::value_to_yaml(msg.track_object_id, out);
+    out << "\n";
+  }
+
+  // member: track_icp_fitness
+  {
+    if (indentation > 0) {
+      out << std::string(indentation, ' ');
+    }
+    out << "track_icp_fitness: ";
+    rosidl_generator_traits::value_to_yaml(msg.track_icp_fitness, out);
+    out << "\n";
+  }
+
+  // member: track_icp_rmse_mm
+  {
+    if (indentation > 0) {
+      out << std::string(indentation, ' ');
+    }
+    out << "track_icp_rmse_mm: ";
+    rosidl_generator_traits::value_to_yaml(msg.track_icp_rmse_mm, out);
+    out << "\n";
   }
 }  // NOLINT(readability/fn_size)
 
