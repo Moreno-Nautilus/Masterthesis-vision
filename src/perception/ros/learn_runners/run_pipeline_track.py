@@ -59,13 +59,13 @@ LATCHED_QOS = QoSProfile(
 )
 
 CAMERAS = [
-    # CameraTopics(
-    #     cam_id="zed2i_1",
-    #     depth_topic="/zed2i_1/zed_node/depth/depth_registered",
-    #     info_topic="/zed2i_1/zed_node/depth/depth_registered/camera_info",
-    #     rgb_topic="/zed2i_1/zed_node/rgb/color/rect/image",
-    #     rgb_info_topic="/zed2i_1/zed_node/rgb/color/rect/image/camera_info",
-    # ),
+    CameraTopics(
+        cam_id="zed2i_1",
+        depth_topic="/zed2i_1/zed_node/depth/depth_registered",
+        info_topic="/zed2i_1/zed_node/depth/depth_registered/camera_info",
+        rgb_topic="/zed2i_1/zed_node/rgb/color/rect/image",
+        rgb_info_topic="/zed2i_1/zed_node/rgb/color/rect/image/camera_info",
+    ),
     CameraTopics(
         cam_id="zed2i_2",
         depth_topic="/zed2i_2/zed_node/depth/depth_registered",
@@ -786,6 +786,16 @@ class FoundationPoseTrackerNode(Node):
                     mesh_scale=args.mesh_scale,
                 )
             )
+        # self.fp_tracker = FoundationPoseWrapper(
+        #     FoundationPoseConfig(
+        #         repo_root=args.fp_repo_root,
+        #         weights_dir=args.fp_weights_dir,
+        #         debug_dir=str(Path(args.output_root).resolve() / "fp_debug_shared"),
+        #         debug=args.fp_debug,
+        #         est_refine_iter=args.est_refine_iter,
+        #         mesh_scale=args.mesh_scale,
+        #     )
+        # )
         
         # Pre-cache meshes for faster first init
         self.get_logger().info("Pre-caching meshes for FoundationPose...")
@@ -1157,11 +1167,13 @@ class FoundationPoseTrackerNode(Node):
 
     def _to_base_pose(self, cam_id: str, T_object_camera: np.ndarray) -> np.ndarray:
         T_object_camera = np.asarray(T_object_camera, dtype=np.float32).reshape(4, 4)
-
+        print(f"[DEBUG] {cam_id} T_cam_object:\n{T_object_camera}")
         if cam_id not in self.T_base_cam_map:
             raise KeyError(f"No base extrinsic for cam_id={cam_id}")
 
         T_base_cam = self.T_base_cam_map[cam_id]
+        
+
         if hasattr(T_base_cam, "as_matrix"):
             T_base_cam = T_base_cam.as_matrix()
         elif hasattr(T_base_cam, "matrix"):
@@ -1169,7 +1181,12 @@ class FoundationPoseTrackerNode(Node):
         else:
             T_base_cam = np.asarray(T_base_cam, dtype=np.float32).reshape(4, 4)
 
-        return T_base_cam @ T_object_camera
+        print(f"[DEBUG] {cam_id} T_base_cam:\n{T_base_cam}")
+        result = T_base_cam @ T_object_camera
+        print(f"[DEBUG] {cam_id} T_base_object:\n{result}")
+            
+        return result
+
 
     def _generate_tiny_object_masks_cam2(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
         if "zed2i_2" not in self.sam_tiny_by_cam:
@@ -1526,7 +1543,7 @@ class FoundationPoseTrackerNode(Node):
             return False, f"flipped_orientation trace={trace:.3f}"
 
         t_mag = np.linalg.norm(t_cam)
-        if t_mag < 0.4 or t_mag > 0.9:
+        if t_mag < 0.4 or t_mag > 1.5:
             return False, f"bad_distance mag={t_mag:.3f}"
 
         try:
@@ -1711,6 +1728,11 @@ class FoundationPoseTrackerNode(Node):
                 mesh_path = self._resolve_mesh_path(sel.object_id)
             except FileNotFoundError:
                 continue
+
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
 
             try:
                 t_fp = time.time()
@@ -2428,32 +2450,91 @@ class FoundationPoseTrackerNode(Node):
                 f"selected={len(selected)} initialized={len(new_states)}"
             )
 
+    # def _tick(self) -> None:
+    #     if self.busy:
+    #         return
+
+    #     views = self.grabber.get_latest_views()
+    #     if views is None:
+    #         print("[TICK] No views yet...")  
+
+    #         return
+
+    #     signature = self._views_signature(views)
+    #     if signature == self.last_signature:
+    #         return
+
+    #     print(f"[TICK] New frame at {time.time():.3f}")
+    #     self.last_signature = signature
+
+    #     self.busy = True
+    #     try:
+    #         self.frame_counter += 1
+    #         for view in views:
+    #             try:
+    #                 if torch.cuda.is_available():
+    #                     torch.cuda.empty_cache()
+    #                     torch.cuda.synchronize()
+    #                 self._process_single_view(view)
+    #                 if torch.cuda.is_available():
+    #                     torch.cuda.empty_cache()
+    #             except Exception as e:
+    #                 self.get_logger().warn(f"[{view.cam_id}] processing failed: {e}")
+    #                 self.track_states[view.cam_id] = []
+    #     finally:
+    #         self.busy = False
+
     def _tick(self) -> None:
         if self.busy:
             return
 
         views = self.grabber.get_latest_views()
         if views is None:
-            print("[TICK] No views yet...")  
-
+            print("[TICK] No views yet...")
             return
-
-        signature = self._views_signature(views)
-        if signature == self.last_signature:
-            return
-
-        print(f"[TICK] New frame at {time.time():.3f}")
-        self.last_signature = signature
 
         self.busy = True
         try:
             self.frame_counter += 1
+            
+            # Separate cameras into tracking vs needing-init
+            tracking_views = []
+            init_views = []
+            
             for view in views:
-                try:
-                    self._process_single_view(view)
-                except Exception as e:
-                    self.get_logger().warn(f"[{view.cam_id}] processing failed: {e}")
-                    self.track_states[view.cam_id] = []
+                cam_id = view.cam_id
+                states = self.track_states.get(cam_id, [])
+                if states and all(s.mode in ("track", "track/rt", "degraded") for s in states):
+                    tracking_views.append(view)
+                else:
+                    init_views.append(view)
+            
+            # Always process tracking cameras (fast, ~100ms)
+            for view in tracking_views:
+                self._process_single_view(view)
+            
+            # Only init ONE camera per tick (prevents OOM)
+            # Only init ONE camera per tick to prevent OOM (but in init_only mode, do both)
+            if init_views:
+                torch.cuda.empty_cache()
+                if self.args.run_mode == "init_only":
+                    # In init_only mode, process all cameras for testing
+                    for view in init_views:
+                        try:
+                            self._process_single_view(view)
+                        except Exception as e:
+                            self.get_logger().warn(f"[{view.cam_id}] init failed: {e}")
+                            self.track_states[view.cam_id] = []
+                else:
+                    # In track mode, only init one camera per tick
+                    view = init_views[0]
+                    print(f"[TICK] Running INIT for {view.cam_id}")
+                    try:
+                        self._process_single_view(view)
+                    except Exception as e:
+                        self.get_logger().warn(f"[{view.cam_id}] init failed: {e}")
+                        self.track_states[view.cam_id] = []
+                        
         finally:
             self.busy = False
 
@@ -2514,7 +2595,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
 
     p.add_argument("--reference-dir", default="Data/ZED_screens")
-    p.add_argument("--cad-dir", default="Data/CAD_Models")
+    p.add_argument("--cad-dir", default="Data/CAD_Models_centered")
     p.add_argument("--output-root", default="outputs/foundationpose")
 
     p.add_argument("--dino-model-name", default="dinov2_vitb14")
@@ -2534,10 +2615,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sam-model-cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
     p.add_argument("--sam-max-image-side", type=int, default=1536)
 
-    p.add_argument("--cam1-sam-min-mask-area", type=int, default=150)
-    p.add_argument("--cam1-sam-min-bbox-side-px", type=int, default=10)
-    p.add_argument("--cam1-sam-max-mask-area-ratio", type=float, default=0.007)
-    p.add_argument("--cam1-sam-max-bbox-area-ratio", type=float, default=0.007)
+    p.add_argument("--cam1-sam-min-mask-area", type=int, default=20)
+    p.add_argument("--cam1-sam-min-bbox-side-px", type=int, default=3)
+    p.add_argument("--cam1-sam-max-mask-area-ratio", type=float, default=0.06)
+    p.add_argument("--cam1-sam-max-bbox-area-ratio", type=float, default=0.06)
     p.add_argument("--cam1-sam-border-px", type=int, default=6)
     p.add_argument("--cam1-sam-max-border-fraction", type=float, default=0.00)
 
