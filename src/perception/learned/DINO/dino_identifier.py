@@ -46,7 +46,7 @@ class DINOIdentifier:
         )
 
         self.model = self._build_model()
-        self.model.eval()
+        # self.model.eval()
 
         self.reference_bank: list[ReferenceEmbedding] = []
         self.reference_matrix: np.ndarray | None = None
@@ -89,7 +89,6 @@ class DINOIdentifier:
         return rgb[y0:y0 + s, x0:x0 + s]
 
     def _preprocess(self, rgb: np.ndarray) -> torch.Tensor:
-        rgb = self._ensure_rgb(rgb)
         rgb = self._center_crop_square(rgb)
         rgb = cv2.resize(rgb, (self.cfg.input_size, self.cfg.input_size), interpolation=cv2.INTER_AREA)
 

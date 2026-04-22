@@ -1,3 +1,13 @@
+"""
+Fixed external visualizer for FoundationPose.
+
+Changes from original:
+1. _make_track_overlay: fixed indentation bug (try was outside if guard)
+2. _make_track_overlay: catch ALL exceptions (not just LinAlgError)
+3. _make_track_overlay: render error text ON the image so you see it in Foxglove
+4. _make_track_overlay: always draw pose text even if axes fail
+5. Added debug prints so you can see in terminal what's happening
+"""
 from __future__ import annotations
 
 import argparse
@@ -39,19 +49,15 @@ def imgmsg_to_rgb_numpy(msg: Image) -> np.ndarray:
     if msg.encoding == "rgb8":
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
         return arr.copy()
-
     if msg.encoding == "bgr8":
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
         return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-
     if msg.encoding == "rgba8":
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 4)
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
-
     if msg.encoding == "bgra8":
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 4)
         return cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
-
     raise ValueError(f"Unsupported image encoding: {msg.encoding}")
 
 
@@ -90,13 +96,7 @@ def project_points(K: np.ndarray, pts_cam: np.ndarray) -> tuple[np.ndarray, np.n
     if np.any(valid):
         x = pts_cam[valid, 0] / z[valid]
         y = pts_cam[valid, 1] / z[valid]
-        uv_valid = np.stack(
-            [
-                K[0, 0] * x + K[0, 2],
-                K[1, 1] * y + K[1, 2],
-            ],
-            axis=1,
-        )
+        uv_valid = np.stack([K[0, 0] * x + K[0, 2], K[1, 1] * y + K[1, 2]], axis=1)
         uv[valid] = uv_valid
     return uv, valid
 
@@ -110,16 +110,8 @@ def draw_bbox_label_inplace(
 ) -> None:
     x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
     cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
-    cv2.putText(
-        image,
-        text,
-        (x0, max(20, y0 - 6)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
+    cv2.putText(image, text, (x0, max(20, y0 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 2, cv2.LINE_AA)
 
 
 def draw_pose_text_inplace(
@@ -154,16 +146,8 @@ def draw_roi_polygon_inplace(
         return
     polygon = np.array(polygon_flat, dtype=np.int32).reshape(-1, 2)
     cv2.polylines(image, [polygon], isClosed=True, color=color, thickness=thickness)
-    cv2.putText(
-        image,
-        label,
-        (int(polygon[0, 0]) + 8, max(20, int(polygon[0, 1]) - 8)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
+    cv2.putText(image, label, (int(polygon[0, 0]) + 8, max(20, int(polygon[0, 1]) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
 
 def draw_axes_from_pose_inplace(
@@ -174,12 +158,7 @@ def draw_axes_from_pose_inplace(
     thickness: int = 2,
 ) -> None:
     pts_obj = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [axis_len_m, 0.0, 0.0],
-            [0.0, axis_len_m, 0.0],
-            [0.0, 0.0, axis_len_m],
-        ],
+        [[0, 0, 0], [axis_len_m, 0, 0], [0, axis_len_m, 0], [0, 0, axis_len_m]],
         dtype=np.float32,
     )
     pts_cam = (T_camera_object[:3, :3] @ pts_obj.T).T + T_camera_object[:3, 3]
@@ -208,17 +187,14 @@ def overlay_mask_crop_in_bbox(
 ) -> None:
     if mask_msg.width == 0 or mask_msg.height == 0 or len(mask_msg.data) == 0:
         return
-
     x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
     if x1 <= x0 or y1 <= y0:
         return
-
     crop = np.array(mask_msg.data, dtype=np.uint8).reshape(mask_msg.height, mask_msg.width)
     target_w = x1 - x0
     target_h = y1 - y0
     if target_w <= 0 or target_h <= 0:
         return
-
     mask = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_NEAREST).astype(bool)
     roi = image[y0:y1, x0:x1]
     color_arr = np.array(color, dtype=np.float32)
@@ -261,12 +237,19 @@ class FoundationPoseExternalVisualizer(Node):
         self.pub_track = self.create_publisher(Image, self.args.track_out_topic, FAST_QOS)
         self.timer = self.create_timer(self.args.timer_period_s, self._tick)
 
+        self.get_logger().info(
+            f"Visualizer started | cam_id={args.cam_id} "
+            f"rgb={args.rgb_topic} info={args.camera_info_topic} debug={args.debug_topic}"
+        )
+
     def _on_rgb(self, msg: Image) -> None:
         rgb = imgmsg_to_rgb_numpy(msg)
         stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
         self.latest_frame = FrameData(stamp_ns=stamp_ns, rgb=rgb)
 
     def _on_camera_info(self, msg: CameraInfo) -> None:
+        if self.K is None:
+            self.get_logger().info(f"Got camera_info K: fx={msg.k[0]:.1f} fy={msg.k[4]:.1f}")
         self.K = np.asarray(msg.k, dtype=np.float32).reshape(3, 3)
 
     def _on_debug(self, msg: DebugFrame) -> None:
@@ -292,7 +275,6 @@ class FoundationPoseExternalVisualizer(Node):
             if cand.has_mask:
                 overlay_mask_crop_in_bbox(out, bbox, cand.mask, color, alpha=0.22)
             draw_bbox_label_inplace(out, bbox, f"{i}: sam={cand.score:.2f}", color, font_scale=0.5)
-
         return out
 
     def _make_dino_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
@@ -320,63 +302,92 @@ class FoundationPoseExternalVisualizer(Node):
             draw_pose_text_inplace(out, item.object_id, item.score, T_base, item.mode, i)
 
             if dbg.show_axes and self.K is not None:
-                T_cam = pose_msg_to_T(item.pose_camera)
-                draw_axes_from_pose_inplace(out, self.K, T_cam, axis_len_m=float(item.axis_len_m), thickness=2)
-
+                T_obj_cam = pose_msg_to_T(item.pose_camera)
+                try:
+                    T_cam_obj = np.linalg.inv(T_obj_cam.astype(np.float64)).astype(np.float32)
+                    draw_axes_from_pose_inplace(out, self.K, T_cam_obj, axis_len_m=float(item.axis_len_m), thickness=2)
+                except np.linalg.LinAlgError:
+                    pass
         return out
 
     def _make_track_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
-        """Create overlay showing Cutie tracking mask, axes, and ICP metrics."""
-        out = rgb.copy()
+        """
+        Create overlay showing Cutie tracking mask, axes, and ICP metrics.
         
+        FIXES vs original:
+        - try/except is INSIDE the if-guard (was outside → NameError)
+        - Catches ALL exceptions, not just LinAlgError
+        - Renders errors ON the image so you see them in Foxglove
+        - Always draws pose text even if axes fail
+        """
+        out = rgb.copy()
+
+        # ── Tracking mask overlay ──
         if dbg.has_track_mask:
             bbox = tuple(int(v) for v in dbg.track_mask_bbox_xyxy)
-            color = (0, 255, 128)  # Bright green for tracking
-            
-            # Draw the tracking mask
+            color = (0, 255, 128)
             overlay_mask_crop_in_bbox(out, bbox, dbg.track_mask, color, alpha=0.35)
-            
-            # Draw bbox with tracking info
             label = f"TRACK: {dbg.track_object_id}"
             draw_bbox_label_inplace(out, bbox, label, color, font_scale=0.7)
-            
-            # Draw ICP metrics in top-left
+
             metrics_lines = [
                 f"ICP fitness: {dbg.track_icp_fitness:.2f}",
                 f"ICP rmse: {dbg.track_icp_rmse_mm:.1f}mm",
             ]
             y = 32
             for line in metrics_lines:
-                cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 90), 1, cv2.LINE_AA)
+                cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 180, 90), 1, cv2.LINE_AA)
                 y += 28
         else:
-            # No tracking active
-            cv2.putText(out, "MODE: INIT/SEARCH", (20, 32), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
-        
-        # Draw pose axes and base coordinates from pose_items (same as pose overlay)
+            cv2.putText(out, "MODE: INIT/SEARCH", (20, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+
+        # ── DEBUG: Show diagnostic info on image ──
+        n_items = len(dbg.pose_items) if dbg.pose_items else 0
+        has_k = self.K is not None
+        diag = f"pose_items={n_items} K={'YES' if has_k else 'NO'} axes={dbg.show_axes}"
+        cv2.putText(out, diag, (20, out.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # ── Pose axes + text for each tracked object ──
         for i, item in enumerate(dbg.pose_items):
-            # Draw axes if we have camera intrinsics
-            if dbg.show_axes and self.K is not None:
-                T_cam = pose_msg_to_T(item.pose_camera)
-                draw_axes_from_pose_inplace(out, self.K, T_cam, axis_len_m=float(item.axis_len_m), thickness=2)
-            
-            # Draw base pose text
+            # ALWAYS draw base-pose text regardless of axes success
             T_base = pose_msg_to_T(item.pose_base)
             t = T_base[:3, 3]
-            
-            # Position text below ICP metrics
             y_start = 100 + i * 80
-            lines = [
+            text_lines = [
                 f"[{i}] {item.mode}: {item.object_id}",
                 f"  base: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]",
             ]
-            for line in lines:
-                cv2.putText(out, line, (20, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(out, line, (20, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+            for line in text_lines:
+                cv2.putText(out, line, (20, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(out, line, (20, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 0, 0), 1, cv2.LINE_AA)
                 y_start += 24
-        
+
+            # Draw axes — fully guarded, catches ALL exceptions
+            if self.K is not None:
+                try:
+                    T_obj_cam = pose_msg_to_T(item.pose_camera)
+                    T_cam_obj = np.linalg.inv(
+                        T_obj_cam.astype(np.float64)
+                    ).astype(np.float32)
+                    draw_axes_from_pose_inplace(
+                        out, self.K, T_cam_obj,
+                        axis_len_m=float(item.axis_len_m),
+                        thickness=2,
+                    )
+                except Exception as e:
+                    # Render error ON the image so we can see it in Foxglove
+                    err_text = f"AXES ERR [{i}]: {type(e).__name__}: {e}"
+                    cv2.putText(out, err_text, (20, y_start),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+                    print(f"[TRACK_VIZ] {err_text}")
+
         return out
 
     def _tick(self) -> None:
@@ -393,11 +404,35 @@ class FoundationPoseExternalVisualizer(Node):
         rgb = frame.rgb
         stamp = self.get_clock().now().to_msg()
 
-        sam_overlay = self._make_sam_overlay(rgb, dbg)
-        dino_overlay = self._make_dino_overlay(rgb, dbg)
-        pose_overlay = self._make_pose_overlay(rgb, dbg)
-        track_overlay = self._make_track_overlay(rgb, dbg)
+        # Wrap each overlay in try/except so one failure doesn't kill others
+        try:
+            sam_overlay = self._make_sam_overlay(rgb, dbg)
+        except Exception as e:
+            print(f"[VIZ] sam overlay failed: {e}")
+            sam_overlay = rgb.copy()
 
+        try:
+            dino_overlay = self._make_dino_overlay(rgb, dbg)
+        except Exception as e:
+            print(f"[VIZ] dino overlay failed: {e}")
+            dino_overlay = rgb.copy()
+
+        try:
+            pose_overlay = self._make_pose_overlay(rgb, dbg)
+        except Exception as e:
+            print(f"[VIZ] pose overlay failed: {e}")
+            pose_overlay = rgb.copy()
+
+        try:
+            track_overlay = self._make_track_overlay(rgb, dbg)
+        except Exception as e:
+            print(f"[VIZ] track overlay FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            # Render error on a copy of rgb so user sees something
+            track_overlay = rgb.copy()
+            cv2.putText(track_overlay, f"TRACK OVERLAY CRASHED: {e}",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         if self.args.output_scale != 1.0:
             new_w = max(1, int(round(rgb.shape[1] * self.args.output_scale)))
@@ -428,7 +463,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pose-out-topic", type=str, default="/perception/fp/pose_overlay/zed2i_2_external")
     p.add_argument("--track-out-topic", type=str, default="/perception/fp/track_overlay/zed2i_2_external")
 
-    p.add_argument("--timer-period-s", type=float, default=0.2)  # 5 Hz
+    p.add_argument("--timer-period-s", type=float, default=0.2)
     p.add_argument("--max-sync-dt-s", type=float, default=0.25)
     p.add_argument("--output-scale", type=float, default=0.5)
     return p.parse_args()
