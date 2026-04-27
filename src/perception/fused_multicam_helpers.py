@@ -5,19 +5,15 @@ Helper functions for multi-camera fused pose estimation.
 Used by both init (dual-FP + ICP refinement + weighted average)
 and tracking (Cutie per-cam + fused ICP).
 
-Place this file alongside your runner, e.g.:
-  src/perception/fused_multicam_helpers.py
-
-Then import in your runner:
-  from src.perception.fused_multicam_helpers import (
-      lift_masked_depth_to_base,
-      mesh_to_pcd_cached,
-      run_icp_in_base_frame,
-      weighted_average_poses,
-  )
+Changes from original:
+  - lift_masked_depth_to_base: added depth_bias_m param for per-camera depth correction
+  - merge_point_clouds_weighted: new function for distance-weighted cloud merging
+  - MedianPoseBuffer: new class for temporal outlier filtering at zero compute cost
+  - apply_x_bias_correction: utility for systematic x-axis correction
 """
 from __future__ import annotations
 
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -60,10 +56,16 @@ def lift_masked_depth_to_base(
     z_min: float = 0.05,
     z_max: float = 3.0,
     voxel_size: float = 0.002,
+    depth_bias_m: float = 0.0,
 ) -> Optional[o3d.geometry.PointCloud]:
     """
     Unproject masked depth pixels into 3D, transform to base frame.
     Returns an Open3D PointCloud (voxel-downsampled) or None if too few points.
+
+    Args:
+        depth_bias_m: per-camera depth offset correction (added to raw depth).
+                      Positive = sensor reads too short, negative = too long.
+                      Calibrate by comparing known-distance measurements.
     """
     mask_bool = np.asarray(mask).astype(bool)
     if mask_bool.sum() < 10:
@@ -71,6 +73,10 @@ def lift_masked_depth_to_base(
 
     ys, xs = np.where(mask_bool)
     zs = depth[ys, xs].astype(np.float64)
+
+    # Apply per-camera depth bias correction
+    if abs(depth_bias_m) > 1e-6:
+        zs = zs + depth_bias_m
 
     valid = np.isfinite(zs) & (zs > z_min) & (zs < z_max)
     if valid.sum() < 10:
@@ -107,7 +113,7 @@ def merge_point_clouds(
     clouds: list[o3d.geometry.PointCloud],
     voxel_size: float = 0.002,
 ) -> Optional[o3d.geometry.PointCloud]:
-    """Merge multiple point clouds and voxel-downsample."""
+    """Merge multiple point clouds and voxel-downsample (unweighted, original behavior)."""
     if not clouds:
         return None
     merged = o3d.geometry.PointCloud()
@@ -116,6 +122,83 @@ def merge_point_clouds(
     if voxel_size > 0 and len(merged.points) > 100:
         merged = merged.voxel_down_sample(voxel_size)
     return merged
+
+
+def merge_point_clouds_weighted(
+    clouds: list[o3d.geometry.PointCloud],
+    cam_positions_base: list[np.ndarray],
+    voxel_size: float = 0.002,
+    distance_exponent: float = 2.0,
+) -> Optional[o3d.geometry.PointCloud]:
+    """
+    Merge point clouds with distance-based weighting.
+
+    Points from closer cameras are weighted higher because:
+    1. Depth sensors are more accurate at shorter range
+    2. Calibration errors scale with distance from origin
+
+    Instead of naive concatenation + voxel downsample (which averages equally),
+    this creates a weighted voxel grid where closer-camera points dominate.
+
+    Args:
+        clouds: list of per-camera point clouds in base frame
+        cam_positions_base: list of camera origin positions in base frame
+        voxel_size: voxel downsample size
+        distance_exponent: higher = more aggressive close-camera preference
+    """
+    if not clouds:
+        return None
+    if len(clouds) == 1:
+        return clouds[0]
+
+    all_points = []
+    all_weights = []
+
+    for pcd, cam_pos in zip(clouds, cam_positions_base):
+        pts = np.asarray(pcd.points)
+        if len(pts) == 0:
+            continue
+
+        cam_pos = np.asarray(cam_pos, dtype=np.float64).reshape(3)
+        dists = np.linalg.norm(pts - cam_pos, axis=1)
+        weights = 1.0 / (dists ** distance_exponent + 1e-6)
+
+        all_points.append(pts)
+        all_weights.append(weights)
+
+    if not all_points:
+        return None
+
+    all_points_arr = np.concatenate(all_points, axis=0)
+    all_weights_arr = np.concatenate(all_weights, axis=0)
+
+    if len(all_points_arr) < 10:
+        return None
+
+    if voxel_size > 0:
+        voxel_indices = np.floor(all_points_arr / voxel_size).astype(np.int64)
+
+        voxel_dict: dict[tuple, tuple[np.ndarray, float]] = {}
+        for i in range(len(all_points_arr)):
+            key = tuple(voxel_indices[i])
+            pt = all_points_arr[i]
+            w = all_weights_arr[i]
+            if key in voxel_dict:
+                accum_pt, accum_w = voxel_dict[key]
+                voxel_dict[key] = (accum_pt + pt * w, accum_w + w)
+            else:
+                voxel_dict[key] = (pt * w, w)
+
+        result_pts = np.array([
+            accum_pt / accum_w
+            for accum_pt, accum_w in voxel_dict.values()
+        ], dtype=np.float64)
+    else:
+        result_pts = all_points_arr
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(result_pts)
+    return pcd
 
 
 # ─── ICP in base frame ──────────────────────────────────────────────────
@@ -173,6 +256,71 @@ def chamfer_distance_one_way(
 
     dists = transformed_pcd.compute_point_cloud_distance(scene_pcd)
     return float(np.mean(dists))
+
+
+# ─── Median Pose Buffer (temporal outlier filter, zero compute) ──────────
+
+class MedianPoseBuffer:
+    """
+    Holds the last N accepted poses and outputs the median.
+
+    This provides temporal smoothing that is robust to single-frame outliers
+    without adding any compute cost. The median is computed component-wise
+    on the translation, and the rotation closest to the median translation
+    is used (to avoid quaternion averaging complexities).
+    """
+
+    def __init__(self, window_size: int = 3):
+        self.window_size = window_size
+        self._buffer: deque[np.ndarray] = deque(maxlen=window_size)
+
+    def push(self, T_base: np.ndarray) -> None:
+        """Add a new accepted pose to the buffer."""
+        self._buffer.append(np.asarray(T_base, dtype=np.float32).reshape(4, 4).copy())
+
+    def get_median(self) -> Optional[np.ndarray]:
+        """Return the median pose from the buffer, or None if empty."""
+        if not self._buffer:
+            return None
+        if len(self._buffer) == 1:
+            return self._buffer[0].copy()
+
+        translations = np.array([T[:3, 3] for T in self._buffer])
+        median_t = np.median(translations, axis=0)
+
+        # Use rotation from pose closest to median translation
+        dists = np.linalg.norm(translations - median_t, axis=1)
+        best_idx = int(np.argmin(dists))
+
+        result = self._buffer[best_idx].copy()
+        result[:3, 3] = median_t.astype(np.float32)
+        return result
+
+    def is_ready(self) -> bool:
+        return len(self._buffer) >= 2
+
+    def reset(self) -> None:
+        self._buffer.clear()
+
+    @property
+    def count(self) -> int:
+        return len(self._buffer)
+
+
+# ─── X-bias correction utility ──────────────────────────────────────────
+
+def apply_x_bias_correction(
+    T_base: np.ndarray,
+    x_bias_m: float,
+) -> np.ndarray:
+    """
+    Apply a constant correction to the x-component of a base-frame pose.
+
+    If measurements consistently underestimate x, set x_bias_m > 0 to compensate.
+    """
+    T_corrected = T_base.copy()
+    T_corrected[0, 3] += x_bias_m
+    return T_corrected
 
 
 # ─── Weighted pose averaging ────────────────────────────────────────────
@@ -257,12 +405,6 @@ def weighted_average_poses(
     Translation: weighted mean.
     Rotation: SLERP between the two (for 2 poses), or pick highest-weight
               rotation for 3+ poses (full Karcher mean is overkill here).
-
-    Args:
-        poses: list of 4x4 transforms
-        weights: corresponding non-negative weights (will be normalized)
-    Returns:
-        4x4 averaged transform
     """
     if len(poses) == 1:
         return poses[0].copy()
@@ -270,16 +412,13 @@ def weighted_average_poses(
     w = np.array(weights, dtype=np.float64)
     w = w / (w.sum() + 1e-12)
 
-    # Weighted translation average
     avg_t = np.zeros(3, dtype=np.float64)
     for T, wi in zip(poses, w):
         avg_t += wi * T[:3, 3].astype(np.float64)
 
-    # Rotation: SLERP for 2 poses, highest-weight for more
     if len(poses) == 2:
         q0 = rotation_matrix_to_quaternion_wxyz(poses[0][:3, :3])
         q1 = rotation_matrix_to_quaternion_wxyz(poses[1][:3, :3])
-        # SLERP parameter = weight of second pose
         avg_q = slerp(q0, q1, float(w[1]))
         avg_R = quaternion_wxyz_to_rotation_matrix(avg_q)
     else:
