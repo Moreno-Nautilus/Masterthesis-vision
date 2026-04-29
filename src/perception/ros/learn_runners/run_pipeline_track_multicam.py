@@ -260,6 +260,38 @@ def rotation_angle_deg(R1: np.ndarray, R2: np.ndarray) -> float:
     c = float(np.clip(c, -1.0, 1.0))
     return float(np.degrees(np.arccos(c)))
 
+def force_object_z_up_in_base(T_base_object: np.ndarray, preserve_axis: str = "x") -> np.ndarray:
+    T = np.asarray(T_base_object, dtype=np.float32).reshape(4, 4).copy()
+    R_old = T[:3, :3].astype(np.float64)
+
+    z_new = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    if preserve_axis == "y":
+        y = R_old[:, 1].copy()
+        y[2] = 0.0
+        if np.linalg.norm(y) < 1e-6:
+            y = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+        y_new = y / (np.linalg.norm(y) + 1e-12)
+        x_new = np.cross(y_new, z_new)
+        x_new = x_new / (np.linalg.norm(x_new) + 1e-12)
+        y_new = np.cross(z_new, x_new)
+        y_new = y_new / (np.linalg.norm(y_new) + 1e-12)
+
+    else:
+        x = R_old[:, 0].copy()
+        x[2] = 0.0
+        if np.linalg.norm(x) < 1e-6:
+            x = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+        x_new = x / (np.linalg.norm(x) + 1e-12)
+        y_new = np.cross(z_new, x_new)
+        y_new = y_new / (np.linalg.norm(y_new) + 1e-12)
+        x_new = np.cross(y_new, z_new)
+        x_new = x_new / (np.linalg.norm(x_new) + 1e-12)
+
+    T[:3, :3] = np.column_stack([x_new, y_new, z_new]).astype(np.float32)
+    return T
 
 def should_log_track_update(
     T_base_new: np.ndarray,
@@ -887,6 +919,17 @@ class FoundationPoseTrackerNode(Node):
             f"t_base=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] "
             f"q_base=[{q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f}]"
         )
+    
+    def _postprocess_base_pose(self, object_id: str, T_base_object: np.ndarray) -> np.ndarray:
+        T_base_object = np.asarray(T_base_object, dtype=np.float32).reshape(4, 4)
+
+        if bool(getattr(self.args, "force_upright_base_pose", False)):
+            return force_object_z_up_in_base(
+                T_base_object,
+                preserve_axis=str(getattr(self.args, "upright_preserve_axis", "x")),
+            )
+
+        return T_base_object
 
     def _log_base_pose(
         self,
@@ -945,6 +988,8 @@ class FoundationPoseTrackerNode(Node):
         stamp,
     ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
+        #new post publish step
+        T_base_object = self._postprocess_base_pose(object_id, T_base_object)
         pub = self._get_or_create_pose_base_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
@@ -957,6 +1002,8 @@ class FoundationPoseTrackerNode(Node):
         stamp,
     ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
+        #new post publish step
+        T_base_object = self._postprocess_base_pose(object_id, T_base_object)
         pub = self._get_or_create_pose_base_init_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
@@ -969,6 +1016,8 @@ class FoundationPoseTrackerNode(Node):
         stamp,
     ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
+        #new post publish step
+        T_base_object = self._postprocess_base_pose(object_id, T_base_object)
         pub = self._get_or_create_pose_base_track_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
@@ -1141,6 +1190,50 @@ class FoundationPoseTrackerNode(Node):
             out.append(msg)
         return out
 
+    # def _states_to_pose_item_msgs(
+    #     self,
+    #     cam_id: str,
+    #     states: list[ObjectTrackState],
+    #     include_masks: bool,
+    # ) -> list[DebugPoseItem]:
+    #     out: list[DebugPoseItem] = []
+    #     for s in states:
+    #         if s.T_object_camera is None:
+    #             continue
+
+    #         msg = DebugPoseItem()
+    #         msg.object_id = str(s.object_id)
+    #         msg.mode = str(s.mode)
+    #         msg.score = float(s.dino_score)
+    #         msg.pose_camera = T_to_pose_msg(s.T_object_camera)
+    #         T_base_dbg = self._safe_to_base_pose(cam_id, s.T_object_camera)
+    #         T_base_dbg = self._postprocess_base_pose(s.object_id, T_base_dbg)
+    #         msg.pose_base = T_to_pose_msg(T_base_dbg)
+    #         msg.axis_len_m = 0.03
+
+    #         msg.has_bbox = False
+    #         msg.bbox_xyxy = [0, 0, 0, 0]
+    #         msg.has_mask = False
+    #         msg.mask = DebugMaskCrop()
+
+    #         if include_masks and s.recovery_mask is not None:
+    #             ys, xs = np.where(s.recovery_mask.astype(bool))
+    #             if xs.size > 0 and ys.size > 0:
+    #                 bbox = (
+    #                     int(xs.min()),
+    #                     int(ys.min()),
+    #                     int(xs.max()) + 1,
+    #                     int(ys.max()) + 1,
+    #                 )
+    #                 msg.has_bbox = True
+    #                 msg.bbox_xyxy = [bbox[0], bbox[1], bbox[2], bbox[3]]
+    #                 ok_mask, mask_msg = self._make_mask_crop_msg(s.recovery_mask, bbox)
+    #                 msg.has_mask = bool(ok_mask)
+    #                 msg.mask = mask_msg
+
+    #         out.append(msg)
+    #     return out
+
     def _states_to_pose_item_msgs(
         self,
         cam_id: str,
@@ -1148,6 +1241,7 @@ class FoundationPoseTrackerNode(Node):
         include_masks: bool,
     ) -> list[DebugPoseItem]:
         out: list[DebugPoseItem] = []
+
         for s in states:
             if s.T_object_camera is None:
                 continue
@@ -1156,8 +1250,25 @@ class FoundationPoseTrackerNode(Node):
             msg.object_id = str(s.object_id)
             msg.mode = str(s.mode)
             msg.score = float(s.dino_score)
-            msg.pose_camera = T_to_pose_msg(s.T_object_camera)
-            msg.pose_base = T_to_pose_msg(self._safe_to_base_pose(cam_id, s.T_object_camera))
+
+            # 1) Convert raw camera-frame CAD pose to base frame.
+            T_base_dbg = self._safe_to_base_pose(cam_id, s.T_object_camera)
+
+            # 2) Apply the SAME upright/debug correction that you publish.
+            T_base_dbg = self._postprocess_base_pose(s.object_id, T_base_dbg)
+
+            # 3) Store corrected base pose.
+            msg.pose_base = T_to_pose_msg(T_base_dbg)
+
+            # 4) IMPORTANT:
+            # Recompute corrected camera-frame pose from corrected base pose.
+            # Do NOT use raw s.T_object_camera here.
+            T_base_cam = self._resolve_T_base_cam(cam_id)
+            T_cam_base = np.linalg.inv(T_base_cam).astype(np.float32)
+            T_cam_dbg = (T_cam_base @ T_base_dbg).astype(np.float32)
+
+            msg.pose_camera = T_to_pose_msg(T_cam_dbg)
+
             msg.axis_len_m = 0.03
 
             msg.has_bbox = False
@@ -1176,13 +1287,15 @@ class FoundationPoseTrackerNode(Node):
                     )
                     msg.has_bbox = True
                     msg.bbox_xyxy = [bbox[0], bbox[1], bbox[2], bbox[3]]
+
                     ok_mask, mask_msg = self._make_mask_crop_msg(s.recovery_mask, bbox)
                     msg.has_mask = bool(ok_mask)
                     msg.mask = mask_msg
 
             out.append(msg)
-        return out
 
+        return out
+        
     def _resolve_mesh_path(self, object_id: str) -> str:
         if object_id in self.mesh_map:
             return self.mesh_map[object_id]
@@ -4043,7 +4156,11 @@ class FoundationPoseTrackerNode(Node):
 
             # ─── Step 3d: Weighted average → canonical base-frame pose ───
             T_base_canonical = weighted_average_poses(candidate_poses, candidate_weights)
-
+            if bool(getattr(self.args, "force_upright_base_pose", False)):
+                T_base_canonical = force_object_z_up_in_base(
+                    T_base_canonical,
+                    preserve_axis=str(getattr(self.args, "upright_preserve_axis", "x")),
+                )
             # Log the fusion result
             t_canon = T_base_canonical[:3, 3]
             weights_str = ", ".join(
@@ -4697,6 +4814,9 @@ def parse_args() -> argparse.Namespace:
  
     # Median pose buffer (temporal outlier filter, 0 to disable)
     p.add_argument("--median-pose-buffer-size", type=int, default=3)
+
+    p.add_argument("--force-upright-base-pose", action="store_true")
+    p.add_argument("--upright-preserve-axis", type=str, default="x", choices=["x", "y"])
 
     return p.parse_args()
 
