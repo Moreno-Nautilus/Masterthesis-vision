@@ -293,6 +293,62 @@ def force_object_z_up_in_base(T_base_object: np.ndarray, preserve_axis: str = "x
     T[:3, :3] = np.column_stack([x_new, y_new, z_new]).astype(np.float32)
     return T
 
+
+# [POST-RUN3 Item 4b] 3D PNG render of init pose for diagnostics
+def save_init_pose_render(
+    T_base: np.ndarray,
+    model_pcd,
+    obj_id: str,
+    save_path: str,
+    accepted: bool,
+    gt_pos=None,
+) -> None:
+    """Render a 3D scatter of the init pose estimate using matplotlib (headless-safe)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    try:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Transform model cloud to base frame
+        pts = np.asarray(model_pcd.points)
+        R, t = T_base[:3, :3], T_base[:3, 3]
+        pts_base = (R @ pts.T).T + t
+
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111, projection='3d')
+
+        color = '#3366CC' if accepted else '#CC3333'
+        ax.scatter(pts_base[::3, 0], pts_base[::3, 1], pts_base[::3, 2],
+                   s=1, c=color, alpha=0.4)
+
+        # Draw pose axes (50mm)
+        for axis_i, axis_color in enumerate(['r', 'g', 'b']):
+            axis_end = t + R[:, axis_i] * 0.05
+            ax.plot([t[0], axis_end[0]], [t[1], axis_end[1]], [t[2], axis_end[2]],
+                    color=axis_color, linewidth=2)
+
+        if gt_pos is not None:
+            ax.scatter(*gt_pos, s=80, c='lime', edgecolors='black', zorder=5)
+
+        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+        ax.set_title(f'{obj_id} | {"ACCEPT" if accepted else "REJECT"}')
+        ax.view_init(elev=30, azim=135)
+
+        # Equal aspect ratio
+        all_pts = pts_base
+        mid = all_pts.mean(axis=0)
+        max_range = (all_pts.max(axis=0) - all_pts.min(axis=0)).max() / 2 * 1.2
+        ax.set_xlim(mid[0]-max_range, mid[0]+max_range)
+        ax.set_ylim(mid[1]-max_range, mid[1]+max_range)
+        ax.set_zlim(mid[2]-max_range, mid[2]+max_range)
+
+        plt.savefig(save_path, dpi=120, bbox_inches='tight')
+        plt.close(fig)
+    except Exception as e:
+        print(f"  [WARN] save_init_pose_render failed: {e}")
+
 def should_log_track_update(
     T_base_new: np.ndarray,
     T_base_last: Optional[np.ndarray],
@@ -892,6 +948,18 @@ class FoundationPoseTrackerNode(Node):
         self._fused_warmup_count = {}       # obj_id -> frames since init
         self._median_pose_buffers = {}      # obj_id -> MedianPoseBuffer
 
+        # [POST-RUN3 Item 2d] Manipulation mode toggle — when active, z_up is never
+        # applied to that object's tracking seed (callable from grasping node)
+        self._manipulation_mode: dict[str, bool] = {}
+
+        # [POST-RUN3 Item 2c] Per-object config — e.g. {'allow_upright_constraint': True}
+        # Populate from your object config file if you have one; defaults to all-True.
+        self._object_config: dict[str, dict] = {}
+
+        # [POST-RUN3 Item 3] Consecutive Chamfer failure tracking per object
+        self._consecutive_chamfer_fails: dict[str, int] = {}
+        self._last_reinit_time: dict[str, float] = {}
+
     @staticmethod
     def _build_mesh_map(cad_dir: str) -> dict[str, str]:
         cad_root = Path(cad_dir)
@@ -930,6 +998,40 @@ class FoundationPoseTrackerNode(Node):
             )
 
         return T_base_object
+
+    # [POST-RUN3 Item 2d] Manipulation mode toggle
+    def set_manipulation_mode(self, obj_id: str, active: bool) -> None:
+        """Callable from grasping node. When active, z_up is never applied
+        to this object's tracking seed."""
+        self._manipulation_mode[obj_id] = active
+        self.get_logger().info(
+            f"Manipulation mode {'ENABLED' if active else 'DISABLED'} for {obj_id}"
+        )
+
+    # [POST-RUN3 Item 3] ICP rotation grid — 8 yaw seeds for recovery
+    def _icp_rotation_grid(
+        self,
+        t_base: np.ndarray,
+        model_pcd,
+        fused_cloud,
+    ) -> tuple:
+        """Try 8 yaw angles at the best estimated translation.
+        Returns (best_T, best_chamfer). Cost: ~40ms total."""
+        from scipy.spatial.transform import Rotation as SciRot
+        best_T, best_chamfer = None, float('inf')
+        for yaw_deg in np.arange(0, 360, 45):
+            yaw = np.radians(yaw_deg)
+            R_seed = SciRot.from_euler('z', yaw).as_matrix()
+            T_seed = np.eye(4, dtype=np.float32)
+            T_seed[:3, :3] = R_seed.astype(np.float32)
+            T_seed[:3, 3] = t_base
+            T_ref, fit, _ = run_icp_in_base_frame(
+                fused_cloud, model_pcd, T_seed, max_iteration=30,
+            )
+            ch = chamfer_distance_one_way(model_pcd, fused_cloud, T_ref)
+            if ch < best_chamfer:
+                best_T, best_chamfer = T_ref, ch
+        return best_T, best_chamfer
 
     def _log_base_pose(
         self,
@@ -988,8 +1090,9 @@ class FoundationPoseTrackerNode(Node):
         stamp,
     ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
-        #new post publish step
-        T_base_object = self._postprocess_base_pose(object_id, T_base_object)
+        # T_base_object = self._postprocess_base_pose(object_id, T_base_object)
+
+        # [POST-RUN3 Item 2b] z_up removed from publish path — raw pose only
         pub = self._get_or_create_pose_base_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
@@ -1002,8 +1105,9 @@ class FoundationPoseTrackerNode(Node):
         stamp,
     ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
-        #new post publish step
-        T_base_object = self._postprocess_base_pose(object_id, T_base_object)
+        # [POST-RUN3 Item 2b] z_up removed from publish path — raw pose only
+        # T_base_object = self._postprocess_base_pose(object_id, T_base_object)
+
         pub = self._get_or_create_pose_base_init_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
@@ -1016,8 +1120,8 @@ class FoundationPoseTrackerNode(Node):
         stamp,
     ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
-        #new post publish step
-        T_base_object = self._postprocess_base_pose(object_id, T_base_object)
+        # [POST-RUN3 Item 2b] z_up removed from publish path — raw pose only
+        # T_base_object = self._postprocess_base_pose(object_id, T_base_object)
         pub = self._get_or_create_pose_base_track_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
@@ -1190,50 +1294,6 @@ class FoundationPoseTrackerNode(Node):
             out.append(msg)
         return out
 
-    # def _states_to_pose_item_msgs(
-    #     self,
-    #     cam_id: str,
-    #     states: list[ObjectTrackState],
-    #     include_masks: bool,
-    # ) -> list[DebugPoseItem]:
-    #     out: list[DebugPoseItem] = []
-    #     for s in states:
-    #         if s.T_object_camera is None:
-    #             continue
-
-    #         msg = DebugPoseItem()
-    #         msg.object_id = str(s.object_id)
-    #         msg.mode = str(s.mode)
-    #         msg.score = float(s.dino_score)
-    #         msg.pose_camera = T_to_pose_msg(s.T_object_camera)
-    #         T_base_dbg = self._safe_to_base_pose(cam_id, s.T_object_camera)
-    #         T_base_dbg = self._postprocess_base_pose(s.object_id, T_base_dbg)
-    #         msg.pose_base = T_to_pose_msg(T_base_dbg)
-    #         msg.axis_len_m = 0.03
-
-    #         msg.has_bbox = False
-    #         msg.bbox_xyxy = [0, 0, 0, 0]
-    #         msg.has_mask = False
-    #         msg.mask = DebugMaskCrop()
-
-    #         if include_masks and s.recovery_mask is not None:
-    #             ys, xs = np.where(s.recovery_mask.astype(bool))
-    #             if xs.size > 0 and ys.size > 0:
-    #                 bbox = (
-    #                     int(xs.min()),
-    #                     int(ys.min()),
-    #                     int(xs.max()) + 1,
-    #                     int(ys.max()) + 1,
-    #                 )
-    #                 msg.has_bbox = True
-    #                 msg.bbox_xyxy = [bbox[0], bbox[1], bbox[2], bbox[3]]
-    #                 ok_mask, mask_msg = self._make_mask_crop_msg(s.recovery_mask, bbox)
-    #                 msg.has_mask = bool(ok_mask)
-    #                 msg.mask = mask_msg
-
-    #         out.append(msg)
-    #     return out
-
     def _states_to_pose_item_msgs(
         self,
         cam_id: str,
@@ -1254,8 +1314,8 @@ class FoundationPoseTrackerNode(Node):
             # 1) Convert raw camera-frame CAD pose to base frame.
             T_base_dbg = self._safe_to_base_pose(cam_id, s.T_object_camera)
 
-            # 2) Apply the SAME upright/debug correction that you publish.
-            T_base_dbg = self._postprocess_base_pose(s.object_id, T_base_dbg)
+            # 2) [POST-RUN3 Item 2b] Raw base pose — no z_up in publish/debug path
+            # T_base_dbg = self._postprocess_base_pose(s.object_id, T_base_dbg)
 
             # 3) Store corrected base pose.
             msg.pose_base = T_to_pose_msg(T_base_dbg)
@@ -1295,7 +1355,7 @@ class FoundationPoseTrackerNode(Node):
             out.append(msg)
 
         return out
-        
+
     def _resolve_mesh_path(self, object_id: str) -> str:
         if object_id in self.mesh_map:
             return self.mesh_map[object_id]
@@ -3987,21 +4047,11 @@ class FoundationPoseTrackerNode(Node):
                         f"{mean_overlap_dist*1000:.1f}mm > 8mm — "
                         f"extrinsic calibration may need re-running"
                     )
-            # fused_cloud = merge_point_clouds(per_cam_clouds, voxel_size=0.002)
-            use_weighted = bool(getattr(self.args, 'use_weighted_cloud_merge', False))
-            if use_weighted and len(per_cam_clouds) >= 2:
-                cam_positions = [
-                    self._resolve_T_base_cam(det.cam_id)[:3, 3]
-                    for det in fused.detections
-                    if det.cam_id in views_by_cam
-                ]
-                fused_cloud = merge_point_clouds_weighted(
-                    per_cam_clouds, cam_positions,
-                    voxel_size=0.002,
-                    distance_exponent=float(getattr(self.args, 'cloud_merge_distance_exponent', 2.0)),
-                )
-            else:
-                fused_cloud = merge_point_clouds(per_cam_clouds, voxel_size=0.002)
+            # [POST-RUN3 Item 1] Always use UNWEIGHTED merge at init.
+            # Weighted merge gives cam1 54–64% weight (always closer), which
+            # introduces systematic −X,+Y bias via cam1's depth underestimate.
+            # Tracking merge stays weighted — ICP self-corrects frame-to-frame.
+            fused_cloud = merge_point_clouds(per_cam_clouds, voxel_size=0.002)
 
             if fused_cloud is None or len(fused_cloud.points) < 50:
                 print(f"  Fused cloud too small for {fused.object_id}, skipping")
@@ -4026,9 +4076,8 @@ class FoundationPoseTrackerNode(Node):
             candidate_det_indices: list[int] = []
 
             is_single_cam = len(fused.detections) == 1
-            # How many FP attempts per camera: more for single-cam since there's
-            # no second viewpoint to average out bad hypotheses
-            N_ATTEMPTS = 3 if is_single_cam else 2
+            # [POST-RUN3 Item 3] N=3 FP attempts for ALL cases (was 2 for multi-cam)
+            N_ATTEMPTS = 3
             CHAMFER_REJECT_M = 0.012 if is_single_cam else 0.015
 
             if is_single_cam:
@@ -4111,6 +4160,39 @@ class FoundationPoseTrackerNode(Node):
                             f"fitness={fitness:.3f} chamfer={chamfer*1000:.2f}mm"
                         )
 
+                    # [POST-RUN3 Item 4a] CSV logging of init poses
+                    accepted_attempt = (chamfer <= CHAMFER_REJECT_M)
+                    if getattr(self.args, 'log_init_poses', False):
+                        try:
+                            from scipy.spatial.transform import Rotation as SciRot
+                            roll, pitch, yaw = SciRot.from_matrix(
+                                T_refined[:3, :3].astype(np.float64)
+                            ).as_euler('xyz', degrees=True)
+                            log_path = Path('init_pose_log.csv')
+                            write_header = not log_path.exists()
+                            with open(log_path, 'a') as f:
+                                if write_header:
+                                    f.write('timestamp,obj_id,cam_id,attempt,'
+                                            'tx,ty,tz,roll,pitch,yaw,'
+                                            'chamfer_mm,accepted\n')
+                                f.write(
+                                    f'{time.time():.3f},{fused.object_id},{cam_id},'
+                                    f'{attempt_i},'
+                                    f'{T_refined[0,3]:.4f},{T_refined[1,3]:.4f},'
+                                    f'{T_refined[2,3]:.4f},'
+                                    f'{roll:.2f},{pitch:.2f},{yaw:.2f},'
+                                    f'{chamfer*1000:.2f},{accepted_attempt}\n'
+                                )
+                        except Exception as e:
+                            print(f"  [WARN] init pose CSV log failed: {e}")
+
+                        # [POST-RUN3 Item 4b] PNG render per attempt
+                        save_init_pose_render(
+                            T_refined, model_pcd, fused.object_id,
+                            f'init_renders/{fused.object_id}_{cam_id}_att{attempt_i}.png',
+                            accepted=accepted_attempt,
+                        )
+
                     if chamfer < best_chamfer:
                         best_T = T_refined
                         best_chamfer = chamfer
@@ -4128,6 +4210,28 @@ class FoundationPoseTrackerNode(Node):
                         f"  No valid FP+ICP for {cam_id} {fused.object_id}"
                     )
                     continue
+                if best_chamfer > 0.007:
+                    t_grid = time.time()
+                    grid_T, grid_chamfer = self._icp_rotation_grid(
+                        best_T[:3, 3], model_pcd, fused_cloud,
+                    )
+                    grid_ms = (time.time() - t_grid) * 1000
+                    if grid_T is not None and grid_chamfer < best_chamfer:
+                        print(
+                            f"    ICP grid improved [{cam_id}]: "
+                            f"{best_chamfer*1000:.2f}mm → {grid_chamfer*1000:.2f}mm "
+                            f"({grid_ms:.0f}ms)"
+                        )
+                        best_T = grid_T
+                        best_chamfer = grid_chamfer
+                        if getattr(self.args, 'log_init_poses', False):
+                            save_init_pose_render(
+                                best_T, model_pcd, fused.object_id,
+                                f'init_renders/{fused.object_id}_{cam_id}_grid_corrected.png',
+                                accepted=True,
+                            )
+                    else:
+                        print(f"    ICP grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
 
                 print(
                     f"  FP+ICP [{cam_id}] {fused.object_id}: "
@@ -4136,13 +4240,71 @@ class FoundationPoseTrackerNode(Node):
                     f"{f' (best of {N_ATTEMPTS})' if N_ATTEMPTS > 1 else ''}"
                 )
 
-                # ─── Chamfer gate: reject if alignment is too bad ───
+                # ─── Chamfer gate: ICP rotation grid recovery on reject ───
+                # [POST-RUN3 Item 3] Instead of hard reject + SAM/DINO reinit,
+                # try ICP rotation grid as lightweight recovery.
+                init_quality = 'good'
                 if best_chamfer > CHAMFER_REJECT_M:
                     self.get_logger().warn(
-                        f"  ✗ CHAMFER REJECT {cam_id} {fused.object_id}: "
-                        f"{best_chamfer*1000:.1f}mm > {CHAMFER_REJECT_M*1000:.0f}mm"
+                        f"  ⚠ CHAMFER REJECT {cam_id} {fused.object_id}: "
+                        f"{best_chamfer*1000:.1f}mm > {CHAMFER_REJECT_M*1000:.0f}mm "
+                        f"→ trying ICP rotation grid..."
                     )
-                    continue
+                    # Keep existing mask — do NOT call SAM/DINO again
+                    t_grid = time.time()
+                    grid_T, grid_chamfer = self._icp_rotation_grid(
+                        best_T[:3, 3],    # use best estimated translation
+                        model_pcd,
+                        fused_cloud,
+                    )
+                    grid_ms = (time.time() - t_grid) * 1000
+                    print(
+                        f"    ICP grid: chamfer={grid_chamfer*1000:.2f}mm "
+                        f"({grid_ms:.0f}ms)"
+                    )
+                    if grid_T is not None and grid_chamfer < best_chamfer:
+                        best_T = grid_T
+                        best_chamfer = grid_chamfer
+
+                    if best_chamfer > CHAMFER_REJECT_M:
+                        # Grid also failed — accept best-Chamfer result anyway
+                        # with quality flag, do NOT reject
+                        init_quality = 'uncertain'
+                        self.get_logger().warn(
+                            f"  ⚠ ICP grid also failed for {cam_id} {fused.object_id}: "
+                            f"chamfer={best_chamfer*1000:.1f}mm — "
+                            f"accepting with init_quality='uncertain'"
+                        )
+
+                        # Track consecutive failures for this object
+                        fail_key = fused.object_id
+                        self._consecutive_chamfer_fails[fail_key] = \
+                            self._consecutive_chamfer_fails.get(fail_key, 0) + 1
+
+                        # Only trigger full SAM+DINO reinit after 3 consecutive
+                        # failures with 10s minimum cooldown
+                        n_fails = self._consecutive_chamfer_fails[fail_key]
+                        last_reinit = self._last_reinit_time.get(fail_key, 0.0)
+                        if n_fails >= 3 and (time.time() - last_reinit) > 10.0:
+                            self.get_logger().warn(
+                                f"  ✗ {n_fails} consecutive Chamfer failures for "
+                                f"{fused.object_id} — full SAM+DINO reinit on next cycle"
+                            )
+                            self._last_reinit_time[fail_key] = time.time()
+                            self._consecutive_chamfer_fails[fail_key] = 0
+                            # Mark object for reinit on next cycle
+                            for cid in self.track_states:
+                                self.track_states[cid] = [
+                                    s for s in self.track_states[cid]
+                                    if s.object_id != fused.object_id
+                                ]
+                    else:
+                        # Grid recovered successfully
+                        init_quality = 'recovered'
+                        self._consecutive_chamfer_fails[fused.object_id] = 0
+                else:
+                    # Good chamfer — reset consecutive failure counter
+                    self._consecutive_chamfer_fails[fused.object_id] = 0
 
                 candidate_poses.append(best_T)
                 weight = best_fitness / (best_chamfer + 1e-6)
@@ -4156,13 +4318,30 @@ class FoundationPoseTrackerNode(Node):
 
             # ─── Step 3d: Weighted average → canonical base-frame pose ───
             T_base_canonical = weighted_average_poses(candidate_poses, candidate_weights)
-            if bool(getattr(self.args, "force_upright_base_pose", False)):
-                T_base_canonical = force_object_z_up_in_base(
+
+            # [POST-RUN3 Item 2a] Separate T_publish from T_track_seed.
+            # T_publish = raw canonical pose (no z_up) — what gets published/measured.
+            # T_track_seed = optionally z_up-corrected — used only to seed tracker.
+            #T_publish = T_track_seed.copy() # strictly forcing z to be up
+            T_publish = T_base_canonical.copy()
+            T_track_seed = T_base_canonical.copy()
+
+            # [POST-RUN3 Item 2c] Per-object upright eligibility
+            allow_upright = self._object_config.get(fused.object_id, {}).get(
+                'allow_upright_constraint', True
+            )
+            in_manipulation = self._manipulation_mode.get(fused.object_id, False)
+
+            if (bool(getattr(self.args, "force_upright_base_pose", False))
+                    and allow_upright and not in_manipulation):
+                T_track_seed = force_object_z_up_in_base(
                     T_base_canonical,
                     preserve_axis=str(getattr(self.args, "upright_preserve_axis", "x")),
                 )
+            
+            # T_publish = T_track_seed.copy() # FORCE Z UP ALWAYS
             # Log the fusion result
-            t_canon = T_base_canonical[:3, 3]
+            t_canon = T_publish[:3, 3]
             weights_str = ", ".join(
                 f"{cid}:{w:.2f}" for cid, w in zip(candidate_cam_ids, candidate_weights)
             )
@@ -4175,6 +4354,7 @@ class FoundationPoseTrackerNode(Node):
 
     
             # ─── Step 3e: Back-project to all contributing cameras ───
+            # Use T_track_seed for tracker state, T_publish for published pose
             for det_idx, det in enumerate(fused.detections):
                 cam_id = det.cam_id
                 if cam_id not in views_by_cam:
@@ -4182,7 +4362,7 @@ class FoundationPoseTrackerNode(Node):
     
                 T_bc = self._resolve_T_base_cam(cam_id)
                 T_cam_base = np.linalg.inv(T_bc).astype(np.float32)
-                T_local = T_cam_base @ T_base_canonical
+                T_local = T_cam_base @ T_track_seed    # tracker gets z_up seed
     
                 ok_local, reason_local = self._pose_reason(T_local, cam_id)
                 if not ok_local:
@@ -4212,14 +4392,14 @@ class FoundationPoseTrackerNode(Node):
                     extra=f"dino={det.dino_score:.3f} cams={len(candidate_poses)}",
                 )
     
-            # Publish canonical fused pose
+            # Publish canonical fused pose (T_publish — NO z_up)
             fused_key = f"fused/{fused.object_id}_{i}"
             if fused_key not in self._pub_fused_pose:
                 self._pub_fused_pose[fused_key] = self.create_publisher(
                     PoseStamped, f"/perception/fp/pose_base/{fused_key}", FAST_QOS,
                 )
             self._pub_fused_pose[fused_key].publish(
-                T_to_pose_stamped(T_base_canonical, frame_id="base", stamp=stamp)
+                T_to_pose_stamped(T_publish, frame_id="base", stamp=stamp)
             )
     
         print(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms")
@@ -4817,6 +4997,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--force-upright-base-pose", action="store_true")
     p.add_argument("--upright-preserve-axis", type=str, default="x", choices=["x", "y"])
+
+    # [POST-RUN3 Item 4] Init rotation logging + 3D PNG render (off by default)
+    p.add_argument("--log-init-poses", action="store_true",
+                   help="Log CSV of init pose RPY + render 3D PNGs per attempt")
 
     return p.parse_args()
 
