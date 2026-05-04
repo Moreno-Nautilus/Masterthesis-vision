@@ -3,9 +3,7 @@ from __future__ import annotations
 import argparse
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -183,10 +181,7 @@ class PoseKalmanFilter:
         self.P = (I - K @ self.H) @ self.P
         
         self._frame_count += 1
-    
-    def get_velocity(self) -> np.ndarray:
-        """Get current estimated velocity [vx, vy, vz] in m/frame."""
-        return self.state[3:].copy()
+
     
     def get_speed(self) -> float:
         """Get current speed in m/frame."""
@@ -313,23 +308,6 @@ def save_init_pose_render(
         plt.close(fig)
     except Exception as e:
         print(f"  [WARN] save_init_pose_render failed: {e}")
-
-def should_log_track_update(
-    T_base_new: np.ndarray,
-    T_base_last: Optional[np.ndarray],
-    convention_new: str,
-    convention_last: Optional[str],
-    trans_thresh_m: float = 0.005,
-    rot_thresh_deg: float = 4.0,
-) -> bool:
-    if T_base_last is None:
-        return True
-    if convention_last != convention_new:
-        return True
-
-    dt = float(np.linalg.norm(T_base_new[:3, 3] - T_base_last[:3, 3]))
-    drot = rotation_angle_deg(T_base_last[:3, :3], T_base_new[:3, :3])
-    return (dt > trans_thresh_m) or (drot > rot_thresh_deg)
 
 
 def rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
@@ -539,6 +517,13 @@ def reject_border_masks(
         out.append(c)
     return out
 
+def pad_mask_for_fp(mask: np.ndarray, pad_px: int = 5) -> np.ndarray:
+    """Dilate mask by pad_px pixels to give FP more context around the object."""
+    if pad_px <= 0:
+        return mask
+    kernel = np.ones((2 * pad_px + 1, 2 * pad_px + 1), np.uint8)
+    dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
+    return dilated.astype(mask.dtype)
 
 def mask_depth_coverage(
     depth: np.ndarray,
@@ -553,15 +538,6 @@ def mask_depth_coverage(
     d = depth[mask_bool]
     valid = np.isfinite(d) & (d > zmin) & (d < zmax)
     return float(valid.sum()) / float(n_mask)
-
-
-def vote_object_id(history: deque) -> str:
-    if not history:
-        return "unknown"
-    counts: dict[str, int] = defaultdict(int)
-    for obj_id in history:
-        counts[obj_id] += 1
-    return max(counts, key=counts.get)
 
 
 def bbox_containment_ratio(
@@ -748,10 +724,6 @@ def batch_dino_classify(
     return results
 
 
-class ProjectedMaskProvider:
-    def get_mask(self, view: Any, object_id_hint: str | None = None) -> np.ndarray:
-        raise NotImplementedError("Projected mask mode is not wired yet.")
-
 
 class FoundationPoseTrackerNode(Node):
     def __init__(self, args: argparse.Namespace, grabber: MultiCamGrabber, T_base_cam_map):
@@ -843,7 +815,6 @@ class FoundationPoseTrackerNode(Node):
                     )
                 )
 
-        self.projected_provider = ProjectedMaskProvider()
 
         self.fp_tracker_by_cam: dict[str, FoundationPoseWrapper] = {}
         for cam in CAMERAS:
@@ -876,7 +847,6 @@ class FoundationPoseTrackerNode(Node):
         self._fused_translation_kalman: dict[str, PoseKalmanFilter] = {}
 
         self.pub_pose_base: dict[str, Any] = {}
-        self.pub_pose_base_init: dict[str, Any] = {}
         self.pub_pose_base_track: dict[str, Any] = {}
         self.pub_debug_frame: dict[str, Any] = {}
 
@@ -903,6 +873,8 @@ class FoundationPoseTrackerNode(Node):
             }
         self._fused_warmup_count = {}       # obj_id -> frames since init
         self._median_pose_buffers = {}      # obj_id -> MedianPoseBuffer
+        self._T_cam_base_cache: dict[str, np.ndarray] = {}
+
 
         self._consecutive_chamfer_fails: dict[str, int] = {}
         self._last_reinit_time: dict[str, float] = {}
@@ -938,14 +910,6 @@ class FoundationPoseTrackerNode(Node):
             f"q_base=[{q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f}]"
         )
     
-
-    def set_manipulation_mode(self, obj_id: str, active: bool) -> None:
-        """Callable from grasping node. When active, z_up is never applied
-        to this object's tracking seed."""
-        self._manipulation_mode[obj_id] = active
-        self.get_logger().info(
-            f"Manipulation mode {'ENABLED' if active else 'DISABLED'} for {obj_id}"
-        )
 
     def _icp_rotation_grid(
             self,
@@ -1023,13 +987,13 @@ class FoundationPoseTrackerNode(Node):
         idx: int,
         T_object_camera: np.ndarray,
         extra: str = "",
-    ) -> None:
+        ) -> None:
         pose_str = self._base_pose_string(cam_id, T_object_camera)
         suffix = f" | {extra}" if extra else ""
         self.get_logger().info(
             f"[{cam_id}] {stage} [{idx}] {object_id} | {pose_str}{suffix}"
         )
-
+    
     def _get_or_create_pose_base_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
         key = f"{cam_id}/{object_id}_{idx}"
         if key not in self.pub_pose_base:
@@ -1039,21 +1003,24 @@ class FoundationPoseTrackerNode(Node):
         return self.pub_pose_base[key]
 
     def _resolve_T_base_cam(self, cam_id: str) -> np.ndarray:
-        """Get T_base_cam as a plain float64 4x4 array."""
-        T = self.T_base_cam_map[cam_id]
-        if hasattr(T, "as_matrix"):
-            T = T.as_matrix()
-        elif hasattr(T, "matrix"):
-            T = T.matrix
-        return np.asarray(T, dtype=np.float64).reshape(4, 4)
+        """Get T_base_cam as a plain float64 4x4 array, cached."""
+        if not hasattr(self, '_T_base_cam_cache'):
+            self._T_base_cam_cache: dict[str, np.ndarray] = {}
+        if cam_id not in self._T_base_cam_cache:
+            T = self.T_base_cam_map[cam_id]
+            if hasattr(T, "as_matrix"):
+                T = T.as_matrix()
+            elif hasattr(T, "matrix"):
+                T = T.matrix
+            self._T_base_cam_cache[cam_id] = np.asarray(T, dtype=np.float64).reshape(4, 4)
+        return self._T_base_cam_cache[cam_id]
 
-    def _get_or_create_pose_base_init_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
-        if key not in self.pub_pose_base_init:
-            self.pub_pose_base_init[key] = self.create_publisher(
-                PoseStamped, f"/perception/fp/pose_base_init/{key}", FAST_QOS
-            )
-        return self.pub_pose_base_init[key]
+    def _resolve_T_cam_base(self, cam_id: str) -> np.ndarray:
+        """Get T_cam_base (inverse of extrinsic), cached."""
+        if cam_id not in self._T_cam_base_cache:
+            T_bc = self._resolve_T_base_cam(cam_id)
+            self._T_cam_base_cache[cam_id] = np.linalg.inv(T_bc).astype(np.float32)
+        return self._T_cam_base_cache[cam_id]
 
     def _get_or_create_pose_base_track_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
         key = f"{cam_id}/{object_id}_{idx}"
@@ -1070,21 +1037,9 @@ class FoundationPoseTrackerNode(Node):
         idx: int,
         T_object_camera: np.ndarray,
         stamp,
-    ) -> None:
+        ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
         pub = self._get_or_create_pose_base_pub(cam_id, object_id, idx)
-        pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
-
-    def _publish_pose_base_init(
-        self,
-        cam_id: str,
-        object_id: str,
-        idx: int,
-        T_object_camera: np.ndarray,
-        stamp,
-    ) -> None:
-        T_base_object = self._to_base_pose(cam_id, T_object_camera)
-        pub = self._get_or_create_pose_base_init_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
     def _publish_pose_base_track(
@@ -1094,7 +1049,7 @@ class FoundationPoseTrackerNode(Node):
         idx: int,
         T_object_camera: np.ndarray,
         stamp,
-    ) -> None:
+        ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
         pub = self._get_or_create_pose_base_track_pub(cam_id, object_id, idx)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
@@ -1104,7 +1059,7 @@ class FoundationPoseTrackerNode(Node):
         mask: np.ndarray,
         bbox_xyxy: tuple[int, int, int, int],
         max_side: int = 96,
-    ) -> tuple[bool, DebugMaskCrop]:
+        ) -> tuple[bool, DebugMaskCrop]:
         msg = DebugMaskCrop()
         x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
 
@@ -1137,7 +1092,7 @@ class FoundationPoseTrackerNode(Node):
         dino_candidates: list[DebugCandidate],
         pose_items: list[DebugPoseItem],
         track_debug: Optional[dict] = None,
-    ) -> DebugFrame:
+        ) -> DebugFrame:
         frame = DebugFrame()
         frame.stamp = stamp
         frame.cam_id = cam_id
@@ -1191,7 +1146,7 @@ class FoundationPoseTrackerNode(Node):
     def _sam_candidates_to_msgs(
         self,
         masks: list[SAMMaskCandidate],
-    ) -> list[DebugCandidate]:
+        ) -> list[DebugCandidate]:
         out: list[DebugCandidate] = []
         for m in masks:
             msg = DebugCandidate()
@@ -1204,58 +1159,10 @@ class FoundationPoseTrackerNode(Node):
             out.append(msg)
         return out
 
-    def _fast_sam_at_position(
-        self,
-        rgb: np.ndarray,
-        last_bbox: tuple[int, int, int, int],
-        cam_id: str,
-    ) -> list[SAMMaskCandidate]:
-        """
-        Run SAM with point prompts at the center of the last known bbox.
-        Much faster than full auto-segmentation (~100ms vs ~5s).
-        """
-        if cam_id not in self.sam_by_cam:
-            return []
-        
-        sam = self.sam_by_cam[cam_id]
-        
-        # Get center of last known bbox
-        x0, y0, x1, y1 = last_bbox
-        cx = (x0 + x1) // 2
-        cy = (y0 + y1) // 2
-        
-        # Also add corner points for better coverage
-        margin = 5
-        points = np.array([
-            [cx, cy],  # Center
-            [x0 + margin, y0 + margin],  # Top-left
-            [x1 - margin, y0 + margin],  # Top-right
-            [x0 + margin, y1 - margin],  # Bottom-left
-            [x1 - margin, y1 - margin],  # Bottom-right
-        ], dtype=np.float32)
-        
-        # All foreground labels
-        labels = np.ones(len(points), dtype=np.int32)
-        
-        try:
-            t0 = time.time()
-            masks = sam.generate_from_points(
-                rgb=rgb,
-                prompt_points_xy=points,
-                prompt_labels=labels,
-                multimask_output=True,
-            )
-            elapsed_ms = (time.time() - t0) * 1000
-            self.get_logger().info(f"[{cam_id}] Fast SAM point prompts: {len(masks)} masks in {elapsed_ms:.0f}ms")
-            return masks
-        except Exception as e:
-            self.get_logger().warn(f"[{cam_id}] Fast SAM failed: {e}")
-            return []
-
     def _dino_ranked_to_msgs(
         self,
         ranked: list[CandidateSelection],
-    ) -> list[DebugCandidate]:
+        ) -> list[DebugCandidate]:
         out: list[DebugCandidate] = []
         for r in ranked:
             msg = DebugCandidate()
@@ -1273,7 +1180,7 @@ class FoundationPoseTrackerNode(Node):
         cam_id: str,
         states: list[ObjectTrackState],
         include_masks: bool,
-    ) -> list[DebugPoseItem]:
+        ) -> list[DebugPoseItem]:
         out: list[DebugPoseItem] = []
 
         for s in states:
@@ -1294,8 +1201,7 @@ class FoundationPoseTrackerNode(Node):
             # 4) IMPORTANT:
             # Recompute corrected camera-frame pose from corrected base pose.
             # Do NOT use raw s.T_object_camera here.
-            T_base_cam = self._resolve_T_base_cam(cam_id)
-            T_cam_base = np.linalg.inv(T_base_cam).astype(np.float32)
+            T_cam_base = self._resolve_T_cam_base(cam_id)
             T_cam_dbg = (T_cam_base @ T_base_dbg).astype(np.float32)
 
             msg.pose_camera = T_to_pose_msg(T_cam_dbg)
@@ -1491,7 +1397,7 @@ class FoundationPoseTrackerNode(Node):
         self,
         rgb: np.ndarray,
         masks: list[SAMMaskCandidate],
-    ) -> list[CandidateSelection]:
+        ) -> list[CandidateSelection]:
         if not masks:
             return []
 
@@ -1613,7 +1519,7 @@ class FoundationPoseTrackerNode(Node):
         self,
         ranked: list[CandidateSelection],
         depth: np.ndarray,
-    ) -> list[CandidateSelection]:
+        ) -> list[CandidateSelection]:
         selected: list[CandidateSelection] = []
         used_pixels = np.zeros(depth.shape[:2], dtype=bool)
 
@@ -1663,11 +1569,12 @@ class FoundationPoseTrackerNode(Node):
             pass
 
         return True, "ok"
+    
     def _get_previous_object_base_pose(
         self,
         obj_id: str,
         per_object_entries: list[dict],
-    ) -> Optional[np.ndarray]:
+     ) -> Optional[np.ndarray]:
         mem = self._fused_track_memory.get(obj_id, {})
         T_mem = mem.get("T_base")
         if T_mem is not None:
@@ -1689,7 +1596,7 @@ class FoundationPoseTrackerNode(Node):
     def _pose_delta_from_base(
         T_base_prev: Optional[np.ndarray],
         T_base_new: Optional[np.ndarray],
-    ) -> tuple[float, float]:
+        ) -> tuple[float, float]:
         if T_base_prev is None or T_base_new is None:
             return 0.0, 0.0
         dt = float(np.linalg.norm(T_base_new[:3, 3] - T_base_prev[:3, 3]))
@@ -1744,7 +1651,7 @@ class FoundationPoseTrackerNode(Node):
         cr: dict,
         prev_base_pose: Optional[np.ndarray],
         is_warmup: bool = False,
-    ) -> dict:
+        ) -> dict:
         """
         FIXED: During warmup (first N frames after init), override rt_invalid
         rejection and use relaxed gating thresholds. This lets the tracker
@@ -1878,7 +1785,6 @@ class FoundationPoseTrackerNode(Node):
         per_cam_results = {}
         tracker_key_to_state = {}
     
-        # ── FIX A: Run per-camera Cutie+ICP in parallel ──
         # Collect work items
         camera_work = []
         for view in views:
@@ -1962,8 +1868,14 @@ class FoundationPoseTrackerNode(Node):
     
         # Run cameras in parallel (or serially if only 1)
 
-        for view, states in camera_work:
-            per_cam_results.update(_run_one_camera(view, states))
+        if len(camera_work) >= 2:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(_run_one_camera, v, s) for v, s in camera_work]
+                for f in futures:
+                    per_cam_results.update(f.result())
+        else:
+            for view, states in camera_work:
+                per_cam_results.update(_run_one_camera(view, states))
     
         if not per_cam_results:
             self.get_logger().warn("Fused tracking: no camera produced a usable mask")
@@ -2035,7 +1947,7 @@ class FoundationPoseTrackerNode(Node):
                 self._fused_warmup_count[obj_id] = warmup_count + 1
                 continue
     
-            # ── Single-camera fallback (same as original but with warmup awareness) ──
+            # ── Single-camera fallback ──
             if len(survivors) == 1:
                 m = survivors[0]
                 cr = next(cr for cr in entries if cr["cam_id"] == m["cam_id"] and cr["state_idx"] == m["state_idx"])
@@ -2075,7 +1987,6 @@ class FoundationPoseTrackerNode(Node):
                     )
     
                 if motion_ok and not kalman_soft_reject:
-                    # ── FIX E: Median pose buffer ──
                     T_base_publish = T_base_candidate
                     buf_size = int(getattr(self.args, 'median_pose_buffer_size', 3))
                     if buf_size > 0:
@@ -2084,7 +1995,6 @@ class FoundationPoseTrackerNode(Node):
                         if buf.is_ready():
                             T_base_publish = buf.get_median()
     
-                    # ── FIX F: X-bias correction ──
                     x_bias = float(getattr(self.args, 'x_bias_correction_m', 0.0))
                     if abs(x_bias) > 1e-6:
                         T_base_publish = apply_x_bias_correction(T_base_publish, x_bias)
@@ -2128,7 +2038,6 @@ class FoundationPoseTrackerNode(Node):
                 state0.mesh_path, float(self.args.mesh_scale), num_points=5000,
             )
     
-            # ── FIX C: Distance-weighted cloud merge ──
             survivor_pcds = [m["pcd"] for m in survivors if m["pcd"] is not None]
             use_weighted = bool(getattr(self.args, 'use_weighted_cloud_merge', False))
     
@@ -2387,26 +2296,34 @@ class FoundationPoseTrackerNode(Node):
                 idx = cr["state_idx"]
                 rt_result = cr["rt_result"]
                 current_mask = np.asarray(cr["mask"]).astype(bool)
-    
+
                 if accepted:
-                    T_bc = self._resolve_T_base_cam(cam_id)
-                    T_cam_base = np.linalg.inv(T_bc).astype(np.float32)
+                    T_cam_base = self._resolve_T_cam_base(cam_id)
                     T_local = (T_cam_base @ T_base).astype(np.float32)
-                    state.T_object_camera = T_local.copy()
+                    state.T_object_camera = T_local
                     state.last_good_T = T_local.copy()
-                    state.last_good_mask = current_mask.copy()
+                    state.last_good_mask = current_mask
                     state.lost_count = 0
                     state.degraded_count = 0
                     state.mode = "track"
                     if state.kalman is not None:
-                        state.kalman.update(state.T_object_camera[:3, 3])
+                        state.kalman.update(T_local[:3, 3])
+
+                    # Publish T_base directly — skip cam→base roundtrip
+                    pose_msg = T_to_pose_stamped(T_base, frame_id="base", stamp=stamp)
+                    self._get_or_create_pose_base_pub(cam_id, state.object_id, idx).publish(pose_msg)
+                    self._get_or_create_pose_base_track_pub(cam_id, state.object_id, idx).publish(pose_msg)
                 else:
                     if state.last_good_T is not None:
                         state.T_object_camera = state.last_good_T.copy()
                     state.degraded_count += 1
                     state.mode = "degraded"
-    
-                state.recovery_mask = current_mask.copy()
+
+                    # Rejected path: must go through cam→base conversion
+                    self._publish_pose_base_track(cam_id, state.object_id, idx, state.T_object_camera, stamp)
+                    self._publish_pose_base(cam_id, state.object_id, idx, state.T_object_camera, stamp)
+
+                state.recovery_mask = current_mask
                 state.last_mask_area = int(current_mask.sum())
     
                 self._publish_pose_base_track(cam_id, state.object_id, idx, state.T_object_camera, stamp)
@@ -2422,13 +2339,13 @@ class FoundationPoseTrackerNode(Node):
                         "icp_rmse_mm": fused_metrics.get("rmse_mm", 0.0),
                     }
     
-        # ── Debug frame publishing (same as original) ──
+        # ── Debug frame publishing ──
         for view in views:
             cam_id = view.cam_id
             states = self.track_states.get(cam_id, [])
             if not states:
                 continue
-            pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=True)
+            pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
             track_debug = track_debug_by_cam.get(cam_id)
             frame = self._build_debug_frame(
                 cam_id=cam_id, stamp=stamp,
@@ -2461,208 +2378,7 @@ class FoundationPoseTrackerNode(Node):
         accepted_count = sum(1 for d in object_decisions.values() if d.get("accepted"))
         self.get_logger().info(f"FUSED TRACK total: {t_total:.0f}ms | {accepted_count} objects updated")
 
-    def _track_objects(
-        self,
-        view: Any,
-        states: list[ObjectTrackState],
-        stamp,
-    ) -> tuple[list[ObjectTrackState], Optional[dict]]:
-        """
-        Track objects using CuteVOS + ICP with graceful degradation.
-        
-        Flow:
-        1. TRACKING: Normal Cutie + ICP
-        2. DEGRADED: ICP failed but Cutie mask OK → keep last pose, try N frames
-        3. FAST_RECOVERY: Use last good mask + FP estimate_pose (skip SAM+DINO)
-        4. NEEDS_REINIT: Full pipeline (last resort)
-        """
-        cam_id = view.cam_id
-        rgb = view.rgb
-        depth = view.depth
-        K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
-
-        surviving: list[ObjectTrackState] = []
-        track_debug_info: Optional[dict] = None
-        
-        MAX_DEGRADED_FRAMES = 10  # Try this many frames before fast recovery
-        MAX_FAST_RECOVERY_ATTEMPTS = 2  # Try fast recovery this many times before full reinit
-
-        for i, state in enumerate(states):
-            tracker_key = f"{cam_id}_{state.object_id}_{i}"
-
-            # Initialize real-time tracker if not active
-            if tracker_key not in self.realtime_trackers:
-                try:
-                    cfg = RealtimeTrackerConfig(
-                        cutie_cfg=CutieConfig(max_internal_size=480),
-                        icp_cfg=ICPConfig(
-                            variant=ICPVariant.POINT_TO_POINT,
-                            max_correspondence_distance=0.05,
-                            voxel_size=0.002,
-                        ),
-                        min_icp_fitness=0.20,
-                        max_translation_per_frame=0.08,
-                        lost_frames_before_reinit=999,  
-                        verbose=False,
-                    )
-                    rt = RealtimeTracker(cfg)
-
-                    init_mask = state.recovery_mask
-                    if init_mask is None or init_mask.sum() < 100:
-                        self.get_logger().warn(f"[{cam_id}] No mask for RT init, requesting re-init")
-                        continue
-                    
-                    init_mask = np.asarray(init_mask).astype(bool)
-                    if init_mask.ndim != 2:
-                        self.get_logger().warn(f"[{cam_id}] Mask has wrong dims: {init_mask.shape}")
-                        continue
-
-                    rt.initialize(
-                        rgb=rgb,
-                        depth=depth,
-                        mask=init_mask,
-                        T_init=state.T_object_camera,
-                        K=K,
-                        mesh_path=state.mesh_path,
-                    )
-                    self.realtime_trackers[tracker_key] = rt
-                    
-                    # Store initial good state
-                    state.last_good_mask = init_mask.copy()
-                    state.last_good_T = state.T_object_camera.copy()
-                    
-                    self.get_logger().info(f"[{cam_id}] RT tracker initialized for {state.object_id}")
-                except Exception as e:
-                    self.get_logger().warn(f"[{cam_id}] RT init failed: {e}")
-                    continue
-
-            rt = self.realtime_trackers[tracker_key]
-
-            # === Try normal tracking ===
-            try:
-                result = rt.track(rgb, depth, K)
-            except Exception as e:
-                self.get_logger().warn(f"[{cam_id}] RT track exception: {e}")
-                result = None
-
-            # === Handle result ===
-            if result is not None and result.valid:
-                # SUCCESS - normal tracking
-                T_new = result.T_object_camera
-                if state.kalman is None:
-                    state.kalman = PoseKalmanFilter()
-                state.kalman.update(T_new[:3, 3])
-    
-                state.T_object_camera = T_new.copy()
-                state.recovery_mask = result.mask
-                state.last_good_mask = result.mask.copy()
-                state.last_good_T = T_new.copy()
-                state.lost_count = 0
-                state.degraded_count = 0
-                state.mode = "track"
-                surviving.append(state)
-
-                if track_debug_info is None:
-                    track_debug_info = {
-                        "mask": result.mask,
-                        "bbox_xyxy": result.bbox_xyxy,
-                        "object_id": state.object_id,
-                        "icp_fitness": result.icp_fitness,
-                        "icp_rmse_mm": result.icp_rmse * 1000,
-                    }
-
-                self._publish_pose_base_track(cam_id, state.object_id, i, T_new, stamp)
-                self._publish_pose_base(cam_id, state.object_id, i, T_new, stamp)
-                
-            elif result is not None and result.mask_area > 50:
-                # DEGRADED - Cutie mask exists but ICP failed
-                state.degraded_count += 1
-                if state.kalman is not None and state.kalman.is_initialized:
-                    predicted_pos = state.kalman.predict()
-                    speed = state.kalman.get_speed()
-                    
-                    # Update T_object_camera with predicted position
-                    if state.T_object_camera is not None:
-                        state.T_object_camera[:3, 3] = predicted_pos
-                    
-                    self.get_logger().info(
-                        f"[{cam_id}] DEGRADED [{state.degraded_count}/{MAX_DEGRADED_FRAMES}] "
-                        f"{state.object_id}: {result.message} | predicted speed={speed*1000:.1f}mm/frame"
-                    )
-                else:
-                    self.get_logger().info(
-                        f"[{cam_id}] DEGRADED [{state.degraded_count}/{MAX_DEGRADED_FRAMES}] "
-                        f"{state.object_id}: {result.message}"
-                    )
-                
-                if state.degraded_count < MAX_DEGRADED_FRAMES:
-                    # Keep last good pose, continue tracking
-                    state.mode = "degraded"
-                    state.recovery_mask = result.mask  # Update mask for Cutie continuity
-                    surviving.append(state)
-                    
-                    if track_debug_info is None:
-                        track_debug_info = {
-                            "mask": result.mask,
-                            "bbox_xyxy": result.bbox_xyxy,
-                            "object_id": state.object_id,
-                            "icp_fitness": result.icp_fitness,
-                            "icp_rmse_mm": result.icp_rmse * 1000 if result.icp_rmse != float('inf') else 0,
-                        }
-                else:
-                    # Try fast recovery
-                    self.get_logger().info(f"[{cam_id}] Attempting FAST RECOVERY for {state.object_id}")
-                    recovered = self._try_fast_recovery(view, state, result.mask, K)
-                    
-                    if recovered:
-                        state.degraded_count = 0
-                        state.lost_count = 0
-                        state.mode = "track"
-                        surviving.append(state)
-                        
-                        # Re-init Cutie with new mask
-                        del self.realtime_trackers[tracker_key]
-                        self.get_logger().info(f"[{cam_id}] FAST RECOVERY succeeded for {state.object_id}")
-                    else:
-                        state.lost_count += 1
-                        if state.lost_count < MAX_FAST_RECOVERY_ATTEMPTS:
-                            state.mode = "fast_recovery"
-                            surviving.append(state)
-                        else:
-                            self.get_logger().info(f"[{cam_id}] FAST RECOVERY failed, need full re-init for {state.object_id}")
-                            del self.realtime_trackers[tracker_key]
-                            # Don't add to surviving → triggers full re-init
-            else:
-                # LOST - No good mask
-                state.lost_count += 1
-                self.get_logger().warn(
-                    f"[{cam_id}] LOST [{state.lost_count}] {state.object_id}: "
-                    f"{result.message if result else 'No result'}"
-                )
-                
-                if state.lost_count < 3 and state.last_good_mask is not None:
-                    # Try fast recovery with last good mask
-                    self.get_logger().info(f"[{cam_id}] Attempting FAST RECOVERY (lost) for {state.object_id}")
-                    recovered = self._try_fast_recovery(view, state, state.last_good_mask, K)
-                    
-                    if recovered:
-                        state.lost_count = 0
-                        state.degraded_count = 0
-                        state.mode = "track"
-                        del self.realtime_trackers[tracker_key]
-                        surviving.append(state)
-                        self.get_logger().info(f"[{cam_id}] FAST RECOVERY (lost) succeeded")
-                    else:
-                        state.mode = "fast_recovery"
-                        surviving.append(state)
-                else:
-                    # Give up, need full re-init
-                    if tracker_key in self.realtime_trackers:
-                        del self.realtime_trackers[tracker_key]
-                    self.get_logger().info(f"[{cam_id}] Need full re-init for {state.object_id}")
-
-        return surviving, track_debug_info
-
+   
     def _check_chamfer_drift(self) -> None:
         """
         Compare mean Chamfer across cameras over recent inits.
@@ -2699,78 +2415,7 @@ class FoundationPoseTrackerNode(Node):
                     f"  Chamfer balance: {cid}={mean_ch*1000:.1f}mm vs "
                     f"{best_cam}={best_mean*1000:.1f}mm (ratio={ratio:.1f}x) — OK"
                 )
-    def _try_fast_recovery(
-        self,
-        view: Any,
-        state: ObjectTrackState,
-        mask: np.ndarray,
-        K: np.ndarray,
-    ) -> bool:
-        """
-        Try to recover pose using FoundationPose estimate_pose with existing mask.
-        If mask is too small, try SAM point prompts at last known position.
-        """
-        cam_id = view.cam_id
-        rgb = view.rgb
-        depth = view.depth
-        
-        # If mask is too small, try to get a better one with SAM point prompts
-        if mask.sum() < 100 and state.last_good_mask is not None:
-            # Get bbox from last good mask
-            ys, xs = np.where(state.last_good_mask)
-            if len(xs) > 0:
-                last_bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
-                sam_masks = self._fast_sam_at_position(rgb, last_bbox, cam_id)
-                if sam_masks:
-                    # Use the best mask from SAM
-                    mask = sam_masks[0].mask
-                    self.get_logger().info(f"[{cam_id}] Using SAM point prompt mask (area={mask.sum()})")
-        
-        tracker = self.fp_tracker_by_cam[cam_id]
-        
-        try:
-            t0 = time.time()
-            result = tracker.estimate_pose(
-                object_id=state.object_id,
-                mesh_path=state.mesh_path,
-                rgb=rgb,
-                depth=depth,
-                K=K,
-                mask=mask,
-            )
-            elapsed_ms = (time.time() - t0) * 1000
-            self.get_logger().info(f"[{cam_id}] Fast recovery FP took {elapsed_ms:.0f}ms")
-            
-            T_new = np.asarray(result.T_object_camera, dtype=np.float32).reshape(4, 4)
-            
-            # Sanity check the recovered pose (basic validity only)
-            ok_pose, reason = self._pose_reason(T_new, cam_id)
-            if not ok_pose:
-                self.get_logger().warn(f"[{cam_id}] Fast recovery pose rejected: {reason}")
-                return False
-            
-            # Log distance for debugging, but DON'T reject based on it
-            # Cutie tracked the mask through the motion — trust it!
-            if state.last_good_T is not None:
-                delta = np.linalg.norm(T_new[:3, 3] - state.last_good_T[:3, 3])
-                self.get_logger().info(f"[{cam_id}] Fast recovery: object moved {delta*1000:.0f}mm from last good pose")
-            
-            # Success!
-            state.T_object_camera = T_new.copy()
-            state.last_good_T = T_new.copy()
-            state.recovery_mask = mask.copy()
-            state.last_good_mask = mask.copy()
-            
-            # Re-initialize Kalman with new position
-            if state.kalman is not None:
-                state.kalman.initialize(T_new[:3, 3])
-            
-            return True
-            
-        except Exception as e:
-            self.get_logger().warn(f"[{cam_id}] Fast recovery failed: {e}")
-            return False
-
+    
 
 
     def _process_multicam_init(self, views: list, stamp) -> None:
@@ -2930,7 +2575,6 @@ class FoundationPoseTrackerNode(Node):
                 tracker = self.fp_tracker_by_cam[cam_id]
 
                 # ─── Single FP call ───
-                torch.cuda.empty_cache()
                 try:
                     t_fp = time.time()
                     result = tracker.estimate_pose(
@@ -2939,7 +2583,7 @@ class FoundationPoseTrackerNode(Node):
                         rgb=view.rgb,
                         depth=view.depth,
                         K=K_cam,
-                        mask=det.mask,
+                        mask=pad_mask_for_fp(det.mask, pad_px=5),
                     )
                     fp_ms = (time.time() - t_fp) * 1000
                 except Exception as e:
@@ -3165,7 +2809,7 @@ class FoundationPoseTrackerNode(Node):
                     continue
 
                 T_bc = self._resolve_T_base_cam(cam_id)
-                T_cam_base = np.linalg.inv(T_bc).astype(np.float32)
+                T_cam_base = self._resolve_T_cam_base(cam_id)
                 T_local = T_cam_base @ T_base_canonical
 
                 ok_local, reason_local = self._pose_reason(T_local, cam_id)
@@ -3215,7 +2859,7 @@ class FoundationPoseTrackerNode(Node):
         for cam_id, states in new_states_by_cam.items():
             if not states:
                 continue
-            pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=True)
+            pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
             frame = self._build_debug_frame(
                 cam_id=cam_id, stamp=stamp,
                 update_sam=False, update_dino=False,
@@ -3240,7 +2884,6 @@ class FoundationPoseTrackerNode(Node):
         total_inited = sum(len(s) for s in new_states_by_cam.values())
         print(f"[TIMING] ========== MULTICAM INIT TOTAL: {t_total:.0f}ms | {total_inited} objects ==========\n")
 
-
     def _reset_tracking_state_for_reinit(self, fused_detections):
         """
         Call this in _process_multicam_init after creating new states.
@@ -3257,167 +2900,10 @@ class FoundationPoseTrackerNode(Node):
             if obj_id in self._fused_track_memory:
                 del self._fused_track_memory[obj_id]
 
-    def _process_single_view(self, view: Any) -> None:
-        t_start = time.time()
-        cam_id = view.cam_id
-
-        if view.rgb is None or view.depth is None:
-            return
-        if view.rgb.shape[:2] != view.depth.shape[:2]:
-            return
-
-        stamp = self.get_clock().now().to_msg()
-
-        rgb = view.rgb
-        depth = view.depth
-        states = self.track_states[cam_id]
-
-        # === TRACKING PATH ===
-        if self.args.run_mode == "track" and states and all(
-            s.mode in ("track", "track/rt", "degraded", "fast_recovery") or s.mode.startswith("recover") 
-            for s in states
-        ):
-            t1 = time.time()
-            surviving, track_debug = self._track_objects(view, states, stamp)
-            print(f"[TIMING] _track_objects: {(time.time()-t1)*1000:.0f}ms")
-
-            if surviving:
-                self.track_states[cam_id] = surviving
-
-                pose_items = self._states_to_pose_item_msgs(
-                    cam_id,
-                    surviving,
-                    include_masks=True,
-                )
-                frame = self._build_debug_frame(
-                    cam_id=cam_id,
-                    stamp=stamp,
-                    update_sam=False,
-                    update_dino=False,
-                    sam_candidates=[],
-                    dino_candidates=[],
-                    pose_items=pose_items,
-                    track_debug=track_debug,
-                )
-                self.pub_debug_frame[cam_id].publish(frame)
-                print(f"[TIMING] TRACK PATH total: {(time.time() - t_start)*1000:.0f}ms")
-                return
-            else:
-                self.get_logger().info(f"[{cam_id}] TRACK -> REINIT")
-
-        # === INIT PATH ===
-        if self.args.mask_source != "sam":
-            return
-
-        print(f"\n[TIMING] ========== INIT PATH START ==========")
-        
-        # --- SAM ---
-        t_sam = time.time()
-        masks = self._generate_and_filter_masks(rgb, cam_id)
-        t_sam_elapsed = (time.time() - t_sam) * 1000
-        print(f"[TIMING] SAM (_generate_and_filter_masks): {t_sam_elapsed:.0f}ms -> {len(masks)} masks")
-
-        if not masks:
-            self.track_states[cam_id] = []
-            frame = self._build_debug_frame(
-                cam_id=cam_id,
-                stamp=stamp,
-                update_sam=True,
-                update_dino=True,
-                sam_candidates=[],
-                dino_candidates=[],
-                pose_items=[],
-            )
-            self.pub_debug_frame[cam_id].publish(frame)
-            print(f"[TIMING] INIT PATH total (no masks): {(time.time() - t_start)*1000:.0f}ms")
-            return
-
-        # --- DINO ---
-        t_dino = time.time()
-        ranked = self._classify_masks_batched(rgb, masks)
-        t_dino_elapsed = (time.time() - t_dino) * 1000
-        print(f"[TIMING] DINO (_classify_masks_batched): {t_dino_elapsed:.0f}ms -> {len(ranked)} ranked")
-
-        # --- Select candidates ---
-        t_select = time.time()
-        selected = self._select_top_candidates(ranked, depth)
-        t_select_elapsed = (time.time() - t_select) * 1000
-        print(f"[TIMING] Select candidates: {t_select_elapsed:.0f}ms -> {len(selected)} selected")
-
-        # --- Build debug messages ---
-        t_msgs = time.time()
-        sam_msgs = self._sam_candidates_to_msgs(masks)
-        dino_msgs = self._dino_ranked_to_msgs(ranked)
-        t_msgs_elapsed = (time.time() - t_msgs) * 1000
-        print(f"[TIMING] Build debug msgs: {t_msgs_elapsed:.0f}ms")
-
-        if not selected:
-            self.track_states[cam_id] = []
-            frame = self._build_debug_frame(
-                cam_id=cam_id,
-                stamp=stamp,
-                update_sam=True,
-                update_dino=True,
-                sam_candidates=sam_msgs,
-                dino_candidates=dino_msgs,
-                pose_items=[],
-            )
-            self.pub_debug_frame[cam_id].publish(frame)
-            print(f"[TIMING] INIT PATH total (no selected): {(time.time() - t_start)*1000:.0f}ms")
-            return
-
-        # --- FoundationPose init ---
-        t_fp = time.time()
-        new_states = self._initialize_objects(view, selected, stamp)
-        t_fp_elapsed = (time.time() - t_fp) * 1000
-        print(f"[TIMING] FP (_initialize_objects): {t_fp_elapsed:.0f}ms -> {len(new_states)} initialized")
-
-        # --- Cleanup ---
-        t_cleanup = time.time()
-        torch.cuda.empty_cache()
-        new_states = nms_by_position(new_states, position_threshold=0.03)
-        t_cleanup_elapsed = (time.time() - t_cleanup) * 1000
-        print(f"[TIMING] Cleanup (cuda cache + NMS): {t_cleanup_elapsed:.0f}ms")
-
-        if self.args.run_mode == "track":
-            self.track_states[cam_id] = new_states
-        else:
-            self.track_states[cam_id] = []
-
-        pose_items = self._states_to_pose_item_msgs(
-            cam_id,
-            new_states,
-            include_masks=True,
-        )
-
-        frame = self._build_debug_frame(
-            cam_id=cam_id,
-            stamp=stamp,
-            update_sam=True,
-            update_dino=True,
-            sam_candidates=sam_msgs,
-            dino_candidates=dino_msgs,
-            pose_items=pose_items,
-        )
-        self.pub_debug_frame[cam_id].publish(frame)
-
-        t_total = (time.time() - t_start) * 1000
-        print(f"[TIMING] ========== INIT PATH TOTAL: {t_total:.0f}ms ==========\n")
-
-        if new_states:
-            self.get_logger().info(
-                f"[{cam_id}] INIT done | masks={len(masks)} ranked={len(ranked)} "
-                f"selected={len(selected)} initialized={len(new_states)}"
-            )
-
-   
-
     def _tick(self) -> None:
         """
         FIXED: If ANY camera has tracked objects, run fused tracking.
         Only fall to init if NO camera has states at all.
-        Previously: required ALL cameras to have states → single-cam detection
-        triggered full re-init.
         """
         if self.busy:
             return
@@ -3463,54 +2949,6 @@ class FoundationPoseTrackerNode(Node):
                         self.track_states[view.cam_id] = []
         finally:
             self.busy = False
-
-
-    def _get_or_create_mesh_centroid_pub(self, object_id: str) -> Any:
-        if not hasattr(self, "pub_mesh_centroid"):
-            self.pub_mesh_centroid = {}
-
-        if object_id not in self.pub_mesh_centroid:
-            self.pub_mesh_centroid[object_id] = self.create_publisher(
-                Vector3Stamped,
-                f"/perception/fp/mesh_centroid_offset/{object_id}",
-                LATCHED_QOS,
-            )
-        return self.pub_mesh_centroid[object_id]
-
-    def _compute_mesh_centroid_offset(self, mesh_path: str) -> np.ndarray:
-        """
-        Returns centroid position expressed in the raw mesh frame.
-        Output: np.array([x, y, z], dtype=np.float32)
-
-        Assumes mesh units still need your usual mesh_scale.
-        """
-        mesh = trimesh.load(mesh_path, force="mesh")
-        centroid = np.asarray(mesh.centroid, dtype=np.float32)
-
-        # Apply same scaling convention as FoundationPose uses
-        centroid = centroid * float(self.args.mesh_scale)
-        return centroid
-
-    def _publish_mesh_centroid_offset(
-        self,
-        object_id: str,
-        mesh_path: str,
-        stamp,
-    ) -> None:
-        """
-        Publishes the offset from mesh origin -> object centroid.
-        """
-        offset = self._compute_mesh_centroid_offset(mesh_path)
-
-        msg = Vector3Stamped()
-        msg.header.stamp = stamp
-        msg.header.frame_id = f"{object_id}_mesh_frame"   # raw CAD mesh frame
-        msg.vector.x = float(offset[0])
-        msg.vector.y = float(offset[1])
-        msg.vector.z = float(offset[2])
-
-        pub = self._get_or_create_mesh_centroid_pub(object_id)
-        pub.publish(msg)
 
 
 def parse_args() -> argparse.Namespace:

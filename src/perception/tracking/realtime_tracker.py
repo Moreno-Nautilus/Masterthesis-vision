@@ -322,7 +322,7 @@ class RealtimeTracker:
         t_new = T_new[:3, 3]
         translation = np.linalg.norm(t_new - t_prev)
         
-        print(f"[Motion DEBUG] t_prev={t_prev}, t_new={t_new}")
+        # print(f"[Motion DEBUG] t_prev={t_prev}, t_new={t_new}")
         #print(f"[Motion DEBUG] delta={translation*1000:.1f}mm, threshold={self.cfg.max_translation_per_frame*1000:.1f}mm")
         
         if translation > self.cfg.max_translation_per_frame:

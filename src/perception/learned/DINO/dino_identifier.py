@@ -121,40 +121,6 @@ class DINOIdentifier:
 
         return feat.squeeze(0).detach().cpu().numpy()
 
-    # def build_reference_bank_from_folder(self) -> None:
-    #     root = Path(self.cfg.reference_dir)
-    #     if not root.exists():
-    #         raise FileNotFoundError(f"Reference directory does not exist: {root}")
-
-    #     bank: list[ReferenceEmbedding] = []
-
-    #     for object_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-    #         object_id = object_dir.name
-    #         for img_path in sorted(object_dir.iterdir()):
-    #             if img_path.suffix.lower() not in self.cfg.allowed_exts:
-    #                 continue
-
-    #             bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-    #             if bgr is None:
-    #                 continue
-    #             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    #             emb = self.embed_image(rgb)
-    #             bank.append(
-    #                 ReferenceEmbedding(
-    #                     object_id=object_id,
-    #                     image_path=str(img_path),
-    #                     embedding=emb,
-    #                 )
-    #             )
-
-    #     if not bank:
-    #         raise RuntimeError(f"No valid reference images found in {root}")
-
-    #     self.reference_bank = bank
-    #     self.reference_matrix = np.stack([r.embedding for r in bank], axis=0)
-    #     self.reference_object_ids = [r.object_id for r in bank]
-
     def build_reference_bank_from_folder(self, cache_path: str | None = None) -> None:
         root = Path(self.cfg.reference_dir)
         if not root.exists():
@@ -288,37 +254,6 @@ class DINOIdentifier:
             scores_by_object=agg,
         )
 
-    # def classify_embedding(self, embedding: np.ndarray) -> DINOResult:
-    #     if self.reference_matrix is None or len(self.reference_bank) == 0:
-    #         raise RuntimeError("Reference bank is empty. Build or set it first.")
-
-    #     embedding = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
-
-    #     if self.cfg.normalize_embeddings:
-    #         norm = np.linalg.norm(embedding, axis=1, keepdims=True) + 1e-12
-    #         embedding = embedding / norm
-
-    #     sims = (embedding @ self.reference_matrix.T).reshape(-1)
-
-    #     scores_by_object: dict[str, list[float]] = {}
-    #     for sim, obj_id in zip(sims, self.reference_object_ids):
-    #         scores_by_object.setdefault(obj_id, []).append(float(sim))
-
-    #     # aggregate by max similarity per object
-    #     agg = {k: max(v) for k, v in scores_by_object.items()}
-    #     best_obj = max(agg, key=agg.get)
-    #     best_score = agg[best_obj]
-
-    #     return DINOResult(
-    #         object_id=best_obj,
-    #         score=float(best_score),
-    #         embedding=embedding.squeeze(0),
-    #         scores_by_object=agg,
-    #     )
-
-    # def classify_crop(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> DINOResult:
-    #     emb = self.embed_image(rgb, mask=mask)
-    #     return self.classify_embedding(emb)
 
     def classify_crop(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> DINOResult:
         # Apply mask if enabled

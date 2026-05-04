@@ -52,7 +52,7 @@ class ICPConfig:
     voxel_size: Optional[float] = 0.002  # 2mm
     
     # Outlier removal
-    remove_statistical_outliers: bool = True
+    remove_statistical_outliers: bool = False
     nb_neighbors: int = 20
     std_ratio: float = 2.0
 
@@ -141,30 +141,7 @@ class ICPRefiner:
         print(f"[ICPRefiner] Model cloud set: {len(self._model_cloud.points)} pts "
               f"-> {len(self._model_cloud_down.points)} pts (downsampled)")
     
-    # def set_model_from_mesh(self, mesh_path: str, num_points: int = 5000, scale: float = 0.01) -> None:
-    #     """Load model cloud by sampling points from mesh."""
-    #     self._lazy_import()
-    #     o3d = self._o3d
-        
-    #     mesh = o3d.io.read_triangle_mesh(mesh_path)
-        
-    #     # Center the mesh (same as FP does)
-    #     mesh.translate(-mesh.get_center())
-        
-    #     # Scale from mm to meters (same as FP)
-    #     mesh.scale(scale, center=(0, 0, 0))
-        
-    #     mesh.compute_vertex_normals()
-        
-    #     # Sample points
-    #     cloud = mesh.sample_points_uniformly(number_of_points=num_points)
-        
-    #     vertices = np.asarray(cloud.points, dtype=np.float32)
-    #     normals = np.asarray(cloud.normals, dtype=np.float32)
-    #     colors = np.asarray(cloud.colors, dtype=np.float32) if cloud.has_colors() else None
-        
-    #     self.set_model_cloud(vertices, colors, normals)
-
+   
     def set_model_from_mesh(self, mesh_path: str, num_points: int = 5000, scale: float = 0.01) -> None:
         """Load model cloud by sampling points from mesh."""
         self._lazy_import()
@@ -194,140 +171,58 @@ class ICPRefiner:
         
         self.set_model_cloud(vertices, colors, normals)
 
-    # CLAUDE DEPTH TO CLOUD  
-    # def _depth_to_cloud(
-    #     self,
-    #     depth: np.ndarray,
-    #     rgb: np.ndarray,
-    #     mask: np.ndarray,
-    #     K: np.ndarray,
-    # ) -> "open3d.geometry.PointCloud":
-    #     """Convert masked depth image to colored point cloud."""
-    #     o3d = self._o3d
-        
-    #     H, W = depth.shape
-        
-    #     # Create pixel coordinate grid
-    #     u = np.arange(W)
-    #     v = np.arange(H)
-    #     u, v = np.meshgrid(u, v)
-        
-    #     # Apply mask
-    #     mask_bool = mask.astype(bool)
-    #     z = depth[mask_bool]
-    #     u = u[mask_bool]
-    #     v = v[mask_bool]
-        
-    #     # Filter invalid depth
-    #     valid = (z > 0.01) & (z < 2.0) & np.isfinite(z)
-    #     z = z[valid]
-    #     u = u[valid]
-    #     v = v[valid]
-        
-    #     if len(z) < 10:
-    #         # Not enough points
-    #         return o3d.geometry.PointCloud()
-        
-    #     # Unproject to 3D
-    #     fx, fy = K[0, 0], K[1, 1]
-    #     cx, cy = K[0, 2], K[1, 2]
-        
-    #     x = (u - cx) * z / fx
-    #     y = (v - cy) * z / fy
-        
-    #     points = np.stack([x, y, z], axis=1).astype(np.float64)
-        
-    #     # Get colors
-    #     rgb_masked = rgb[mask_bool][valid]
-    #     colors = rgb_masked.astype(np.float64) / 255.0
-        
-    #     # Create cloud
-    #     cloud = o3d.geometry.PointCloud()
-    #     cloud.points = o3d.utility.Vector3dVector(points)
-    #     cloud.colors = o3d.utility.Vector3dVector(colors)
-        
-    #     # Estimate normals
-    #     cloud.estimate_normals(
-    #         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
-    #     )
-        
-    #     # Optional: outlier removal
-    #     if self.cfg.remove_statistical_outliers:
-    #         cloud, _ = cloud.remove_statistical_outlier(
-    #             nb_neighbors=self.cfg.nb_neighbors,
-    #             std_ratio=self.cfg.std_ratio,
-    #         )
-            
-    #     # Optional: downsample
-    #     if self.cfg.voxel_size is not None:
-    #         cloud = cloud.voxel_down_sample(self.cfg.voxel_size)
-            
-    #     return cloud
-    # GPT DEPTH TO CLOUD
-    def _depth_to_cloud(
-        self,
-        depth: np.ndarray,
-        rgb: np.ndarray,
-        mask: np.ndarray,
-        K: np.ndarray,
-    ) -> "open3d.geometry.PointCloud":
+    def _depth_to_cloud(self, depth, rgb, mask, K):
         o3d = self._o3d
-
         H, W = depth.shape
 
-        u = np.arange(W)
-        v = np.arange(H)
-        u, v = np.meshgrid(u, v)
+        # Cache meshgrid per image size
+        if not hasattr(self, '_grid_cache') or self._grid_cache_shape != (H, W):
+            uu = np.arange(W)
+            vv = np.arange(H)
+            self._grid_u, self._grid_v = np.meshgrid(uu, vv)
+            self._grid_cache_shape = (H, W)
 
         mask_bool = mask.astype(bool)
         z = depth[mask_bool]
-        u = u[mask_bool]
-        v = v[mask_bool]
+        u = self._grid_u[mask_bool]
+        v = self._grid_v[mask_bool]
 
         valid = (z > 0.01) & (z < 2.0) & np.isfinite(z)
-        z = z[valid]
-        u = u[valid]
-        v = v[valid]
+        z, u, v = z[valid], u[valid], v[valid]
 
         if len(z) < 10:
             return o3d.geometry.PointCloud()
 
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
-
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        points = np.stack([x, y, z], axis=1).astype(np.float64)
-
-        rgb_masked = rgb[mask_bool][valid]
-        colors = rgb_masked.astype(np.float64) / 255.0
+        points = np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], axis=1).astype(np.float64)
 
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(points)
-        cloud.colors = o3d.utility.Vector3dVector(colors)
 
-        # 1) clean first
+        # Only add colors if needed (colored ICP)
+        need_colors = self.cfg.variant == ICPVariant.COLORED
+        if need_colors:
+            rgb_masked = rgb[mask_bool][valid]
+            cloud.colors = o3d.utility.Vector3dVector(rgb_masked.astype(np.float64) / 255.0)
+
+        # Skip outlier removal during tracking (Cutie mask is clean)
         if self.cfg.remove_statistical_outliers:
             cloud, _ = cloud.remove_statistical_outlier(
-                nb_neighbors=self.cfg.nb_neighbors,
-                std_ratio=self.cfg.std_ratio,
+                nb_neighbors=self.cfg.nb_neighbors, std_ratio=self.cfg.std_ratio,
             )
 
         if self.cfg.voxel_size is not None:
             cloud = cloud.voxel_down_sample(self.cfg.voxel_size)
 
-        # 2) THEN estimate normals on the final cloud
-        if len(cloud.points) >= 10:
+        # Only estimate normals if ICP variant needs them
+        need_normals = self.cfg.variant in (ICPVariant.POINT_TO_PLANE, ICPVariant.COLORED, ICPVariant.GENERALIZED)
+        if need_normals and len(cloud.points) >= 10:
             normal_radius = max(0.01, 3.0 * (self.cfg.voxel_size or 0.002))
             cloud.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                    radius=normal_radius,
-                    max_nn=30,
-                )
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=30)
             )
-            cloud.orient_normals_towards_camera_location(
-                camera_location=np.array([0.0, 0.0, 0.0])
-            )
+            cloud.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
 
         return cloud
 
@@ -364,14 +259,22 @@ class ICPRefiner:
             model_transformed = o3d.geometry.PointCloud(self._model_cloud_down)
             model_transformed.transform(T_init.astype(np.float64))
 
-            model_transformed.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+           # Only compute normals if the ICP variant actually uses them
+            need_normals = self.cfg.variant in (
+                ICPVariant.POINT_TO_PLANE,
+                ICPVariant.COLORED,
+                ICPVariant.GENERALIZED,
             )
-            model_transformed.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
-
-            # Orient observed normals toward camera (camera is at origin in camera frame)
-            observed_cloud.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
-
+            if need_normals:
+                model_transformed.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+                )
+                model_transformed.orient_normals_towards_camera_location(
+                    camera_location=np.array([0.0, 0.0, 0.0])
+                )
+                observed_cloud.orient_normals_towards_camera_location(
+                    camera_location=np.array([0.0, 0.0, 0.0])
+                )
             # Build convergence criteria
             criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
                 max_iteration=self.cfg.max_iterations,
@@ -439,79 +342,3 @@ class ICPRefiner:
                 elapsed_ms=elapsed_ms,
             )
     
-# =============================================================================
-# FilterReg fallback (more robust, ~25ms)
-# =============================================================================
-
-@dataclass
-class FilterRegConfig:
-    """Configuration for FilterReg registration."""
-    max_iterations: int = 50
-    tol: float = 1e-5
-    sigma2: Optional[float] = None  # Noise variance, None = estimate
-    w: float = 0.0  # Outlier weight [0, 1]
-
-
-class FilterRegRefiner:
-    """
-    FilterReg: Gaussian mixture model based registration.
-    More robust to outliers and partial overlap than ICP.
-    
-    Install: pip install probreg
-    """
-    
-    def __init__(self, cfg: Optional[FilterRegConfig] = None):
-        self.cfg = cfg or FilterRegConfig()
-        self._probreg = None
-        self._model_cloud = None
-        
-    def _lazy_import(self):
-        if self._probreg is not None:
-            return
-        try:
-            import probreg
-            self._probreg = probreg
-        except ImportError:
-            raise ImportError("probreg not installed. Run: pip install probreg")
-            
-    # Similar interface to ICPRefiner...
-    # Implementation would follow same pattern
-
-
-# =============================================================================
-# TEASER++ fallback (global registration, ~30ms)
-# =============================================================================
-
-@dataclass  
-class TeaserConfig:
-    """Configuration for TEASER++ registration."""
-    noise_bound: float = 0.01  # 1cm
-    cbar2: float = 1.0
-    rotation_gnc_factor: float = 1.4
-    rotation_max_iterations: int = 100
-    rotation_cost_threshold: float = 1e-6
-
-
-class TeaserRefiner:
-    """
-    TEASER++: Certifiably robust point cloud registration.
-    Handles up to 99% outliers. Good for re-initialization.
-    
-    Install: pip install teaserpp-python
-    """
-    
-    def __init__(self, cfg: Optional[TeaserConfig] = None):
-        self.cfg = cfg or TeaserConfig()
-        self._teaser = None
-        self._model_cloud = None
-        
-    def _lazy_import(self):
-        if self._teaser is not None:
-            return
-        try:
-            import teaserpp_python
-            self._teaser = teaserpp_python
-        except ImportError:
-            raise ImportError("TEASER++ not installed. Run: pip install teaserpp-python")
-            
-   

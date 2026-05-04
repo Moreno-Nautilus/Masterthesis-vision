@@ -769,43 +769,24 @@ def run_multicam_fusion(
         List of FusedDetection, each ready for FoundationPose
     """
     cfg = cfg or FusionConfig()
-    t_start = time.time()
 
-    # Step 1: Build per-camera detections with clouds
-    t0 = time.time()
     dets_by_cam = build_per_cam_detections(
-        selections_by_cam=selections_by_cam,
-        views_by_cam=views_by_cam,
-        T_base_cam_map=T_base_cam_map,
-        cfg=cfg,
+        selections_by_cam, views_by_cam, T_base_cam_map, cfg,
     )
-    print(f"[FUSION] Backprojection: {(time.time()-t0)*1000:.0f}ms")
 
-    # Log detection counts
-    for cam_id, dets in dets_by_cam.items():
-        labels = [d.object_id for d in dets]
-        print(f"[FUSION] {cam_id}: {len(dets)} detections -> {labels}")
-
-    # Step 2: Match across cameras
-    t0 = time.time()
     matched_groups = match_detections_across_cameras(
-        dets_by_cam,
-        max_centroid_distance=cfg.max_centroid_distance,
-    )
-    print(
-        f"[FUSION] Matching: {(time.time()-t0)*1000:.0f}ms -> "
-        f"{len(matched_groups)} groups "
-        f"({sum(1 for g in matched_groups if len(g) > 1)} multi-cam)"
+        dets_by_cam, max_centroid_distance=cfg.max_centroid_distance,
     )
 
-    # Step 3: Fuse each matched group
-    t0 = time.time()
-    fused_results: list[FusedDetection] = []
+    results = []
     for group in matched_groups:
-        fused = fuse_matched_group(group, cfg=cfg)
-        if fused is not None:
-            fused_results.append(fused)
-    print(f"[FUSION] Cloud fusion + ICP: {(time.time()-t0)*1000:.0f}ms -> {len(fused_results)} fused objects")
-
-    print(f"[FUSION] Total fusion pipeline: {(time.time()-t_start)*1000:.0f}ms")
-    return fused_results
+        if not group:
+            continue
+        ref_idx = max(range(len(group)), key=lambda i: group[i].mask_area)
+        results.append(FusedDetection(
+            object_id=group[ref_idx].object_id,
+            detections=group,
+            fused_cloud_base=np.zeros((0, 3), dtype=np.float32),
+            ref_cam_idx=ref_idx,
+        ))
+    return results
