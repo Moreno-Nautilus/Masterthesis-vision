@@ -776,6 +776,10 @@ class FoundationPoseTrackerNode(Node):
                 device=args.device,
                 reference_dir=args.reference_dir,
                 use_masked_background=False,
+                embedding_mode=args.dino_embedding_mode,
+                gem_p=float(args.dino_gem_p),
+                similarity=args.dino_similarity,
+                joint_score_alpha=float(args.dino_joint_score_alpha),
             )
         )
         self.get_logger().info("Building DINO reference bank...")
@@ -1549,7 +1553,15 @@ class FoundationPoseTrackerNode(Node):
             pair_gap = float(top1_score - top2_score)
             geometric_resolved = False
 
-            if pair_is_cf_cs and pair_gap < 0.15:
+            # B2: hardcoded cooling_f vs cooling_screw aspect rule. Disable
+            # this when MUSE-style features are good enough to discriminate
+            # on their own (--dino-embedding-mode concat is the typical case
+            # where this rule becomes redundant or actively wrong on
+            # generalised objects).
+            if (
+                self.args.use_aspect_cf_cs_rule
+                and pair_is_cf_cs and pair_gap < 0.15
+            ):
                 bw_tmp, bh_tmp = bbox_size_xyxy(cand.bbox_xyxy)
                 aspect = max(bw_tmp, bh_tmp) / (min(bw_tmp, bh_tmp) + 1e-6)
                 if aspect > 2.2:
@@ -3441,6 +3453,23 @@ def parse_args() -> argparse.Namespace:
     # geometry-best seed. Off by default — only useful when the grid runs.
     p.add_argument("--fp-refine-after-grid", action="store_true")
     p.add_argument("--fp-refine-iterations", type=int, default=1)
+
+    # B2 / Bundle 5: MUSE-style DINO upgrades. Defaults preserve original
+    # CLS-token + cosine behaviour.
+    #   --dino-embedding-mode concat enables MUSE-style CLS+GeM-patch
+    #   --dino-similarity tanimoto switches off cosine
+    #   --dino-joint-score-alpha > 0 blends raw scores with relative ranking
+    p.add_argument("--dino-embedding-mode", choices=["cls", "patch_gem", "concat"],
+                   default="cls")
+    p.add_argument("--dino-gem-p", type=float, default=3.0)
+    p.add_argument("--dino-similarity", choices=["cosine", "tanimoto"], default="cosine")
+    p.add_argument("--dino-joint-score-alpha", type=float, default=0.0)
+    # B2: hardcoded cooling_f vs cooling_screw aspect rule. On for back-compat;
+    # disable once MUSE features make the rule redundant (and dangerous if
+    # extended to new objects).
+    p.add_argument("--use-aspect-cf-cs-rule", action="store_true", default=True)
+    p.add_argument("--no-aspect-cf-cs-rule", dest="use_aspect_cf_cs_rule",
+                   action="store_false")
 
     return p.parse_args()
 

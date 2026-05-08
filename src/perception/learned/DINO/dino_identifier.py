@@ -22,6 +22,26 @@ class DINOIdentifierConfig:
     reference_dir: str = "Data/reference_crops"
     allowed_exts: tuple[str, ...] = (".png", ".jpg", ".jpeg")
 
+    # Bundle 5 / MUSE-style options. All defaults preserve the original
+    # CLS-token + cosine behaviour.
+    #
+    # embedding_mode:
+    #   "cls"        — original DINOv2 CLS token (unchanged behaviour).
+    #   "patch_gem"  — Generalised-Mean-pooled patch tokens (more spatial
+    #                  detail; better at distinguishing similar objects).
+    #   "concat"     — concatenate L2-normalised CLS + GeM patch features.
+    #                  Closest to the MUSE descriptor.
+    embedding_mode: str = "cls"
+    gem_p: float = 3.0  # GeM pooling exponent. Higher = closer to max-pool.
+    # similarity:
+    #   "cosine"   — original.
+    #   "tanimoto" — generalised Tanimoto / Jaccard for normalised vectors.
+    #                Penalises descriptors that share magnitude only.
+    similarity: str = "cosine"
+    # Joint absolute + relative score: blend raw cosine with how much the
+    # top-1 dominates the rest of the bank. 0 = pure raw score (default).
+    joint_score_alpha: float = 0.0
+
 
 @dataclass
 class ReferenceEmbedding:
@@ -100,22 +120,52 @@ class DINOIdentifier:
         x = torch.from_numpy(x).unsqueeze(0).to(self.device)
         return x
 
+    @staticmethod
+    def _gem_pool(patch_tokens: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
+        """Generalised Mean pooling over patch tokens.
+
+        patch_tokens: (B, N_patches, D). Returns (B, D).
+        """
+        x = patch_tokens.clamp(min=eps)
+        return x.pow(p).mean(dim=1).pow(1.0 / p)
+
     def embed_image(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         rgb = self._ensure_rgb(rgb)
         rgb = self._apply_mask(rgb, mask)
 
         x = self._preprocess(rgb)
 
-        with torch.inference_mode():
-            feat = self.model(x)
-
-        if isinstance(feat, dict):
-            if "x_norm_clstoken" in feat:
+        mode = self.cfg.embedding_mode
+        if mode == "cls":
+            # Original path — single forward, take CLS.
+            with torch.inference_mode():
+                feat = self.model(x)
+            if isinstance(feat, dict):
+                if "x_norm_clstoken" not in feat:
+                    raise RuntimeError(f"Unexpected dict output keys: {list(feat.keys())}")
                 feat = feat["x_norm_clstoken"]
-            else:
-                raise RuntimeError(f"Unexpected dict output keys: {list(feat.keys())}")
+            feat = feat.reshape(1, -1)
+        elif mode in ("patch_gem", "concat"):
+            # Need patch tokens — use forward_features which returns the dict.
+            with torch.inference_mode():
+                feats = self.model.forward_features(x)
+            if not isinstance(feats, dict):
+                raise RuntimeError(
+                    f"forward_features returned {type(feats)}; expected dict for patch tokens"
+                )
+            cls_tok = feats["x_norm_clstoken"].reshape(1, -1)
+            patch_toks = feats["x_norm_patchtokens"]  # (1, N, D)
+            gem = self._gem_pool(patch_toks, p=float(self.cfg.gem_p)).reshape(1, -1)
+            if mode == "patch_gem":
+                feat = gem
+            else:  # concat
+                # L2-normalise each component before concat so neither dominates.
+                cls_n = F.normalize(cls_tok, dim=1)
+                gem_n = F.normalize(gem, dim=1)
+                feat = torch.cat([cls_n, gem_n], dim=1)
+        else:
+            raise ValueError(f"Unknown embedding_mode: {self.cfg.embedding_mode!r}")
 
-        feat = feat.reshape(1, -1)
         if self.cfg.normalize_embeddings:
             feat = F.normalize(feat, dim=1)
 
@@ -126,9 +176,12 @@ class DINOIdentifier:
         if not root.exists():
             raise FileNotFoundError(f"Reference directory does not exist: {root}")
 
-        # Default cache path next to reference dir
+        # Default cache path next to reference dir. Tag with model + mode so
+        # switching DINO model or embedding mode doesn't reuse a stale cache
+        # of incompatible dimensionality.
         if cache_path is None:
-            cache_path = str(root / "_embedding_cache.npz")
+            tag = f"{self.cfg.model_name}__{self.cfg.embedding_mode}"
+            cache_path = str(root / f"_embedding_cache__{tag}.npz")
 
         # Try to load from cache
         if Path(cache_path).exists():
@@ -221,7 +274,37 @@ class DINOIdentifier:
         self.reference_object_ids = [r.object_id for r in refs]
         
 
-    def classify_embedding(self, embedding: np.ndarray) -> DINOResult:
+    @staticmethod
+    def _pairwise_similarity(query: np.ndarray, bank: np.ndarray, kind: str) -> np.ndarray:
+        """Compute (1, N) similarity row between query and bank rows.
+
+        Both query (1, D) and bank (N, D) are assumed L2-normalised when
+        the caller normalises embeddings. For Tanimoto we recompute on the
+        raw values to handle the |q|^2 + |r|^2 - q.r denominator.
+        """
+        if kind == "cosine":
+            return (query @ bank.T).reshape(-1)
+        if kind == "tanimoto":
+            qr = (query @ bank.T).reshape(-1)
+            qq = float(np.sum(query * query))
+            rr = np.sum(bank * bank, axis=1)
+            denom = qq + rr - qr
+            return qr / np.maximum(denom, 1e-12)
+        raise ValueError(f"Unknown similarity kind: {kind!r}")
+
+    def classify_embedding(
+        self,
+        embedding: np.ndarray,
+        objectness_prior: dict[str, float] | None = None,
+    ) -> DINOResult:
+        """Classify a query embedding against the reference bank.
+
+        objectness_prior: optional per-object Bayesian prior weight. Posterior
+        for object o becomes: score(o) * prior(o). Useful when the proposal
+        stage (e.g. SAM stability score, mask-area plausibility) carries
+        information about which class the candidate is more likely to be.
+        Missing keys default to 1.0 (uniform).
+        """
         if self.reference_matrix is None or len(self.reference_bank) == 0:
             raise RuntimeError("Reference bank is empty. Build or set it first.")
 
@@ -231,27 +314,46 @@ class DINOIdentifier:
             norm = np.linalg.norm(embedding, axis=1, keepdims=True) + 1e-12
             embedding = embedding / norm
 
-        sims = (embedding @ self.reference_matrix.T).reshape(-1)
+        sims = self._pairwise_similarity(embedding, self.reference_matrix, self.cfg.similarity)
 
         scores_by_object: dict[str, list[float]] = {}
         for sim, obj_id in zip(sims, self.reference_object_ids):
             scores_by_object.setdefault(obj_id, []).append(float(sim))
 
         top_k = 3
-        agg = {}
+        agg: dict[str, float] = {}
         for obj_id, vals in scores_by_object.items():
             vals_sorted = sorted(vals, reverse=True)
             k = min(top_k, len(vals_sorted))
             agg[obj_id] = float(np.mean(vals_sorted[:k]))
 
-        best_obj = max(agg, key=agg.get)
-        best_score = agg[best_obj]
+        # Joint absolute + relative score (MUSE-style). Blends the raw aggregate
+        # with how much the top class dominates the rest. alpha=0 -> raw scores.
+        alpha = float(self.cfg.joint_score_alpha)
+        if alpha > 0.0 and len(agg) >= 2:
+            sorted_vals = sorted(agg.values(), reverse=True)
+            other_mean = float(np.mean(sorted_vals[1:]))
+            relative = {k: (v - other_mean) for k, v in agg.items()}
+            joint = {k: (1.0 - alpha) * agg[k] + alpha * relative[k] for k in agg}
+            agg_for_decision = joint
+        else:
+            agg_for_decision = agg
+
+        # Bayesian objectness prior: multiplicative weighting on the decision score.
+        if objectness_prior:
+            agg_for_decision = {
+                k: v * float(objectness_prior.get(k, 1.0))
+                for k, v in agg_for_decision.items()
+            }
+
+        best_obj = max(agg_for_decision, key=agg_for_decision.get)
+        best_score = agg_for_decision[best_obj]
 
         return DINOResult(
             object_id=best_obj,
             score=float(best_score),
             embedding=embedding.squeeze(0),
-            scores_by_object=agg,
+            scores_by_object=agg_for_decision,
         )
 
 
