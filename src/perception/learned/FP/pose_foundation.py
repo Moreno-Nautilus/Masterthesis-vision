@@ -299,4 +299,51 @@ class FoundationPoseWrapper:
             mask_area=int(mask.sum()),
             debug_dir=str((self.debug_dir / object_id).resolve()),
         )
-   
+
+    def refine_pose(
+        self,
+        *,
+        object_id: str,
+        mesh_path: str,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        K: np.ndarray,
+        T_object_camera_init: np.ndarray,
+        iterations: int = 1,
+    ) -> "FoundationPoseResult":
+        """C8: run only FP's neural refiner starting from a given pose.
+
+        Used post-rotation-grid to lock in the geometry-best seed with the
+        learned refiner. Skips the full proposal+scoring of register() —
+        the grid has already chosen the rotation hypothesis.
+        """
+        self._build_estimator(object_id=object_id, mesh_path=mesh_path)
+        rgb = self._sanitize_rgb(rgb)
+        depth = self._sanitize_depth(depth).astype(np.float32)
+        K = self._sanitize_K(K).astype(np.float32)
+        T0 = np.asarray(T_object_camera_init, dtype=np.float32).reshape(4, 4)
+
+        import torch
+        if hasattr(self._refiner, "model") and self._refiner.model is not None:
+            self._refiner.model = self._refiner.model.float().cuda().eval()
+
+        # The underlying FP estimator caches pose state in `self._est.pose_last`.
+        # track_one() refines from that cached pose, so seed it explicitly.
+        self._est.pose_last = torch.from_numpy(T0[None, ...]).cuda().float()
+
+        pose_raw = self._est.track_one(
+            rgb=rgb, depth=depth, K=K, iteration=int(iterations),
+        )
+        if isinstance(pose_raw, torch.Tensor):
+            pose = pose_raw.detach().cpu().numpy()
+        else:
+            pose = np.asarray(pose_raw, dtype=np.float32)
+        pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
+
+        return FoundationPoseResult(
+            object_id=object_id,
+            mesh_path=str(Path(mesh_path).resolve()),
+            T_object_camera=pose,
+            mask_area=0,
+            debug_dir=str((self.debug_dir / object_id).resolve()),
+        )

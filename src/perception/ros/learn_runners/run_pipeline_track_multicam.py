@@ -59,6 +59,7 @@ from src.perception.fused_multicam_helpers import (
     weighted_average_poses,
     MedianPoseBuffer,
     apply_x_bias_correction,
+    fill_depth_holes_in_mask,
 )
 
 
@@ -2695,8 +2696,18 @@ class FoundationPoseTrackerNode(Node):
                 T_bc = self._resolve_T_base_cam(cam_id)
                 K_cam = np.asarray(views_by_cam[cam_id].K, dtype=np.float32).reshape(3, 3)
 
+                # C5: optionally fill ZED depth holes inside the mask before
+                # lifting. Off by default (kernel=0). Costs one medianBlur per
+                # camera per init.
+                depth_for_lift = views_by_cam[cam_id].depth
+                hole_k = int(getattr(self.args, "depth_fill_holes_kernel", 0))
+                if hole_k > 0:
+                    depth_for_lift = fill_depth_holes_in_mask(
+                        depth_for_lift, det.mask, kernel=hole_k,
+                    )
+
                 pcd = lift_masked_depth_to_base(
-                    depth=views_by_cam[cam_id].depth,
+                    depth=depth_for_lift,
                     mask=det.mask,
                     K=K_cam,
                     T_base_cam=T_bc,
@@ -2739,7 +2750,10 @@ class FoundationPoseTrackerNode(Node):
             model_pcd = mesh_to_pcd_cached(mesh_path, float(self.args.mesh_scale), num_points=5000)
 
             # ─── Step 3b: Run FP ONCE on each contributing camera ───
-            SYMMETRY_GRID_CHAMFER_M = 0.008
+            # C7: grid-skip threshold is configurable; 0.008m kept the historical
+            # default. Below this, FP+ICP is already in the good regime so the
+            # rotation-grid sweep is skipped — saves ~100ms when init is clean.
+            SYMMETRY_GRID_CHAMFER_M = float(getattr(self.args, "icp_grid_skip_chamfer_m", 0.008))
             CHAMFER_REJECT_M = 0.012 if len(fused.detections) == 1 else 0.015
 
             candidate_poses: list[np.ndarray] = []
@@ -2822,8 +2836,10 @@ class FoundationPoseTrackerNode(Node):
                 best_fitness = fitness
                 best_rmse = rmse
 
-                # ─── Single symmetry grid call at 8mm ───
+                # ─── Single symmetry grid call at threshold ───
+                grid_ran = False
                 if best_chamfer > SYMMETRY_GRID_CHAMFER_M:
+                    grid_ran = True
                     t_grid = time.time()
                     grid_T, grid_chamfer = self._icp_rotation_grid(
                         best_T[:3, 3], model_pcd, fused_cloud,
@@ -2841,6 +2857,55 @@ class FoundationPoseTrackerNode(Node):
                         best_chamfer = grid_chamfer
                     else:
                         print(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
+
+                # ─── C8: optional FP refiner pass after the grid ───
+                # Lock in the grid-chosen rotation with FP's learned refiner.
+                # Off by default. Only fires when the grid actually ran (the
+                # whole point is to clean up after a rotation flip), and only
+                # if the grid produced a usable pose.
+                if (grid_ran
+                        and bool(getattr(self.args, "fp_refine_after_grid", False))
+                        and best_T is not None):
+                    try:
+                        t_fpref = time.time()
+                        T_bc = self._resolve_T_base_cam(cam_id)
+                        T_cb = np.linalg.inv(T_bc)
+                        T_cam_obj = (T_cb @ best_T.astype(np.float64)).astype(np.float32)
+                        n_iter = int(getattr(self.args, "fp_refine_iterations", 1))
+                        ref_res = tracker.refine_pose(
+                            object_id=fused.object_id,
+                            mesh_path=mesh_path,
+                            rgb=view.rgb,
+                            depth=view.depth,
+                            K=K_cam,
+                            T_object_camera_init=T_cam_obj,
+                            iterations=n_iter,
+                        )
+                        T_cam_ref = np.asarray(
+                            ref_res.T_object_camera, dtype=np.float32
+                        ).reshape(4, 4)
+                        T_base_ref = (T_bc @ T_cam_ref.astype(np.float64)).astype(np.float32)
+                        ref_chamfer = chamfer_distance_one_way(
+                            model_pcd, fused_cloud, T_base_ref
+                        )
+                        fpref_ms = (time.time() - t_fpref) * 1000
+                        if ref_chamfer < best_chamfer:
+                            print(
+                                f"    FP-refine improved [{cam_id}]: "
+                                f"{best_chamfer*1000:.2f}mm → {ref_chamfer*1000:.2f}mm "
+                                f"({fpref_ms:.0f}ms)"
+                            )
+                            best_T = T_base_ref
+                            best_chamfer = ref_chamfer
+                        else:
+                            print(
+                                f"    FP-refine no improvement [{cam_id}] "
+                                f"({fpref_ms:.0f}ms, chamfer {ref_chamfer*1000:.2f}mm)"
+                            )
+                    except Exception as e:
+                        self.get_logger().warn(
+                            f"  FP-refine after grid failed [{cam_id}]: {e}"
+                        )
 
                 # ─── Optional CSV + PNG logging ───
                 if getattr(self.args, 'log_init_poses', False):
@@ -3363,6 +3428,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--icp-grid-cross-cam-chamfer", action="store_true")
     p.add_argument("--icp-grid-tie-by-inliers", action="store_true")
     p.add_argument("--icp-grid-tie-chamfer-eps-m", type=float, default=0.0005)
+
+    # C5: fill ZED depth holes inside the mask before lifting to a cloud.
+    # 0 = off (current behaviour). 3 or 5 = cv2.medianBlur kernel.
+    p.add_argument("--depth-fill-holes-kernel", type=int, default=0)
+
+    # C7: threshold above which the rotation grid runs. Below this, FP+ICP
+    # is already in the good regime and the grid sweep is skipped.
+    p.add_argument("--icp-grid-skip-chamfer-m", type=float, default=0.008)
+
+    # C8: run FP's neural refiner after the rotation grid to lock in the
+    # geometry-best seed. Off by default — only useful when the grid runs.
+    p.add_argument("--fp-refine-after-grid", action="store_true")
+    p.add_argument("--fp-refine-iterations", type=int, default=1)
 
     return p.parse_args()
 

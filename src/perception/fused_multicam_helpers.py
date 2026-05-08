@@ -46,6 +46,51 @@ def mesh_to_pcd_cached(
     return pcd
 
 
+# ─── Depth hole-filling ─────────────────────────────────────────────────
+
+def fill_depth_holes_in_mask(
+    depth: np.ndarray,
+    mask: np.ndarray,
+    kernel: int = 5,
+) -> np.ndarray:
+    """
+    Fill zero / non-finite depth holes that fall inside `mask` using a
+    median blur, leaving outside-mask pixels untouched. Cheap (a single
+    cv2.medianBlur on uint16) and good enough for the small holes ZED
+    leaves on shiny / black surfaces.
+
+    Args:
+        depth: (H, W) float depth in metres.
+        mask:  (H, W) bool mask where holes should be filled.
+        kernel: 3 or 5 (cv2.medianBlur on uint16 only supports these).
+
+    Returns:
+        New depth array with holes inside `mask` replaced by the local
+        median of valid neighbours. Out-of-mask pixels are unchanged.
+    """
+    import cv2
+
+    mask_b = np.asarray(mask).astype(bool)
+    d = np.asarray(depth, dtype=np.float32)
+    bad = ((~np.isfinite(d)) | (d <= 0.0)) & mask_b
+    if not bad.any():
+        return d
+
+    # uint16 millimetres for medianBlur (which is what it supports for k > 3).
+    d_clean = np.where(np.isfinite(d) & (d > 0), d, 0.0)
+    d_mm = np.clip(d_clean * 1000.0, 0.0, 65535.0).astype(np.uint16)
+
+    k = max(3, min(int(kernel), 5))
+    if k % 2 == 0:
+        k += 1
+    d_blurred_mm = cv2.medianBlur(d_mm, k)
+    d_blurred = d_blurred_mm.astype(np.float32) / 1000.0
+
+    out = d.copy()
+    out[bad] = d_blurred[bad]
+    return out
+
+
 # ─── Depth → base-frame point cloud ─────────────────────────────────────
 
 def lift_masked_depth_to_base(
