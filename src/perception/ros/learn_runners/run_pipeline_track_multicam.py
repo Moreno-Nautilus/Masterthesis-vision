@@ -803,16 +803,26 @@ class FoundationPoseTrackerNode(Node):
                 )
 
             if args.tiny_objects_enabled:
+                # A3/A4/A7: dedicated tiny-pass SAM config. Lighter checkpoint
+                # (if provided), fewer prompt points, lower acceptance thresholds.
+                # Defaults still produce a working pipeline if the user has not
+                # downloaded a smaller checkpoint — falls back to main ckpt.
+                tiny_ckpt = args.tiny_sam_checkpoint or args.sam_checkpoint
+                tiny_cfg = args.tiny_sam_model_cfg or args.sam_model_cfg
                 self.sam_tiny_by_cam["zed2i_2"] = SAMSegmenter(
                     SAMSegmenterConfig(
                         repo_root=args.sam_repo_root,
-                        checkpoint=args.sam_checkpoint,
-                        model_cfg=args.sam_model_cfg,
+                        checkpoint=tiny_ckpt,
+                        model_cfg=tiny_cfg,
                         device=args.device,
                         max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
                         min_mask_area=args.tiny_sam_min_mask_area,
                         min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
                         attach_rgb_crops=False,
+                        auto_points_per_side=int(args.tiny_sam_points_per_side),
+                        auto_pred_iou_thresh=float(args.tiny_sam_pred_iou_thresh),
+                        auto_stability_score_thresh=float(args.tiny_sam_stability_score_thresh),
+                        max_aspect_ratio=float(args.tiny_sam_max_aspect_ratio),
                     )
                 )
 
@@ -3107,6 +3117,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tiny-sam-min-bbox-side-px", type=int, default=2)
     p.add_argument("--tiny-max-mask-area-ratio", type=float, default=0.01)
     p.add_argument("--tiny-max-bbox-area-ratio", type=float, default=0.02)
+
+    # A3/A4/A7: lighter tiny-pass SAM config. Empty checkpoint => fall back to
+    # main checkpoint. Pass e.g.
+    #   --tiny-sam-checkpoint external/sam2/checkpoints/sam2.1_hiera_small.pt
+    #   --tiny-sam-model-cfg configs/sam2.1/sam2.1_hiera_s.yaml
+    # to use Hiera Small once the checkpoint is downloaded.
+    p.add_argument("--tiny-sam-checkpoint", type=str, default="")
+    p.add_argument("--tiny-sam-model-cfg", type=str, default="")
+    p.add_argument("--tiny-sam-points-per-side", type=int, default=32)
+    p.add_argument("--tiny-sam-pred-iou-thresh", type=float, default=0.55)
+    p.add_argument("--tiny-sam-stability-score-thresh", type=float, default=0.55)
+    p.add_argument("--tiny-sam-max-aspect-ratio", type=float, default=4.5)
 
     p.add_argument("--blue-blob-proposals-enabled", action="store_true")
     p.add_argument("--blue-blob-min-area", type=int, default=20)
