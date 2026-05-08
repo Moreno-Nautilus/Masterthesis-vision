@@ -175,17 +175,30 @@ class ICPRefiner:
         o3d = self._o3d
         H, W = depth.shape
 
-        # Cache meshgrid per image size
-        if not hasattr(self, '_grid_cache') or self._grid_cache_shape != (H, W):
-            uu = np.arange(W)
-            vv = np.arange(H)
-            self._grid_u, self._grid_v = np.meshgrid(uu, vv)
-            self._grid_cache_shape = (H, W)
+        mask_bool = mask.astype(bool, copy=False)
 
-        mask_bool = mask.astype(bool)
-        z = depth[mask_bool]
-        u = self._grid_u[mask_bool]
-        v = self._grid_v[mask_bool]
+        # Crop to mask bbox first so we don't allocate full-image meshgrids or
+        # index across the whole frame. The bbox is tight by construction.
+        rows = np.flatnonzero(mask_bool.any(axis=1))
+        if rows.size == 0:
+            return o3d.geometry.PointCloud()
+        cols = np.flatnonzero(mask_bool.any(axis=0))
+        y0, y1 = int(rows[0]), int(rows[-1]) + 1
+        x0, x1 = int(cols[0]), int(cols[-1]) + 1
+
+        depth_c = depth[y0:y1, x0:x1]
+        mask_c = mask_bool[y0:y1, x0:x1]
+        h, w = depth_c.shape
+
+        # Cache meshgrid per (cropped) image size — bbox sizes vary, so we
+        # build the local grid on demand. It's small and cheap.
+        uu = np.arange(x0, x1)
+        vv = np.arange(y0, y1)
+        grid_u, grid_v = np.meshgrid(uu, vv)
+
+        z = depth_c[mask_c]
+        u = grid_u[mask_c]
+        v = grid_v[mask_c]
 
         valid = (z > 0.01) & (z < 2.0) & np.isfinite(z)
         z, u, v = z[valid], u[valid], v[valid]
@@ -203,7 +216,8 @@ class ICPRefiner:
         # Only add colors if needed (colored ICP)
         need_colors = self.cfg.variant == ICPVariant.COLORED
         if need_colors:
-            rgb_masked = rgb[mask_bool][valid]
+            rgb_c = rgb[y0:y1, x0:x1]
+            rgb_masked = rgb_c[mask_c][valid]
             cloud.colors = o3d.utility.Vector3dVector(rgb_masked.astype(np.float64) / 255.0)
 
         # Skip outlier removal during tracking (Cutie mask is clean)
@@ -255,80 +269,65 @@ class ICPRefiner:
                     elapsed_ms=(time.time() - t0) * 1000,
                 )
             
-            # Transform model cloud by initial pose - MAKE A COPY
-            model_transformed = o3d.geometry.PointCloud(self._model_cloud_down)
-            model_transformed.transform(T_init.astype(np.float64))
+            # Pass T_init directly to registration_icp via the `init` arg —
+            # avoids copying + transforming the model cloud every frame and
+            # avoids re-estimating normals (model normals from set_model_cloud
+            # stay valid in object frame since the source isn't transformed).
+            source_model = self._model_cloud_down
+            T_init64 = T_init.astype(np.float64)
 
-           # Only compute normals if the ICP variant actually uses them
-            need_normals = self.cfg.variant in (
-                ICPVariant.POINT_TO_PLANE,
-                ICPVariant.COLORED,
-                ICPVariant.GENERALIZED,
-            )
-            if need_normals:
-                model_transformed.estimate_normals(
-                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
-                )
-                model_transformed.orient_normals_towards_camera_location(
-                    camera_location=np.array([0.0, 0.0, 0.0])
-                )
-                observed_cloud.orient_normals_towards_camera_location(
-                    camera_location=np.array([0.0, 0.0, 0.0])
-                )
-            # Build convergence criteria
             criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
                 max_iteration=self.cfg.max_iterations,
                 relative_fitness=self.cfg.relative_fitness,
                 relative_rmse=self.cfg.relative_rmse,
             )
-            
-            # Run ICP based on variant
+
             if self.cfg.variant == ICPVariant.POINT_TO_POINT:
                 result = o3d.pipelines.registration.registration_icp(
-                    source=model_transformed,
+                    source=source_model,
                     target=observed_cloud,
                     max_correspondence_distance=self.cfg.max_correspondence_distance,
-                    init=np.eye(4),
+                    init=T_init64,
                     estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
                     criteria=criteria,
                 )
-                
+
             elif self.cfg.variant == ICPVariant.POINT_TO_PLANE:
                 result = o3d.pipelines.registration.registration_icp(
-                    source=model_transformed,
+                    source=source_model,
                     target=observed_cloud,
                     max_correspondence_distance=self.cfg.max_correspondence_distance,
-                    init=np.eye(4),
+                    init=T_init64,
                     estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                     criteria=criteria,
                 )
-                
+
             elif self.cfg.variant == ICPVariant.COLORED:
                 result = o3d.pipelines.registration.registration_colored_icp(
-                    source=model_transformed,
+                    source=source_model,
                     target=observed_cloud,
                     max_correspondence_distance=self.cfg.max_correspondence_distance,
-                    init=np.eye(4),
+                    init=T_init64,
                     estimation_method=o3d.pipelines.registration.TransformationEstimationForColoredICP(
                         lambda_geometric=self.cfg.lambda_geometric,
                     ),
                     criteria=criteria,
                 )
-                
+
             elif self.cfg.variant == ICPVariant.GENERALIZED:
                 result = o3d.pipelines.registration.registration_generalized_icp(
-                    source=model_transformed,
+                    source=source_model,
                     target=observed_cloud,
                     max_correspondence_distance=self.cfg.max_correspondence_distance,
-                    init=np.eye(4),
+                    init=T_init64,
                     criteria=criteria,
                 )
             else:
                 raise ValueError(f"Unknown ICP variant: {self.cfg.variant}")
-            
-            # Compose final transformation: T_refined = T_icp @ T_init
-            T_icp = np.asarray(result.transformation, dtype=np.float64)
-            T_refined = T_icp @ T_init.astype(np.float64)
+
+            # `init` was applied internally; result.transformation is already
+            # the full T_refined.
+            T_refined = np.asarray(result.transformation, dtype=np.float64)
             
             elapsed_ms = (time.time() - t0) * 1000
             converged = result.fitness > 0.3 and result.inlier_rmse < 0.005

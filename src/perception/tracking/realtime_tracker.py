@@ -184,27 +184,36 @@ class RealtimeTracker:
         if self.cfg.verbose:
             print(f"[RealtimeTracker] Initialized with T={T_init[:3, 3]}")
     
-    def track(self, rgb: np.ndarray, depth: np.ndarray, K: Optional[np.ndarray] = None) -> TrackingResult:
+    def track(
+        self,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        K: Optional[np.ndarray] = None,
+        skip_icp: bool = False,
+    ) -> TrackingResult:
         """
         Track object in new frame.
-        
+
         Args:
             rgb: (H, W, 3) uint8 RGB image
             depth: (H, W) float32 depth in meters
             K: (3, 3) camera intrinsics (uses stored K if not provided)
-            
+            skip_icp: when True, only Cutie runs and the pose is held at
+                the current internal value. Used by the multicam-fused pipeline
+                where a single fused-cloud ICP refines the pose downstream.
+
         Returns:
             TrackingResult with pose and quality metrics
         """
         if self._state == TrackingState.UNINITIALIZED:
             return self._make_invalid_result("Not initialized")
-            
+
         if self._state == TrackingState.NEEDS_REINIT:
             return self._make_invalid_result("Needs re-initialization")
-            
+
         K = K if K is not None else self._K
         t0 = time.time()
-        
+
         # =====================================================================
         # Stage 1: Mask tracking with CuteVOS
         # =====================================================================
@@ -213,9 +222,9 @@ class RealtimeTracker:
         except Exception as e:
             self._handle_lost(f"Cutie failed: {e}")
             return self._make_invalid_result(f"Cutie failed: {e}")
-        
+
         cutie_ms = cutie_result.elapsed_ms
-        
+
         # Check mask validity
         if cutie_result.area < self.cfg.min_mask_area:
             self._handle_lost(f"Mask too small: {cutie_result.area} < {self.cfg.min_mask_area}")
@@ -224,6 +233,30 @@ class RealtimeTracker:
                 mask=cutie_result.mask,
                 bbox=cutie_result.bbox_xyxy,
                 cutie_ms=cutie_ms,
+            )
+
+        # =====================================================================
+        # Mask-only fast path: skip ICP, return pose unchanged. The fused-cloud
+        # ICP downstream is the authoritative pose refinement.
+        # =====================================================================
+        if skip_icp:
+            self._lost_count = 0
+            self._frame_count += 1
+            self._state = TrackingState.TRACKING
+            total_ms = (time.time() - t0) * 1000
+            return TrackingResult(
+                valid=True,
+                state=TrackingState.TRACKING,
+                T_object_camera=self._T_current.copy(),
+                mask=cutie_result.mask,
+                bbox_xyxy=cutie_result.bbox_xyxy,
+                mask_area=cutie_result.area,
+                icp_fitness=0.0,
+                icp_rmse=0.0,
+                cutie_ms=cutie_ms,
+                icp_ms=0.0,
+                total_ms=total_ms,
+                message="OK (mask-only)",
             )
         
         # =====================================================================
