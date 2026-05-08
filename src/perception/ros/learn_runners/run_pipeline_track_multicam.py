@@ -897,24 +897,28 @@ class FoundationPoseTrackerNode(Node):
                 # (if provided), fewer prompt points, lower acceptance thresholds.
                 # Defaults still produce a working pipeline if the user has not
                 # downloaded a smaller checkpoint — falls back to main ckpt.
+                # Bundle 11: build the tiny segmenter for every camera so the
+                # tiny-pass runs on both cams (was previously zed2i_2-only).
                 tiny_ckpt = args.tiny_sam_checkpoint or args.sam_checkpoint
                 tiny_cfg = args.tiny_sam_model_cfg or args.sam_model_cfg
-                self.sam_tiny_by_cam["zed2i_2"] = SAMSegmenter(
-                    SAMSegmenterConfig(
-                        repo_root=args.sam_repo_root,
-                        checkpoint=tiny_ckpt,
-                        model_cfg=tiny_cfg,
-                        device=args.device,
-                        max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
-                        min_mask_area=args.tiny_sam_min_mask_area,
-                        min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
-                        attach_rgb_crops=False,
-                        auto_points_per_side=int(args.tiny_sam_points_per_side),
-                        auto_pred_iou_thresh=float(args.tiny_sam_pred_iou_thresh),
-                        auto_stability_score_thresh=float(args.tiny_sam_stability_score_thresh),
-                        max_aspect_ratio=float(args.tiny_sam_max_aspect_ratio),
-                    )
+                tiny_sam_cfg = SAMSegmenterConfig(
+                    repo_root=args.sam_repo_root,
+                    checkpoint=tiny_ckpt,
+                    model_cfg=tiny_cfg,
+                    device=args.device,
+                    max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
+                    min_mask_area=args.tiny_sam_min_mask_area,
+                    min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
+                    attach_rgb_crops=False,
+                    auto_points_per_side=int(args.tiny_sam_points_per_side),
+                    auto_pred_iou_thresh=float(args.tiny_sam_pred_iou_thresh),
+                    auto_stability_score_thresh=float(args.tiny_sam_stability_score_thresh),
+                    max_aspect_ratio=float(args.tiny_sam_max_aspect_ratio),
                 )
+                # Share weights across cams: build the model once and reuse.
+                tiny_segmenter = SAMSegmenter(tiny_sam_cfg)
+                for cam in CAMERAS:
+                    self.sam_tiny_by_cam[cam.cam_id] = tiny_segmenter
 
 
         self.fp_tracker_by_cam: dict[str, FoundationPoseWrapper] = {}
@@ -982,6 +986,10 @@ class FoundationPoseTrackerNode(Node):
         self._init_chamfer_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=10)
         )
+        # Bundle 11: (cam_id, object_id) -> {frame_idx, mask, occlusion_score,
+        # T_object_camera}. Populated by _track_multicam_fused and consumed
+        # by _process_multicam_init when --skip-dino-when-tracker-healthy.
+        self._recent_tracker_health: dict[tuple[str, str], dict] = {}
 
     @staticmethod
     def _build_mesh_map(cad_dir: str) -> dict[str, str]:
@@ -1306,8 +1314,12 @@ class FoundationPoseTrackerNode(Node):
         roi = self.cam_sam_params[cam_id].roi_polygon.reshape(-1)
         frame.roi_polygon_xy_flat = [int(v) for v in roi.tolist()]
 
-        if cam_id == "zed2i_2" and self.args.tiny_objects_enabled:
-            x0, y0, x1, y1 = parse_xyxy_string(self.args.cam2_tiny_roi)
+        roi = (
+            self._tiny_roi_for_cam(cam_id)
+            if self.args.tiny_objects_enabled else None
+        )
+        if roi is not None:
+            x0, y0, x1, y1 = roi
             frame.has_tiny_roi = True
             frame.tiny_roi_xyxy = [int(x0), int(y0), int(x1), int(y1)]
         else:
@@ -1466,11 +1478,97 @@ class FoundationPoseTrackerNode(Node):
         return (T_base_cam @ T_object_camera.astype(np.float64)).astype(np.float32)
 
 
-    def _generate_tiny_object_masks_cam2(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
-        if "zed2i_2" not in self.sam_tiny_by_cam:
+    def _inherit_from_tracker_health(
+        self, cam_id: str, masks: list[SAMMaskCandidate],
+    ) -> tuple[list[CandidateSelection], list[SAMMaskCandidate]]:
+        """Bundle 11: assign masks to objects whose tracker was healthy on a
+        recent frame, by IoU with the tracker's last good mask. Returns
+        (inherited_selections, remaining_masks_for_dino).
+
+        Skipped masks bypass DINO classification entirely — saving DINO
+        compute proportional to the number of healthy tracker objects.
+        """
+        if not masks:
+            return [], masks
+        stale_frames = int(getattr(self.args, "tracker_health_stale_frames", 5))
+        iou_thr = float(getattr(self.args, "tracker_health_iou_threshold", 0.5))
+        max_occ = float(getattr(self.args, "tracker_health_max_occlusion", 0.4))
+
+        # Collect healthy entries for this cam.
+        healthy: list[tuple[str, np.ndarray]] = []  # (object_id, mask)
+        for (cid, obj_id), info in self._recent_tracker_health.items():
+            if cid != cam_id:
+                continue
+            if (self.frame_counter - int(info.get("frame_idx", 0))) > stale_frames:
+                continue
+            if float(info.get("occlusion_score", 0.0)) > max_occ:
+                continue
+            mask = info.get("mask")
+            if mask is None or int(np.asarray(mask).sum()) <= 0:
+                continue
+            healthy.append((obj_id, np.asarray(mask, dtype=bool)))
+
+        if not healthy:
+            return [], masks
+
+        inherited: list[CandidateSelection] = []
+        remaining: list[SAMMaskCandidate] = []
+        used_obj_ids: set[str] = set()
+        for cand in masks:
+            cm = np.asarray(cand.mask, dtype=bool)
+            cm_sum = int(cm.sum())
+            if cm_sum == 0:
+                remaining.append(cand)
+                continue
+            best_iou = 0.0
+            best_obj: Optional[str] = None
+            for obj_id, hmask in healthy:
+                if obj_id in used_obj_ids:
+                    continue
+                if hmask.shape != cm.shape:
+                    continue
+                inter = int(np.logical_and(cm, hmask).sum())
+                if inter == 0:
+                    continue
+                union = cm_sum + int(hmask.sum()) - inter
+                if union <= 0:
+                    continue
+                iou = float(inter) / float(union)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_obj = obj_id
+            if best_obj is not None and best_iou >= iou_thr:
+                inherited.append(CandidateSelection(
+                    object_id=best_obj,
+                    score=1.0,
+                    scores_by_object={best_obj: 1.0},
+                    candidate=cand,
+                ))
+                used_obj_ids.add(best_obj)
+            else:
+                remaining.append(cand)
+        return inherited, remaining
+
+    def _tiny_roi_for_cam(self, cam_id: str) -> Optional[tuple[int, int, int, int]]:
+        """Look up the tiny-object ROI for a camera. Returns None if no ROI
+        is configured (which means: skip the tiny pass on this cam)."""
+        roi_str = None
+        if cam_id == "zed2i_1":
+            roi_str = getattr(self.args, "cam1_tiny_roi", "") or ""
+        elif cam_id == "zed2i_2":
+            roi_str = getattr(self.args, "cam2_tiny_roi", "") or ""
+        if not roi_str.strip():
+            return None
+        return parse_xyxy_string(roi_str)
+
+    def _generate_tiny_object_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
+        if cam_id not in self.sam_tiny_by_cam:
             return []
 
-        x0, y0, x1, y1 = parse_xyxy_string(self.args.cam2_tiny_roi)
+        roi = self._tiny_roi_for_cam(cam_id)
+        if roi is None:
+            return []
+        x0, y0, x1, y1 = roi
         h, w = rgb.shape[:2]
         x0 = max(0, min(x0, w - 1))
         x1 = max(x0 + 1, min(x1, w))
@@ -1481,9 +1579,9 @@ class FoundationPoseTrackerNode(Node):
         if crop.size == 0:
             return []
 
-        sam = self.sam_tiny_by_cam["zed2i_2"]
+        sam = self.sam_tiny_by_cam[cam_id]
         masks = sam.generate_auto(crop)
-        self.get_logger().info(f"[zed2i_2] Tiny-object SAM raw masks: {len(masks)}")
+        self.get_logger().info(f"[{cam_id}] Tiny-object SAM raw masks: {len(masks)}")
 
         if not masks:
             return []
@@ -1505,7 +1603,7 @@ class FoundationPoseTrackerNode(Node):
         ]
 
         lifted = lift_crop_masks_to_full_image(masks, h, w, x0, y0)
-        self.get_logger().info(f"[zed2i_2] Tiny-object SAM kept masks: {len(lifted)}")
+        self.get_logger().info(f"[{cam_id}] Tiny-object SAM kept masks: {len(lifted)}")
         return lifted
 
    
@@ -1583,10 +1681,12 @@ class FoundationPoseTrackerNode(Node):
         masks = sorted(masks, key=lambda m: m.area)
 
         # --- Tiny objects SAM (if enabled) ---
-        if cam_id == "zed2i_2" and self.args.tiny_objects_enabled:
+        # Bundle 11: tiny-pass now runs on every cam that has a configured
+        # tiny ROI, not just zed2i_2.
+        if self.args.tiny_objects_enabled and cam_id in self.sam_tiny_by_cam:
             t3 = time.time()
-            tiny_masks = self._generate_tiny_object_masks_cam2(rgb)
-            print(f"[TIMING]   SAM tiny objects: {(time.time() - t3)*1000:.0f}ms -> {len(tiny_masks)} masks")
+            tiny_masks = self._generate_tiny_object_masks(rgb, cam_id)
+            print(f"[TIMING]   SAM tiny objects [{cam_id}]: {(time.time() - t3)*1000:.0f}ms -> {len(tiny_masks)} masks")
             masks.extend(tiny_masks)
 
         # --- Blue blob proposals (if enabled) ---
@@ -1998,6 +2098,8 @@ class FoundationPoseTrackerNode(Node):
             z_max=self.args.max_valid_z_m,
             voxel_size=0.002,
             depth_bias_m=depth_bias,
+            mask_morph_close_kernel=int(getattr(self.args, "icp_mask_close_kernel", 0)),
+            mask_interior_erosion=int(getattr(self.args, "icp_mask_interior_erosion", 0)),
         )
         metrics["pcd"] = pcd
         metrics["cloud_points"] = int(len(pcd.points)) if pcd is not None else 0
@@ -2084,6 +2186,8 @@ class FoundationPoseTrackerNode(Node):
                                 variant=ICPVariant.POINT_TO_POINT,
                                 max_correspondence_distance=0.05,
                                 voxel_size=0.002,
+                                mask_morph_close_kernel=int(getattr(self.args, "icp_mask_close_kernel", 0)),
+                                mask_interior_erosion=int(getattr(self.args, "icp_mask_interior_erosion", 0)),
                             ),
                             min_icp_fitness=0.20,
                             max_translation_per_frame=0.08,
@@ -2619,6 +2723,15 @@ class FoundationPoseTrackerNode(Node):
                     state.mode = "track"
                     if state.kalman is not None:
                         state.kalman.update(T_local[:3, 3])
+                    # Bundle 11: remember healthy tracker masks so the next
+                    # init (if it fires) can skip DINO for these objects.
+                    occ = float(getattr(rt_result, "occlusion_score", 0.0)) if rt_result is not None else 0.0
+                    self._recent_tracker_health[(cam_id, state.object_id)] = {
+                        "frame_idx": self.frame_counter,
+                        "mask": current_mask.copy(),
+                        "occlusion_score": occ,
+                        "T_object_camera": T_local.copy(),
+                    }
                 else:
                     if state.last_good_T is not None:
                         state.T_object_camera = state.last_good_T.copy()
@@ -2780,9 +2893,20 @@ class FoundationPoseTrackerNode(Node):
                 selections_by_cam[cam_id] = []
                 continue
 
+            # Bundle 11: skip DINO for masks that match a recently-healthy
+            # tracker mask via IoU. Inherit the tracker's object_id directly.
+            inherited: list[CandidateSelection] = []
+            remaining_masks = masks
+            if bool(getattr(self.args, "skip_dino_when_tracker_healthy", False)):
+                inherited, remaining_masks = self._inherit_from_tracker_health(
+                    cam_id=cam_id, masks=masks,
+                )
+                if inherited:
+                    print(f"[TIMING] DINO-skip {cam_id}: inherited {len(inherited)} masks from tracker (skipped DINO)")
+
             t_dino = time.time()
-            ranked = self._classify_masks_batched(view.rgb, masks)
-            selected = self._select_top_candidates(ranked, view.depth)
+            ranked = self._classify_masks_batched(view.rgb, remaining_masks) if remaining_masks else []
+            selected = self._select_top_candidates(inherited + ranked, view.depth)
             print(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
             selections_by_cam[cam_id] = selected
 
@@ -2851,6 +2975,8 @@ class FoundationPoseTrackerNode(Node):
                     K=K_cam,
                     T_base_cam=T_bc,
                     voxel_size=INIT_VOXEL_SIZE,
+                    mask_morph_close_kernel=int(getattr(self.args, "icp_mask_close_kernel", 0)),
+                    mask_interior_erosion=int(getattr(self.args, "icp_mask_interior_erosion", 0)),
                 )
                 if pcd is not None:
                     per_cam_clouds.append(pcd)
@@ -3437,6 +3563,10 @@ def parse_args() -> argparse.Namespace:
         default="430,410,1190,160,1920,500,1920,780,1720,1080,940,1080")
 
     p.add_argument("--tiny-objects-enabled", action="store_true")
+    # Bundle 11: per-cam tiny ROIs. Empty string disables the tiny pass on
+    # that cam. cam1 default is empty so the runner stays backwards
+    # compatible — pass an explicit ROI to enable cam1's tiny pass.
+    p.add_argument("--cam1-tiny-roi", type=str, default="")
     p.add_argument("--cam2-tiny-roi", type=str, default="700,500,1350,1080")
     p.add_argument("--tiny-sam-max-image-side", type=int, default=1920)
     p.add_argument("--tiny-sam-min-mask-area", type=int, default=8)
@@ -3634,6 +3764,21 @@ def parse_args() -> argparse.Namespace:
     # z_base outside this window. Defaults preserve current [0, 0.5] gate.
     p.add_argument("--table-plane-z-min", type=float, default=0.0)
     p.add_argument("--table-plane-z-max", type=float, default=0.5)
+
+    # Bundle 11: skip DINO classification for masks that match a recently
+    # healthy tracker mask (by IoU). Off by default — flip on when the
+    # video tracker is reliable enough to authoritatively name objects.
+    p.add_argument("--skip-dino-when-tracker-healthy", action="store_true")
+    p.add_argument("--tracker-health-iou-threshold", type=float, default=0.5)
+    p.add_argument("--tracker-health-stale-frames", type=int, default=5)
+    p.add_argument("--tracker-health-max-occlusion", type=float, default=0.4)
+
+    # Bundle 11: mask preprocessing before depth lift / ICP. Both 0 by
+    # default to preserve current behaviour. Sane starting values would be
+    # close-kernel=5 (fills 5px specular holes) and erosion=3 (drops
+    # boundary pixels with the noisiest ZED depth).
+    p.add_argument("--icp-mask-close-kernel", type=int, default=0)
+    p.add_argument("--icp-mask-interior-erosion", type=int, default=0)
 
     # Bundle 10: A5/A6/B5 — alternative video tracker.
     # A5: choose backend; default keeps current Cutie behaviour. SAM2 falls

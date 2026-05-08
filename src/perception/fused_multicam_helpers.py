@@ -102,6 +102,8 @@ def lift_masked_depth_to_base(
     z_max: float = 3.0,
     voxel_size: float = 0.002,
     depth_bias_m: float = 0.0,
+    mask_morph_close_kernel: int = 0,
+    mask_interior_erosion: int = 0,
 ) -> Optional[o3d.geometry.PointCloud]:
     """
     Unproject masked depth pixels into 3D, transform to base frame.
@@ -111,10 +113,35 @@ def lift_masked_depth_to_base(
         depth_bias_m: per-camera depth offset correction (added to raw depth).
                       Positive = sensor reads too short, negative = too long.
                       Calibrate by comparing known-distance measurements.
+        mask_morph_close_kernel: optional cv2 close-kernel size to fill
+                      pinholes in the mask (specular speckles, partial
+                      occluders) before sampling. 0 disables.
+        mask_interior_erosion: optional erosion radius in px applied after
+                      close. Drops boundary pixels (noisiest depth).
+                      0 disables.
     """
     mask_bool = np.asarray(mask).astype(bool)
     if mask_bool.sum() < 10:
         return None
+
+    if mask_morph_close_kernel > 0 or mask_interior_erosion > 0:
+        import cv2
+        m_u8 = mask_bool.astype(np.uint8)
+        if mask_morph_close_kernel > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (int(mask_morph_close_kernel), int(mask_morph_close_kernel)),
+            )
+            m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, kernel)
+        if mask_interior_erosion > 0:
+            ekernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (int(mask_interior_erosion), int(mask_interior_erosion)),
+            )
+            m_u8 = cv2.erode(m_u8, ekernel)
+        mask_bool = m_u8.astype(bool)
+        if mask_bool.sum() < 10:
+            return None
 
     ys, xs = np.where(mask_bool)
     zs = depth[ys, xs].astype(np.float64)

@@ -56,6 +56,16 @@ class ICPConfig:
     nb_neighbors: int = 20
     std_ratio: float = 2.0
 
+    # Bundle 11: morphological close on the mask before sampling depth.
+    # Closes pinholes from speculars / partial occluders so the cloud
+    # isn't shot through with background depth. 0 disables.
+    mask_morph_close_kernel: int = 0
+    # Bundle 11: per-pixel "depth confidence" proxy via mask interior
+    # erosion. Drops pixels within this many px of the mask boundary,
+    # where ZED depth is least reliable (subpixel edge artefacts).
+    # 0 disables and keeps every masked pixel.
+    mask_interior_erosion: int = 0
+
 
 @dataclass
 class ICPResult:
@@ -176,6 +186,27 @@ class ICPRefiner:
         H, W = depth.shape
 
         mask_bool = mask.astype(bool, copy=False)
+
+        # Bundle 11: optional morphological close + interior erosion on the
+        # mask before sampling depth. Close fills tiny holes (specular
+        # speckles, partial occluders); erosion drops boundary pixels that
+        # are the noisiest depth pixels on ZED.
+        close_k = int(self.cfg.mask_morph_close_kernel)
+        erode_k = int(self.cfg.mask_interior_erosion)
+        if close_k > 0 or erode_k > 0:
+            import cv2
+            m_u8 = mask_bool.astype(np.uint8)
+            if close_k > 0:
+                kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (close_k, close_k),
+                )
+                m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, kernel)
+            if erode_k > 0:
+                ekernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (erode_k, erode_k),
+                )
+                m_u8 = cv2.erode(m_u8, ekernel)
+            mask_bool = m_u8.astype(bool, copy=False)
 
         # Crop to mask bbox first so we don't allocate full-image meshgrids or
         # index across the whole frame. The bbox is tight by construction.
