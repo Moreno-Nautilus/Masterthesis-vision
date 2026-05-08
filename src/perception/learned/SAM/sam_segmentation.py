@@ -298,6 +298,59 @@ class SAMSegmenter:
             scale=scale,
         )
 
+    def generate_from_boxes(
+        self,
+        rgb: np.ndarray,
+        boxes_xyxy: np.ndarray,
+    ) -> list[SAMMaskCandidate]:
+        """Box-prompted segmentation. One mask per box; uses each box as a
+        prompt to SAM's image predictor. Used by the Grounding-DINO + SAM
+        proposal path (Bundle 8 / MUSE-style)."""
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
+        boxes = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
+        if boxes.shape[0] == 0:
+            return []
+
+        rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
+        boxes_scaled = boxes * scale if scale != 1.0 else boxes
+
+        import cv2
+
+        with torch.inference_mode():
+            if self.device.type == "cuda" and self.cfg.use_bfloat16:
+                ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            else:
+                # Python 3.10 needs a real context manager; use nullcontext.
+                from contextlib import nullcontext
+                ctx = nullcontext()
+            with ctx:
+                self._predictor.set_image(rgb_small)
+                out: list[SAMMaskCandidate] = []
+                h0, w0 = rgb.shape[:2]
+                for box in boxes_scaled:
+                    masks, scores, _ = self._predictor.predict(
+                        box=box, multimask_output=False,
+                    )
+                    if masks is None or len(masks) == 0:
+                        continue
+                    mask_small = np.asarray(masks[0], dtype=np.uint8)
+                    if scale != 1.0:
+                        mask = cv2.resize(mask_small, (w0, h0), interpolation=cv2.INTER_NEAREST) > 0
+                    else:
+                        mask = mask_small > 0
+                    score = float(scores[0]) if scores is not None and len(scores) else 0.0
+                    if not self._filter_mask(mask, score, (h0, w0), rgb=rgb):
+                        continue
+                    bbox = self._bbox_from_mask(mask)
+                    area = int(mask.sum())
+                    crop_rgb = self._crop_rgb(rgb, bbox) if self.cfg.attach_rgb_crops else None
+                    out.append(SAMMaskCandidate(
+                        mask=mask, score=score, bbox_xyxy=bbox, area=area, crop_rgb=crop_rgb,
+                    ))
+        out.sort(key=lambda x: (x.score, x.area), reverse=True)
+        return out
+
     def generate_auto(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
         """
         Automatic mask proposals from a single RGB image.

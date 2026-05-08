@@ -831,7 +831,10 @@ class FoundationPoseTrackerNode(Node):
         self.sam_by_cam: dict[str, SAMSegmenter] = {}
         self.sam_tiny_by_cam: dict[str, SAMSegmenter] = {}
 
-        if args.mask_source == "sam":
+        # gdino_sam reuses the same SAM instance — only the proposal stage
+        # differs (boxes from Grounding DINO instead of automatic mask gen).
+        sam_modes = {"sam", "gdino_sam"}
+        if args.mask_source in sam_modes:
             for cam in CAMERAS:
                 cam_params = self.cam_sam_params[cam.cam_id]
                 self.sam_by_cam[cam.cam_id] = SAMSegmenter(
@@ -846,6 +849,28 @@ class FoundationPoseTrackerNode(Node):
                         attach_rgb_crops=False,
                     )
                 )
+
+        # Grounding-DINO proposer (lazy-loaded) for the gdino_sam path.
+        self.gdino_proposer = None
+        if args.mask_source == "gdino_sam":
+            from src.perception.learned.GDINO.grounding_dino_proposal import (
+                GDINOConfig, GroundingDINOProposer,
+            )
+            text_prompts = [p.strip() for p in args.gdino_text_prompts.split(",") if p.strip()]
+            self.gdino_proposer = GroundingDINOProposer(
+                GDINOConfig(
+                    model_id=args.gdino_model_id,
+                    device=args.device,
+                    box_threshold=float(args.gdino_box_threshold),
+                    text_threshold=float(args.gdino_text_threshold),
+                    max_boxes_per_image=int(args.gdino_max_boxes),
+                    text_prompts=text_prompts,
+                )
+            )
+            self.get_logger().info(
+                f"GDINO proposer ready | model={args.gdino_model_id} "
+                f"prompts={text_prompts}"
+            )
 
             if args.tiny_objects_enabled:
                 # A3/A4/A7: dedicated tiny-pass SAM config. Lighter checkpoint
@@ -1484,10 +1509,26 @@ class FoundationPoseTrackerNode(Node):
         rgb_crop_masked[roi_mask_crop == 0] = 0
         print(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
 
-        # --- Main SAM call ---
+        # --- Main proposal stage ---
+        # Default: SAM automatic mask generator. With --mask-source gdino_sam,
+        # boxes come from Grounding DINO and SAM is run as a box-prompted
+        # segmenter (one mask per box).
         t1 = time.time()
-        masks_crop = sam.generate_auto(rgb_crop_masked)
-        print(f"[TIMING]   SAM generate_auto (main): {(time.time() - t1)*1000:.0f}ms -> {len(masks_crop)} raw masks")
+        if (self.args.mask_source == "gdino_sam"
+                and self.gdino_proposer is not None):
+            proposals = self.gdino_proposer.propose(rgb_crop_masked)
+            if proposals:
+                boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
+                masks_crop = sam.generate_from_boxes(rgb_crop_masked, boxes)
+            else:
+                masks_crop = []
+            print(
+                f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
+                f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
+            )
+        else:
+            masks_crop = sam.generate_auto(rgb_crop_masked)
+            print(f"[TIMING]   SAM generate_auto (main): {(time.time() - t1)*1000:.0f}ms -> {len(masks_crop)} raw masks")
 
         if not masks_crop:
             masks = []
@@ -3282,7 +3323,21 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
     p.add_argument("--device", default="cuda")
-    p.add_argument("--mask-source", choices=["sam", "projected"], default="sam")
+    p.add_argument("--mask-source",
+                   choices=["sam", "projected", "gdino_sam"],
+                   default="sam")
+    # B7/B8/A9: Grounding DINO + SAM (MUSE-style) proposal stage. Only used
+    # when --mask-source gdino_sam.
+    p.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base")
+    p.add_argument("--gdino-box-threshold", type=float, default=0.30)
+    p.add_argument("--gdino-text-threshold", type=float, default=0.25)
+    p.add_argument("--gdino-max-boxes", type=int, default=30)
+    # Comma-separated text prompts. Default covers the current object set;
+    # override via --gdino-text-prompts "a,b,c" to extend.
+    p.add_argument(
+        "--gdino-text-prompts",
+        default="cooling base,cooling f,cooling screw,blue cube,green cube,red cube,screwdriver,pb base,pb pipe,pb screw,pb top",
+    )
     p.add_argument("--target-object", default=None)
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
 
