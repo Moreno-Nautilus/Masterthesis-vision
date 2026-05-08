@@ -922,74 +922,174 @@ class FoundationPoseTrackerNode(Node):
         )
     
 
+    @staticmethod
+    def _octahedral_rotations() -> list[np.ndarray]:
+        """24 elements of the chiral octahedral group (cube symmetries)."""
+        from scipy.spatial.transform import Rotation as SciRot
+        return [
+            np.eye(3),
+            SciRot.from_euler('x',  90, degrees=True).as_matrix(),
+            SciRot.from_euler('x', 180, degrees=True).as_matrix(),
+            SciRot.from_euler('x', 270, degrees=True).as_matrix(),
+            SciRot.from_euler('y',  90, degrees=True).as_matrix(),
+            SciRot.from_euler('y', 180, degrees=True).as_matrix(),
+            SciRot.from_euler('y', 270, degrees=True).as_matrix(),
+            SciRot.from_euler('z',  90, degrees=True).as_matrix(),
+            SciRot.from_euler('z', 180, degrees=True).as_matrix(),
+            SciRot.from_euler('z', 270, degrees=True).as_matrix(),
+            SciRot.from_euler('xz', [ 90,  90], degrees=True).as_matrix(),
+            SciRot.from_euler('xz', [ 90, 270], degrees=True).as_matrix(),
+            SciRot.from_euler('xz', [270,  90], degrees=True).as_matrix(),
+            SciRot.from_euler('xz', [270, 270], degrees=True).as_matrix(),
+            SciRot.from_euler('xy', [ 90,  90], degrees=True).as_matrix(),
+            SciRot.from_euler('xy', [ 90, 270], degrees=True).as_matrix(),
+            SciRot.from_euler('xy', [270,  90], degrees=True).as_matrix(),
+            SciRot.from_euler('xy', [270, 270], degrees=True).as_matrix(),
+            SciRot.from_euler('xz', [180,  90], degrees=True).as_matrix(),
+            SciRot.from_euler('xz', [180, 270], degrees=True).as_matrix(),
+            SciRot.from_euler('yz', [180,  90], degrees=True).as_matrix(),
+            SciRot.from_euler('yz', [180, 270], degrees=True).as_matrix(),
+            SciRot.from_rotvec(
+                np.array([1, 1, 1], dtype=float) / np.sqrt(3) * np.radians(120)
+            ).as_matrix(),
+            SciRot.from_rotvec(
+                np.array([1, 1, 1], dtype=float) / np.sqrt(3) * np.radians(240)
+            ).as_matrix(),
+        ]
+
+    @staticmethod
+    def _fibonacci_rotations(n: int) -> list[np.ndarray]:
+        """n uniformly-distributed SO(3) rotations (deterministic seed). Identity first."""
+        from scipy.spatial.transform import Rotation as SciRot
+        if n <= 1:
+            return [np.eye(3)]
+        mats = [np.eye(3)]
+        mats.extend(list(SciRot.random(num=n - 1, random_state=42).as_matrix()))
+        return mats
+
+    @staticmethod
+    def _jitter_rotations(R_center: np.ndarray, n: int, max_deg: float, seed: int = 0) -> list[np.ndarray]:
+        """n random rotations with axis-angle magnitude ≤ max_deg, applied to R_center."""
+        from scipy.spatial.transform import Rotation as SciRot
+        rng = np.random.default_rng(seed)
+        axes = rng.normal(size=(n, 3))
+        axes /= (np.linalg.norm(axes, axis=1, keepdims=True) + 1e-12)
+        angles = rng.uniform(0.0, np.radians(max_deg), size=n)
+        R_jit = SciRot.from_rotvec(axes * angles[:, None]).as_matrix()
+        return [R_center @ R_j for R_j in R_jit]
+
+    def _grid_chamfer(
+        self,
+        model_pcd,
+        fused_cloud,
+        per_cam_clouds,
+        T: np.ndarray,
+    ) -> float:
+        """Chamfer score for grid evaluation. Optionally averages over per-cam clouds."""
+        if (getattr(self.args, "icp_grid_cross_cam_chamfer", False)
+                and per_cam_clouds is not None and len(per_cam_clouds) >= 2):
+            return float(np.mean([
+                chamfer_distance_one_way(model_pcd, c, T) for c in per_cam_clouds
+            ]))
+        return chamfer_distance_one_way(model_pcd, fused_cloud, T)
+
     def _icp_rotation_grid(
             self,
             t_base: np.ndarray,
             model_pcd,
             fused_cloud,
+            per_cam_clouds=None,
         ) -> tuple:
             """
-            Try all 24 chiral octahedral rotations (full cube symmetry group).
-            Covers every 90-degree combination across all 3 axes — catches any
-            flip/rotation FP might produce, including continuous-symmetry objects
-            where the non-symmetric axes still need correct alignment.
-            Translation stays fixed at FP's estimate throughout.
-            Cost: ~100-120ms — irrelevant vs 70s init.
+            Search rotation seeds around translation `t_base`, refine each by ICP,
+            score by Chamfer (lowest = best). Translation stays fixed at the
+            FP estimate throughout the seed search; ICP is free to translate.
+
+            Default seed set: 24 elements of the chiral octahedral group.
+            With --icp-grid-fibonacci, switches to N uniformly-sampled SO(3) seeds.
+            With --icp-grid-prescreen, skips ICP for seeds whose raw-Chamfer
+            already exceeds tau (typical seeds are far enough off that ICP
+            won't recover — checking the seed first saves the ICP cost).
+            With --icp-grid-second-pass, re-refines around the top-K winners
+            with smaller angular jitter.
+            With --icp-grid-cross-cam-chamfer, scores by mean Chamfer across
+            the per-camera clouds (more discriminative for symmetric objects
+            where one camera sees a featureless face).
+            With --icp-grid-tie-by-inliers, breaks Chamfer ties by ICP fitness.
+
             Returns (best_T, best_chamfer).
             """
-            from scipy.spatial.transform import Rotation as SciRot
+            use_fib = bool(getattr(self.args, "icp_grid_fibonacci", False))
+            n_rot = int(getattr(self.args, "icp_grid_n_rot", 60))
+            prescreen = bool(getattr(self.args, "icp_grid_prescreen", False))
+            prescreen_tau = float(getattr(self.args, "icp_grid_prescreen_tau", 0.04))
+            second_pass = bool(getattr(self.args, "icp_grid_second_pass", False))
+            second_k = int(getattr(self.args, "icp_grid_second_pass_k", 3))
+            second_n = int(getattr(self.args, "icp_grid_second_pass_n", 8))
+            second_jitter = float(getattr(self.args, "icp_grid_second_pass_jitter_deg", 15.0))
+            tie_by_inliers = bool(getattr(self.args, "icp_grid_tie_by_inliers", False))
+            tie_chamfer_eps = float(getattr(self.args, "icp_grid_tie_chamfer_eps_m", 0.0005))
 
-            # All 24 elements of the chiral octahedral group
-            CANDIDATES = [
-                # Identity
-                np.eye(3),
-                # Single-axis 90/180/270 (9)
-                SciRot.from_euler('x',  90, degrees=True).as_matrix(),
-                SciRot.from_euler('x', 180, degrees=True).as_matrix(),
-                SciRot.from_euler('x', 270, degrees=True).as_matrix(),
-                SciRot.from_euler('y',  90, degrees=True).as_matrix(),
-                SciRot.from_euler('y', 180, degrees=True).as_matrix(),
-                SciRot.from_euler('y', 270, degrees=True).as_matrix(),
-                SciRot.from_euler('z',  90, degrees=True).as_matrix(),
-                SciRot.from_euler('z', 180, degrees=True).as_matrix(),
-                SciRot.from_euler('z', 270, degrees=True).as_matrix(),
-                # Two-axis compounds (12)
-                SciRot.from_euler('xz', [ 90,  90], degrees=True).as_matrix(),
-                SciRot.from_euler('xz', [ 90, 270], degrees=True).as_matrix(),
-                SciRot.from_euler('xz', [270,  90], degrees=True).as_matrix(),
-                SciRot.from_euler('xz', [270, 270], degrees=True).as_matrix(),
-                SciRot.from_euler('xy', [ 90,  90], degrees=True).as_matrix(),
-                SciRot.from_euler('xy', [ 90, 270], degrees=True).as_matrix(),
-                SciRot.from_euler('xy', [270,  90], degrees=True).as_matrix(),
-                SciRot.from_euler('xy', [270, 270], degrees=True).as_matrix(),
-                SciRot.from_euler('xz', [180,  90], degrees=True).as_matrix(),
-                SciRot.from_euler('xz', [180, 270], degrees=True).as_matrix(),
-                SciRot.from_euler('yz', [180,  90], degrees=True).as_matrix(),
-                SciRot.from_euler('yz', [180, 270], degrees=True).as_matrix(),
-                # Body-diagonal 120/240 (2) — rotation around [1,1,1]
-                SciRot.from_rotvec(
-                    np.array([1, 1, 1], dtype=float) / np.sqrt(3) * np.radians(120)
-                ).as_matrix(),
-                SciRot.from_rotvec(
-                    np.array([1, 1, 1], dtype=float) / np.sqrt(3) * np.radians(240)
-                ).as_matrix(),
-            ]
+            CANDIDATES = (self._fibonacci_rotations(n_rot) if use_fib
+                          else self._octahedral_rotations())
 
-            best_T, best_chamfer = None, float('inf')
+            # Each entry: (chamfer, T_refined, fitness, R_seed)
+            scored: list[tuple[float, np.ndarray, float, np.ndarray]] = []
+
             for R_candidate in CANDIDATES:
                 T_seed = np.eye(4, dtype=np.float32)
                 T_seed[:3, :3] = R_candidate.astype(np.float32)
                 T_seed[:3, 3] = t_base
+
+                if prescreen:
+                    raw_ch = chamfer_distance_one_way(model_pcd, fused_cloud, T_seed)
+                    if raw_ch > prescreen_tau:
+                        continue
+
                 T_ref, fit, _ = run_icp_in_base_frame(
                     fused_cloud, model_pcd, T_seed, max_iteration=30,
                     variant=self.args.icp_variant,
                 )
                 if fit < 0.10:
                     continue
-                ch = chamfer_distance_one_way(model_pcd, fused_cloud, T_ref)
-                if ch < best_chamfer:
-                    best_T, best_chamfer = T_ref, ch
-            return best_T, best_chamfer
+                ch = self._grid_chamfer(model_pcd, fused_cloud, per_cam_clouds, T_ref)
+                scored.append((ch, T_ref, fit, R_candidate.astype(np.float32)))
+
+            if not scored:
+                return None, float('inf')
+
+            scored.sort(key=lambda x: x[0])
+
+            if second_pass and second_k > 0 and second_n > 0:
+                for k_idx, (_, _, _, R_top) in enumerate(scored[:second_k]):
+                    for R_jit in self._jitter_rotations(R_top, second_n, second_jitter, seed=42 + k_idx):
+                        T_seed = np.eye(4, dtype=np.float32)
+                        T_seed[:3, :3] = R_jit.astype(np.float32)
+                        T_seed[:3, 3] = t_base
+
+                        if prescreen:
+                            raw_ch = chamfer_distance_one_way(model_pcd, fused_cloud, T_seed)
+                            if raw_ch > prescreen_tau:
+                                continue
+
+                        T_ref, fit, _ = run_icp_in_base_frame(
+                            fused_cloud, model_pcd, T_seed, max_iteration=30,
+                            variant=self.args.icp_variant,
+                        )
+                        if fit < 0.10:
+                            continue
+                        ch = self._grid_chamfer(model_pcd, fused_cloud, per_cam_clouds, T_ref)
+                        scored.append((ch, T_ref, fit, R_jit.astype(np.float32)))
+
+                scored.sort(key=lambda x: x[0])
+
+            best = scored[0]
+            if tie_by_inliers and len(scored) >= 2:
+                # Among entries within tie_chamfer_eps of the best, pick highest fitness.
+                ties = [s for s in scored if s[0] <= best[0] + tie_chamfer_eps]
+                best = max(ties, key=lambda s: s[2])
+
+            return best[1], float(best[0])
 
     def _log_base_pose(
         self,
@@ -2727,6 +2827,7 @@ class FoundationPoseTrackerNode(Node):
                     t_grid = time.time()
                     grid_T, grid_chamfer = self._icp_rotation_grid(
                         best_T[:3, 3], model_pcd, fused_cloud,
+                        per_cam_clouds=per_cam_clouds,
                     )
                     grid_ms = (time.time() - t_grid) * 1000
 
@@ -3243,6 +3344,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--distance-confidence-warn", action="store_true")
     p.add_argument("--distance-confidence-max-m", type=float, default=1.5)
     p.add_argument("--distance-confidence-min-mask-area", type=int, default=2000)
+
+    # C2/C3/C4/C6: rotation-grid search overhaul. All defaults preserve the
+    # current 24-element octahedral grid behaviour. Enable individually:
+    #   --icp-grid-fibonacci          : sample N uniform SO(3) seeds instead of 24 cube seeds
+    #   --icp-grid-prescreen          : skip ICP for seeds whose raw-Chamfer > tau (cheap)
+    #   --icp-grid-second-pass        : refine top-K winners with small angular jitter
+    #   --icp-grid-cross-cam-chamfer  : score by mean Chamfer across per-cam clouds
+    #   --icp-grid-tie-by-inliers     : break Chamfer ties by ICP fitness (≈ inlier count)
+    p.add_argument("--icp-grid-fibonacci", action="store_true")
+    p.add_argument("--icp-grid-n-rot", type=int, default=60)
+    p.add_argument("--icp-grid-prescreen", action="store_true")
+    p.add_argument("--icp-grid-prescreen-tau", type=float, default=0.04)
+    p.add_argument("--icp-grid-second-pass", action="store_true")
+    p.add_argument("--icp-grid-second-pass-k", type=int, default=3)
+    p.add_argument("--icp-grid-second-pass-n", type=int, default=8)
+    p.add_argument("--icp-grid-second-pass-jitter-deg", type=float, default=15.0)
+    p.add_argument("--icp-grid-cross-cam-chamfer", action="store_true")
+    p.add_argument("--icp-grid-tie-by-inliers", action="store_true")
+    p.add_argument("--icp-grid-tie-chamfer-eps-m", type=float, default=0.0005)
 
     return p.parse_args()
 
