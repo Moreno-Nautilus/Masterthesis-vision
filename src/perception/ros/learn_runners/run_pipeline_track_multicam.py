@@ -459,6 +459,26 @@ def bbox_crop_with_local_mask(
     )
 
 
+def apply_clahe_rgb(
+    rgb: np.ndarray,
+    clip_limit: float = 2.0,
+    grid_size: int = 8,
+) -> np.ndarray:
+    """D1: CLAHE on the L channel of LAB. Boosts local contrast on the
+    matte 3D-printed parts under flat lab lighting without colour shifts.
+    Returns a new (H, W, 3) uint8 RGB array.
+    """
+    if rgb.size == 0:
+        return rgb
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    clahe = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=(int(grid_size), int(grid_size)),
+    )
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
 def upscale_crop_if_small(
     rgb: np.ndarray,
     mask: np.ndarray,
@@ -1507,6 +1527,15 @@ class FoundationPoseTrackerNode(Node):
         cv2.fillPoly(roi_mask_crop, [polygon_crop], 255)
         rgb_crop_masked = rgb_crop.copy()
         rgb_crop_masked[roi_mask_crop == 0] = 0
+
+        # D1: CLAHE on the ROI before SAM. Off by default.
+        if bool(getattr(self.args, "clahe_enabled", False)):
+            rgb_crop_masked = apply_clahe_rgb(
+                rgb_crop_masked,
+                clip_limit=float(self.args.clahe_clip_limit),
+                grid_size=int(self.args.clahe_grid_size),
+            )
+
         print(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
 
         # --- Main proposal stage ---
@@ -1781,11 +1810,16 @@ class FoundationPoseTrackerNode(Node):
         if t_mag < 0.4 or t_mag > 1.5:
             return False, f"bad_distance mag={t_mag:.3f}"
 
+        # D2: table-plane physical check. Objects sit on a flat table near
+        # z_base ~= table_z. Reject anything outside [z_min, z_max]; defaults
+        # match the historical [0.0, 0.5] m gate but are now configurable.
         try:
             T_base = self._to_base_pose(cam_id, T_camera)
-            z_base = T_base[2, 3]
-            if z_base < 0.0 or z_base > 0.5:
-                return False, f"bad_z_base z={z_base:.3f}"
+            z_base = float(T_base[2, 3])
+            z_lo = float(getattr(self.args, "table_plane_z_min", 0.0))
+            z_hi = float(getattr(self.args, "table_plane_z_max", 0.5))
+            if z_base < z_lo or z_base > z_hi:
+                return False, f"bad_z_base z={z_base:.3f} (table window [{z_lo:.3f}, {z_hi:.3f}])"
         except Exception:
             pass
 
@@ -3581,6 +3615,17 @@ def parse_args() -> argparse.Namespace:
     # pixels (after the bbox+mask crop). 0 = off (current behaviour).
     # 224 is a safe default since DINOv2 ultimately resizes to 518.
     p.add_argument("--dino-min-crop-side", type=int, default=0)
+
+    # D1: CLAHE preprocessing on the L channel of LAB before SAM. Off by
+    # default. Helps on low-contrast matte parts under flat lighting.
+    p.add_argument("--clahe-enabled", action="store_true")
+    p.add_argument("--clahe-clip-limit", type=float, default=2.0)
+    p.add_argument("--clahe-grid-size", type=int, default=8)
+
+    # D2: table-plane physical check. _pose_reason rejects poses with
+    # z_base outside this window. Defaults preserve current [0, 0.5] gate.
+    p.add_argument("--table-plane-z-min", type=float, default=0.0)
+    p.add_argument("--table-plane-z-max", type=float, default=0.5)
 
     return p.parse_args()
 
