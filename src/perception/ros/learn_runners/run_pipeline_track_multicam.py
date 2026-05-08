@@ -2071,7 +2071,13 @@ class FoundationPoseTrackerNode(Node):
                         from src.perception.tracking.realtime_tracker import RealtimeTracker, RealtimeTrackerConfig
                         from src.perception.tracking.cutie_tracker import CutieConfig
                         from src.perception.tracking.icp_refiner import ICPConfig, ICPVariant
-    
+                        from src.perception.tracking.sam2_video_tracker import SAM2VideoConfig
+
+                        video_kind = str(getattr(self.args, "video_tracker", "cutie")).lower()
+                        sam2_cfg = SAM2VideoConfig(
+                            max_internal_size=480,
+                            memory_crop_padding_px=int(getattr(self.args, "track_memory_crop_padding", 0)),
+                        )
                         cfg = RealtimeTrackerConfig(
                             cutie_cfg=CutieConfig(max_internal_size=480),
                             icp_cfg=ICPConfig(
@@ -2083,6 +2089,8 @@ class FoundationPoseTrackerNode(Node):
                             max_translation_per_frame=0.08,
                             lost_frames_before_reinit=999,
                             verbose=False,
+                            video_tracker_kind=video_kind,
+                            sam2_cfg=sam2_cfg,
                         )
                         rt = RealtimeTracker(cfg)
                         init_mask = state.recovery_mask
@@ -3626,6 +3634,15 @@ def parse_args() -> argparse.Namespace:
     # z_base outside this window. Defaults preserve current [0, 0.5] gate.
     p.add_argument("--table-plane-z-min", type=float, default=0.0)
     p.add_argument("--table-plane-z-max", type=float, default=0.5)
+
+    # Bundle 10: A5/A6/B5 — alternative video tracker.
+    # A5: choose backend; default keeps current Cutie behaviour. SAM2 falls
+    # back to Cutie automatically if it fails to load or fails mid-stream.
+    p.add_argument("--video-tracker", choices=["cutie", "sam2"], default="cutie")
+    # B5: pad (in internal-resolution px) of the memory crop used to re-prompt
+    # SAM2 each frame. 0 disables the crop and feeds the full image, matching
+    # current behaviour. Only consulted when --video-tracker sam2.
+    p.add_argument("--track-memory-crop-padding", type=int, default=0)
 
     return p.parse_args()
 

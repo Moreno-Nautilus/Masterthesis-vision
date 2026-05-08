@@ -37,6 +37,7 @@ import numpy as np
 
 from .cutie_tracker import CutieConfig, CutieTracker, CutieResult
 from .icp_refiner import ICPConfig, ICPRefiner, ICPResult, ICPVariant
+from .sam2_video_tracker import SAM2VideoConfig, SAM2VideoTracker
 
 
 class TrackingState(Enum):
@@ -53,6 +54,12 @@ class RealtimeTrackerConfig:
     # Sub-module configs
     cutie_cfg: CutieConfig = field(default_factory=CutieConfig)
     icp_cfg: ICPConfig = field(default_factory=ICPConfig)
+
+    # A5: video-tracker backend. Default "cutie" preserves current behaviour;
+    # "sam2" routes mask tracking through SAM2VideoTracker, with Cutie kept
+    # as a runtime fallback if SAM2 fails to load or fails to track.
+    video_tracker_kind: str = "cutie"
+    sam2_cfg: SAM2VideoConfig = field(default_factory=SAM2VideoConfig)
     
     # Quality thresholds for tracking
     min_mask_area: int = 100  # Minimum pixels to consider valid
@@ -97,9 +104,14 @@ class TrackingResult:
     cutie_ms: float
     icp_ms: float
     total_ms: float
-    
+
     # Debug info
     message: str = ""
+
+    # A6: 0.0 (clean) -> 1.0 (very uncertain). 0.0 when not produced.
+    occlusion_score: float = 0.0
+    # Which backend produced this frame's mask: "cutie" or "sam2".
+    mask_backend: str = "cutie"
 
 
 class RealtimeTracker:
@@ -109,9 +121,22 @@ class RealtimeTracker:
     
     def __init__(self, cfg: Optional[RealtimeTrackerConfig] = None):
         self.cfg = cfg or RealtimeTrackerConfig()
-        
-        # Sub-modules
+
+        # Sub-modules. Cutie is always available as a fallback; SAM2 is
+        # only constructed when explicitly selected.
         self._cutie = CutieTracker(self.cfg.cutie_cfg)
+        self._sam2: Optional[SAM2VideoTracker] = None
+        self._mask_backend: str = "cutie"
+        if self.cfg.video_tracker_kind.lower() == "sam2":
+            try:
+                self._sam2 = SAM2VideoTracker(self.cfg.sam2_cfg)
+                self._mask_backend = "sam2"
+            except Exception as e:
+                if self.cfg.verbose:
+                    print(f"[RealtimeTracker] SAM2 unavailable, falling back to Cutie: {e}")
+                self._sam2 = None
+                self._mask_backend = "cutie"
+
         self._icp = ICPRefiner(self.cfg.icp_cfg)
         
         # State
@@ -162,8 +187,18 @@ class RealtimeTracker:
             model_vertices: (N, 3) model point cloud (alternative to mesh)
             model_colors: (N, 3) model colors [0, 1] (optional)
         """
-        # Initialize Cutie with first frame + mask
-        self._cutie.initialize(rgb, mask.astype(np.uint8))
+        # Initialize the chosen mask-tracking backend with first frame + mask.
+        if self._sam2 is not None:
+            try:
+                self._sam2.initialize(rgb, mask.astype(np.uint8))
+            except Exception as e:
+                if self.cfg.verbose:
+                    print(f"[RealtimeTracker] SAM2 init failed, falling back to Cutie: {e}")
+                self._sam2 = None
+                self._mask_backend = "cutie"
+                self._cutie.initialize(rgb, mask.astype(np.uint8))
+        else:
+            self._cutie.initialize(rgb, mask.astype(np.uint8))
         
         # Initialize ICP with model
         if mesh_path is not None:
@@ -215,13 +250,28 @@ class RealtimeTracker:
         t0 = time.time()
 
         # =====================================================================
-        # Stage 1: Mask tracking with CuteVOS
+        # Stage 1: Mask tracking (Cutie or SAM2). On SAM2 failure mid-stream
+        # we don't try to hot-swap to Cutie because Cutie wasn't initialized
+        # on this frame's first stage; we just mark the frame lost.
         # =====================================================================
+        occlusion_score = 0.0
+        backend_used = self._mask_backend
         try:
-            cutie_result = self._cutie.track(rgb)
+            if self._sam2 is not None:
+                sam2_res = self._sam2.track(rgb)
+                cutie_result = CutieResult(
+                    mask=sam2_res.mask,
+                    prob=sam2_res.prob,
+                    bbox_xyxy=sam2_res.bbox_xyxy,
+                    area=sam2_res.area,
+                    elapsed_ms=sam2_res.elapsed_ms,
+                )
+                occlusion_score = float(sam2_res.occlusion_score)
+            else:
+                cutie_result = self._cutie.track(rgb)
         except Exception as e:
-            self._handle_lost(f"Cutie failed: {e}")
-            return self._make_invalid_result(f"Cutie failed: {e}")
+            self._handle_lost(f"{backend_used} failed: {e}")
+            return self._make_invalid_result(f"{backend_used} failed: {e}")
 
         cutie_ms = cutie_result.elapsed_ms
 
@@ -257,6 +307,8 @@ class RealtimeTracker:
                 icp_ms=0.0,
                 total_ms=total_ms,
                 message="OK (mask-only)",
+                occlusion_score=occlusion_score,
+                mask_backend=backend_used,
             )
         
         # =====================================================================
@@ -345,6 +397,8 @@ class RealtimeTracker:
             icp_ms=icp_ms,
             total_ms=total_ms,
             message="OK",
+            occlusion_score=occlusion_score,
+            mask_backend=backend_used,
         )
     
     def _check_motion_sanity(self, T_new: np.ndarray) -> bool:
@@ -420,6 +474,11 @@ class RealtimeTracker:
     def reset(self) -> None:
         """Reset tracker state."""
         self._cutie.reset()
+        if self._sam2 is not None:
+            try:
+                self._sam2.reset()
+            except Exception:
+                pass
         self._state = TrackingState.UNINITIALIZED
         self._T_current = None
         self._T_prev = None
