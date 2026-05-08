@@ -459,6 +459,32 @@ def bbox_crop_with_local_mask(
     )
 
 
+def upscale_crop_if_small(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    min_side: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """A8: bicubic-upscale a small crop so DINOv2's input-size downsample
+    doesn't throw away detail. RGB uses bicubic, mask uses nearest neighbour
+    (so the boolean stays clean). No-op when min_side <= 0 or the crop is
+    already large enough.
+    """
+    if min_side <= 0:
+        return rgb, mask
+    h, w = rgb.shape[:2]
+    short = min(h, w)
+    if short == 0 or short >= min_side:
+        return rgb, mask
+    scale = float(min_side) / float(short)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    rgb_up = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    mask_up = cv2.resize(
+        mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST
+    ).astype(mask.dtype)
+    return rgb_up, mask_up
+
+
 def reject_large_masks(
     masks: list[SAMMaskCandidate],
     h: int,
@@ -1511,10 +1537,14 @@ class FoundationPoseTrackerNode(Node):
         crops_mask: list[np.ndarray | None] = []
         valid_indices: list[int] = []
 
+        dino_min_crop = int(getattr(self.args, "dino_min_crop_side", 0))
         for i, cand in enumerate(masks):
             crop_rgb, crop_mask = bbox_crop_with_local_mask(rgb, cand.mask, cand.bbox_xyxy)
             if crop_rgb.size == 0 or int(crop_mask.sum()) == 0:
                 continue
+            # A8: upscale tiny crops so DINOv2's resize-to-input_size doesn't
+            # throw away detail on small objects (cooling_screw, cooling_f).
+            crop_rgb, crop_mask = upscale_crop_if_small(crop_rgb, crop_mask, dino_min_crop)
             crops_rgb.append(crop_rgb)
             crops_mask.append(crop_mask)
             valid_indices.append(i)
@@ -3470,6 +3500,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-aspect-cf-cs-rule", action="store_true", default=True)
     p.add_argument("--no-aspect-cf-cs-rule", dest="use_aspect_cf_cs_rule",
                    action="store_false")
+
+    # A8: bicubic-upscale DINO crops whose short side is below this many
+    # pixels (after the bbox+mask crop). 0 = off (current behaviour).
+    # 224 is a safe default since DINOv2 ultimately resizes to 518.
+    p.add_argument("--dino-min-crop-side", type=int, default=0)
 
     return p.parse_args()
 
