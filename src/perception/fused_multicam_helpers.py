@@ -209,24 +209,44 @@ def run_icp_in_base_frame(
     T_base_object_init: np.ndarray,
     max_correspondence_dist: float = 0.05,
     max_iteration: int = 30,
+    variant: str = "point_to_point",
+    normal_radius: float = 0.01,
 ) -> tuple[np.ndarray, float, float]:
     """
-    Run point-to-point ICP in base frame.
+    Run ICP in base frame.
 
     source = model points (object-local frame, transformed by T_init)
     target = scene points (already in base frame)
+
+    Args:
+        variant: "point_to_point" (default, geometry-only) or "point_to_plane"
+                 (penalises normal-direction error; better on flat faces / cylinders).
+                 If "point_to_plane" is requested, scene normals are estimated
+                 if absent (model normals are not needed since model is the source).
+        normal_radius: search radius for normal estimation when variant requires it.
 
     Returns:
         T_base_object_refined (4x4 float32), fitness, rmse
     """
     T_init = np.asarray(T_base_object_init, dtype=np.float64).reshape(4, 4)
 
+    if variant == "point_to_plane":
+        if not scene_pcd.has_normals() and len(scene_pcd.points) >= 10:
+            scene_pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=30)
+            )
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+    elif variant == "point_to_point":
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    else:
+        raise ValueError(f"Unknown ICP variant: {variant!r} (expected point_to_point or point_to_plane)")
+
     result = o3d.pipelines.registration.registration_icp(
         source=model_pcd,
         target=scene_pcd,
         max_correspondence_distance=max_correspondence_dist,
         init=T_init,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        estimation_method=estimation,
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
             max_iteration=max_iteration,
         ),

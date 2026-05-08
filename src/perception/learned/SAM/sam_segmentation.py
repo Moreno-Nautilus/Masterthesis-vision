@@ -43,7 +43,12 @@ class SAMSegmenterConfig:
     auto_stability_score_thresh: float = 0.65 #0.75
     auto_crop_n_layers: int = 0 # WAS 1
     auto_crop_n_points_downscale_factor: int = 2
-    auto_min_mask_region_area: int = 150 #200 
+    auto_min_mask_region_area: int = 150 #200
+
+    # Maximum allowed bbox aspect ratio (max_side / min_side). Bumped 2.5 -> 4.5
+    # because cooling_f at oblique viewing angles can hit ~3.5:1 and was being
+    # silently rejected before DINO ever saw it.
+    max_aspect_ratio: float = 4.5
 
     # Shadow rejection (HSV-based)
     shadow_filter_enabled: bool = True
@@ -183,7 +188,7 @@ class SAMSegmenter:
 
         # Reject overly elongated masks (likely merged objects or artifacts)
         aspect_ratio = max(bw, bh) / (min(bw, bh) + 1e-6)
-        if aspect_ratio > 2.5:  # Tune if needed - screws shouldn't be more than 4:1
+        if aspect_ratio > self.cfg.max_aspect_ratio:
             return False
 
         # Reject masks where fill ratio is too low (bbox much larger than mask)

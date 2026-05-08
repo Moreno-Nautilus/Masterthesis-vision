@@ -972,6 +972,7 @@ class FoundationPoseTrackerNode(Node):
                 T_seed[:3, 3] = t_base
                 T_ref, fit, _ = run_icp_in_base_frame(
                     fused_cloud, model_pcd, T_seed, max_iteration=30,
+                    variant=self.args.icp_variant,
                 )
                 if fit < 0.10:
                     continue
@@ -1471,6 +1472,28 @@ class FoundationPoseTrackerNode(Node):
                 if raw_best_score < self.args.dino_min_score:
                     object_id = "unknown"
                 if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
+                    object_id = "unknown"
+
+            # B4: softmax-entropy gate. Independent of raw cosine scale — flags
+            # cases where multiple classes look near-equally similar even if the
+            # raw score is high.
+            if (
+                self.args.dino_entropy_threshold > 0.0
+                and object_id != "unknown"
+                and not geometric_resolved
+                and len(res.scores_by_object) >= 2
+            ):
+                tau = max(1e-3, float(self.args.dino_entropy_tau))
+                logits = np.array(list(res.scores_by_object.values()), dtype=np.float64) / tau
+                logits -= logits.max()
+                probs = np.exp(logits)
+                probs /= probs.sum() + 1e-12
+                entropy = float(-(probs * np.log(probs + 1e-12)).sum())
+                if entropy > self.args.dino_entropy_threshold:
+                    self.get_logger().info(
+                        f"DINO entropy reject {object_id}: H={entropy:.3f} > "
+                        f"{self.args.dino_entropy_threshold:.3f}"
+                    )
                     object_id = "unknown"
 
             bbox_max_side = max(bw, bh)
@@ -2090,6 +2113,7 @@ class FoundationPoseTrackerNode(Node):
                 T_base_object_init=T_base_init,
                 max_correspondence_dist=float(self.args.fused_track_icp_max_correspondence_dist_m),
                 max_iteration=icp_iters,
+                variant=self.args.icp_variant,
             )
     
             dt, drot = self._pose_delta_from_base(prev_base_pose, T_base_fused)
@@ -2665,6 +2689,7 @@ class FoundationPoseTrackerNode(Node):
                     T_base_object_init=T_base,
                     max_correspondence_dist=0.05,
                     max_iteration=30,
+                    variant=self.args.icp_variant,
                 )
                 icp_ms = (time.time() - t_icp) * 1000
 
@@ -2832,6 +2857,7 @@ class FoundationPoseTrackerNode(Node):
                 T_base_object_init=T_base_canonical,
                 max_correspondence_dist=0.03,   # tighter than initial — already close
                 max_iteration=20,
+                variant=self.args.icp_variant,
             )
             polish_chamfer = chamfer_distance_one_way(model_pcd, fused_cloud, T_base_canonical)
             polish_ms = (time.time() - t_polish) * 1000
@@ -2854,6 +2880,21 @@ class FoundationPoseTrackerNode(Node):
                 f"weights=[{weights_str}]"
                 f"{' [SINGLE-CAM]' if is_single_cam else ''}"
             )
+
+            # C9: distance/mask-area-based confidence warning. Cheap, log-only.
+            if self.args.distance_confidence_warn:
+                dist_m = float(np.linalg.norm(T_publish[:3, 3]))
+                min_mask_area = min(
+                    int(d.mask.sum()) for d in fused.detections
+                ) if fused.detections else 0
+                if (
+                    dist_m > self.args.distance_confidence_max_m
+                    or min_mask_area < self.args.distance_confidence_min_mask_area
+                ):
+                    print(
+                        f"  LOW-CONFIDENCE {fused.object_id}: "
+                        f"dist={dist_m:.2f}m min_mask_area={min_mask_area}"
+                    )
 
             # ─── Step 3e: Back-project to all contributing cameras ───
             for det_idx, det in enumerate(fused.detections):
@@ -3017,9 +3058,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cad-dir", default="Data/CAD_Models_centered")
     p.add_argument("--output-root", default="outputs/foundationpose")
 
+    # DINO backbone. dinov2_vitb14 = current default (faster). Pass
+    # dinov2_vitl14 for higher fidelity per DINOv2 paper Fig. 2/5.
     p.add_argument("--dino-model-name", default="dinov2_vitb14")
     p.add_argument("--dino-min-score", type=float, default=0.55)
     p.add_argument("--dino-min-margin", type=float, default=0.0)
+    # B4: softmax-entropy gate over per-object scores. Higher = less confident.
+    # Disabled at 0.0 (default); typical effective range ~0.6-0.9 with tau=0.05.
+    p.add_argument("--dino-entropy-threshold", type=float, default=0.0)
+    p.add_argument("--dino-entropy-tau", type=float, default=0.05)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
     p.add_argument("--cooling-base-min-bbox-side-px", type=int, default=140)
@@ -3162,6 +3209,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chamfer-skip-fitness-min", type=float, default=0.30)
     p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.005)
     p.add_argument("--chamfer-skip-motion-max-m", type=float, default=0.010)
+
+    # C1: ICP variant for run_icp_in_base_frame. point_to_plane penalises
+    # normal-direction error and converges better on flat faces / cylinders;
+    # point_to_point is the historical default and our current behaviour.
+    p.add_argument("--icp-variant", choices=["point_to_point", "point_to_plane"],
+                   default="point_to_point")
+
+    # C9: warn-tag poses that are likely lower confidence (far away / tiny mask).
+    # Default off so behaviour matches current logs.
+    p.add_argument("--distance-confidence-warn", action="store_true")
+    p.add_argument("--distance-confidence-max-m", type=float, default=1.5)
+    p.add_argument("--distance-confidence-min-mask-area", type=int, default=2000)
 
     return p.parse_args()
 
