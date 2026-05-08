@@ -171,17 +171,32 @@ class DINOIdentifier:
 
         return feat.squeeze(0).detach().cpu().numpy()
 
-    def build_reference_bank_from_folder(self, cache_path: str | None = None) -> None:
-        root = Path(self.cfg.reference_dir)
-        if not root.exists():
-            raise FileNotFoundError(f"Reference directory does not exist: {root}")
+    def build_reference_bank_from_folder(
+        self,
+        cache_path: str | None = None,
+        extra_dirs: list[str] | None = None,
+    ) -> None:
+        roots = [Path(self.cfg.reference_dir)]
+        if extra_dirs:
+            roots.extend(Path(d) for d in extra_dirs if d)
 
-        # Default cache path next to reference dir. Tag with model + mode so
-        # switching DINO model or embedding mode doesn't reuse a stale cache
-        # of incompatible dimensionality.
+        # Drop dirs that don't exist; raise only if none remain.
+        existing_roots = [r for r in roots if r.exists()]
+        if not existing_roots:
+            raise FileNotFoundError(
+                f"None of the reference directories exist: {[str(r) for r in roots]}"
+            )
+        roots = existing_roots
+
+        primary_root = roots[0]
+
+        # Default cache path next to primary reference dir. Tag with model + mode
+        # AND a digest of all root paths so caches don't get reused across
+        # different reference-source combinations.
         if cache_path is None:
-            tag = f"{self.cfg.model_name}__{self.cfg.embedding_mode}"
-            cache_path = str(root / f"_embedding_cache__{tag}.npz")
+            roots_tag = "_".join(sorted(r.name for r in roots))
+            tag = f"{self.cfg.model_name}__{self.cfg.embedding_mode}__{roots_tag}"
+            cache_path = str(primary_root / f"_embedding_cache__{tag}.npz")
 
         # Try to load from cache
         if Path(cache_path).exists():
@@ -191,12 +206,13 @@ class DINOIdentifier:
                 cached_object_ids = list(cached["object_ids"])
                 cached_embeddings = cached["embeddings"]
 
-                # Verify cache matches current folder structure
+                # Verify cache matches current folder structure (across all roots).
                 current_paths = []
-                for object_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-                    for img_path in sorted(object_dir.iterdir()):
-                        if img_path.suffix.lower() in self.cfg.allowed_exts:
-                            current_paths.append(str(img_path))
+                for r in roots:
+                    for object_dir in sorted(p for p in r.iterdir() if p.is_dir()):
+                        for img_path in sorted(object_dir.iterdir()):
+                            if img_path.suffix.lower() in self.cfg.allowed_exts:
+                                current_paths.append(str(img_path))
 
                 if cached_paths == current_paths:
                     # Cache is valid, use it
@@ -219,10 +235,11 @@ class DINOIdentifier:
             except Exception as e:
                 print(f"[DINO] Cache load failed, rebuilding: {e}")
 
-        # Build from scratch
+        # Build from scratch (iterate across all reference roots).
         bank: list[ReferenceEmbedding] = []
 
-        for object_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for r in roots:
+          for object_dir in sorted(p for p in r.iterdir() if p.is_dir()):
             object_id = object_dir.name
             for img_path in sorted(object_dir.iterdir()):
                 if img_path.suffix.lower() not in self.cfg.allowed_exts:
@@ -243,7 +260,9 @@ class DINOIdentifier:
                 )
 
         if not bank:
-            raise RuntimeError(f"No valid reference images found in {root}")
+            raise RuntimeError(
+                f"No valid reference images found under: {[str(r) for r in roots]}"
+            )
 
         self.reference_bank = bank
         self.reference_matrix = np.stack([r.embedding for r in bank], axis=0)
