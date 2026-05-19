@@ -283,6 +283,8 @@ def run_icp_in_base_frame(
     max_iteration: int = 30,
     variant: str = "point_to_point",
     normal_radius: float = 0.01,
+    relative_fitness: float = 1e-6,
+    relative_rmse: float = 1e-6,
 ) -> tuple[np.ndarray, float, float]:
     """
     Run ICP in base frame.
@@ -321,11 +323,33 @@ def run_icp_in_base_frame(
         estimation_method=estimation,
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
             max_iteration=max_iteration,
+            relative_fitness=relative_fitness,
+            relative_rmse=relative_rmse,
         ),
     )
 
     T_refined = np.asarray(result.transformation, dtype=np.float32).reshape(4, 4)
     return T_refined, float(result.fitness), float(result.inlier_rmse)
+
+
+def evaluate_icp_in_base_frame(
+    scene_pcd: o3d.geometry.PointCloud,
+    model_pcd: o3d.geometry.PointCloud,
+    T_base_object: np.ndarray,
+    max_correspondence_dist: float = 0.05,
+) -> tuple[float, float]:
+    """Return (fitness, inlier_rmse) for the given transform without running
+    ICP iterations. Use after a non-ICP refinement (symmetry grid, FP-refine)
+    so logged metrics and fusion weights reflect the final pose.
+    """
+    T = np.asarray(T_base_object, dtype=np.float64).reshape(4, 4)
+    result = o3d.pipelines.registration.evaluate_registration(
+        source=model_pcd,
+        target=scene_pcd,
+        max_correspondence_distance=max_correspondence_dist,
+        transformation=T,
+    )
+    return float(result.fitness), float(result.inlier_rmse)
 
 
 # ─── Chamfer distance for pose evaluation ────────────────────────────────

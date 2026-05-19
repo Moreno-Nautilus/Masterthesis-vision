@@ -11,10 +11,14 @@ import torch
 @dataclass
 class SAMMaskCandidate:
     mask: np.ndarray  # (H, W) bool
-    score: float
+    score: float                              # SAM IoU / stability score
     bbox_xyxy: tuple[int, int, int, int]
     area: int
     crop_rgb: np.ndarray | None = None
+    # MUSE Eq.10 objectness prior. For the gdino_sam / yolo_sam paths this
+    # carries the box-proposer's confidence (Grounding DINO or YOLO). Stays
+    # None on the automatic-mask-generator path.
+    prompt_score: float | None = None
 
 
 @dataclass
@@ -302,15 +306,27 @@ class SAMSegmenter:
         self,
         rgb: np.ndarray,
         boxes_xyxy: np.ndarray,
+        box_scores: np.ndarray | None = None,
     ) -> list[SAMMaskCandidate]:
         """Box-prompted segmentation. One mask per box; uses each box as a
         prompt to SAM's image predictor. Used by the Grounding-DINO + SAM
-        proposal path (Bundle 8 / MUSE-style)."""
+        proposal path (Bundle 8 / MUSE-style).
+
+        If `box_scores` is provided (same length as `boxes_xyxy`), the
+        corresponding objectness/confidence is attached to each returned
+        candidate as `prompt_score`. MUSE Eq.10 consumes this downstream.
+        """
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
         boxes = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
         if boxes.shape[0] == 0:
             return []
+        if box_scores is not None:
+            box_scores = np.asarray(box_scores, dtype=np.float32).reshape(-1)
+            if box_scores.shape[0] != boxes.shape[0]:
+                raise ValueError(
+                    f"box_scores length {box_scores.shape[0]} != boxes {boxes.shape[0]}"
+                )
 
         rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
         boxes_scaled = boxes * scale if scale != 1.0 else boxes
@@ -328,7 +344,7 @@ class SAMSegmenter:
                 self._predictor.set_image(rgb_small)
                 out: list[SAMMaskCandidate] = []
                 h0, w0 = rgb.shape[:2]
-                for box in boxes_scaled:
+                for idx, box in enumerate(boxes_scaled):
                     masks, scores, _ = self._predictor.predict(
                         box=box, multimask_output=False,
                     )
@@ -345,8 +361,12 @@ class SAMSegmenter:
                     bbox = self._bbox_from_mask(mask)
                     area = int(mask.sum())
                     crop_rgb = self._crop_rgb(rgb, bbox) if self.cfg.attach_rgb_crops else None
+                    prompt_score = (
+                        float(box_scores[idx]) if box_scores is not None else None
+                    )
                     out.append(SAMMaskCandidate(
-                        mask=mask, score=score, bbox_xyxy=bbox, area=area, crop_rgb=crop_rgb,
+                        mask=mask, score=score, bbox_xyxy=bbox, area=area,
+                        crop_rgb=crop_rgb, prompt_score=prompt_score,
                     ))
         out.sort(key=lambda x: (x.score, x.area), reverse=True)
         return out

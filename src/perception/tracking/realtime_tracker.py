@@ -38,6 +38,7 @@ import numpy as np
 from .cutie_tracker import CutieConfig, CutieTracker, CutieResult
 from .icp_refiner import ICPConfig, ICPRefiner, ICPResult, ICPVariant
 from .sam2_video_tracker import SAM2VideoConfig, SAM2VideoTracker
+from .sam2_streaming_tracker import SAM2StreamingConfig, SAM2StreamingTracker
 
 
 class TrackingState(Enum):
@@ -55,11 +56,15 @@ class RealtimeTrackerConfig:
     cutie_cfg: CutieConfig = field(default_factory=CutieConfig)
     icp_cfg: ICPConfig = field(default_factory=ICPConfig)
 
-    # A5: video-tracker backend. Default "cutie" preserves current behaviour;
-    # "sam2" routes mask tracking through SAM2VideoTracker, with Cutie kept
-    # as a runtime fallback if SAM2 fails to load or fails to track.
+    # A5: video-tracker backend. Default "cutie" preserves current behaviour.
+    # "sam2" routes mask tracking through SAM2ImagePredictor with the previous
+    # low-res mask as a re-prompt (length-1 memory). When sam2_use_video_predictor
+    # is also True, we instead drive the real SAM2VideoPredictor in streaming
+    # mode (full memory bank across frames).
     video_tracker_kind: str = "cutie"
     sam2_cfg: SAM2VideoConfig = field(default_factory=SAM2VideoConfig)
+    sam2_use_video_predictor: bool = False
+    sam2_streaming_cfg: SAM2StreamingConfig = field(default_factory=SAM2StreamingConfig)
     
     # Quality thresholds for tracking
     min_mask_area: int = 100  # Minimum pixels to consider valid
@@ -122,20 +127,21 @@ class RealtimeTracker:
     def __init__(self, cfg: Optional[RealtimeTrackerConfig] = None):
         self.cfg = cfg or RealtimeTrackerConfig()
 
-        # Sub-modules. Cutie is always available as a fallback; SAM2 is
-        # only constructed when explicitly selected.
-        self._cutie = CutieTracker(self.cfg.cutie_cfg)
-        self._sam2: Optional[SAM2VideoTracker] = None
-        self._mask_backend: str = "cutie"
+        # Sub-modules. When SAM2 is explicitly selected we skip building
+        # Cutie entirely — no warmup cost and no silent fallback. Failure to
+        # construct SAM2 raises so the caller sees the real error.
+        self._sam2: Optional[SAM2VideoTracker | SAM2StreamingTracker] = None
+        self._cutie: Optional[CutieTracker] = None
         if self.cfg.video_tracker_kind.lower() == "sam2":
-            try:
+            if self.cfg.sam2_use_video_predictor:
+                self._sam2 = SAM2StreamingTracker(self.cfg.sam2_streaming_cfg)
+                self._mask_backend = "sam2-video"
+            else:
                 self._sam2 = SAM2VideoTracker(self.cfg.sam2_cfg)
                 self._mask_backend = "sam2"
-            except Exception as e:
-                if self.cfg.verbose:
-                    print(f"[RealtimeTracker] SAM2 unavailable, falling back to Cutie: {e}")
-                self._sam2 = None
-                self._mask_backend = "cutie"
+        else:
+            self._cutie = CutieTracker(self.cfg.cutie_cfg)
+            self._mask_backend = "cutie"
 
         self._icp = ICPRefiner(self.cfg.icp_cfg)
         
@@ -188,15 +194,10 @@ class RealtimeTracker:
             model_colors: (N, 3) model colors [0, 1] (optional)
         """
         # Initialize the chosen mask-tracking backend with first frame + mask.
+        # When SAM2 is selected we do not fall back to Cutie on init failure —
+        # init errors propagate so the caller can handle them.
         if self._sam2 is not None:
-            try:
-                self._sam2.initialize(rgb, mask.astype(np.uint8))
-            except Exception as e:
-                if self.cfg.verbose:
-                    print(f"[RealtimeTracker] SAM2 init failed, falling back to Cutie: {e}")
-                self._sam2 = None
-                self._mask_backend = "cutie"
-                self._cutie.initialize(rgb, mask.astype(np.uint8))
+            self._sam2.initialize(rgb, mask.astype(np.uint8))
         else:
             self._cutie.initialize(rgb, mask.astype(np.uint8))
         
@@ -473,7 +474,8 @@ class RealtimeTracker:
     
     def reset(self) -> None:
         """Reset tracker state."""
-        self._cutie.reset()
+        if self._cutie is not None:
+            self._cutie.reset()
         if self._sam2 is not None:
             try:
                 self._sam2.reset()

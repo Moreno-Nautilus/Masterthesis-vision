@@ -165,6 +165,42 @@ class SAM2VideoTracker:
             return rgb_small, None
         return rgb_small[y0:y1, x0:x1], (x0, y0, x1, y1)
 
+    def _build_mask_prior(
+        self,
+        crop_box: tuple[int, int, int, int] | None,
+        low_res_hw: tuple[int, int],
+    ) -> np.ndarray:
+        """Rebuild the SAM2 mask_input prior in the *current* image frame.
+
+        The previous frame's low-res logits are tied to the previous crop
+        coordinates; when crop_box changes frame-to-frame, reusing them
+        feeds SAM2 a prior in mismatched coordinates. We instead resample
+        ``self._last_full_mask`` into the current crop (or full rgb_small
+        when crop_box is None), then convert to a logit-style prior at
+        SAM2's low-res input shape.
+        """
+        if self._scale < 1.0:
+            mask_small = cv2.resize(
+                self._last_full_mask.astype(np.uint8),
+                (self._new_w, self._new_h),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        else:
+            mask_small = self._last_full_mask
+        if crop_box is None:
+            region = mask_small
+        else:
+            x0, y0, x1, y1 = crop_box
+            region = mask_small[y0:y1, x0:x1]
+        h_low, w_low = low_res_hw
+        region_low = cv2.resize(
+            region.astype(np.uint8), (w_low, h_low),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        # ±10 maps through sigmoid to ~{0,1}, matching SAM/SAM2 prior conventions.
+        logits = np.where(region_low, 10.0, -10.0).astype(np.float32)
+        return logits[None, :, :]
+
     def track(self, rgb: np.ndarray) -> SAM2VideoResult:
         if not self._initialized:
             raise RuntimeError("Call initialize() before track()")
@@ -175,8 +211,14 @@ class SAM2VideoTracker:
 
         with torch.inference_mode(), self._autocast_ctx():
             self._predictor.set_image(crop)
-            # Re-prompt SAM2 with the previous low-res mask.
-            mask_input = self._last_low_res_mask  # (1, h, w)
+            # Re-prompt SAM2 with a prior aligned to the current crop frame.
+            # (Reusing self._last_low_res_mask directly would break when
+            # crop_box changes between frames — see _build_mask_prior.)
+            low_res_hw = (
+                self._last_low_res_mask.shape[-2],
+                self._last_low_res_mask.shape[-1],
+            )
+            mask_input = self._build_mask_prior(crop_box, low_res_hw)
             masks, scores, low_res = self._predictor.predict(
                 mask_input=mask_input,
                 multimask_output=False,

@@ -55,6 +55,7 @@ from src.perception.fused_multicam_helpers import (
     merge_point_clouds_weighted,
     mesh_to_pcd_cached,
     run_icp_in_base_frame,
+    evaluate_icp_in_base_frame,
     chamfer_distance_one_way,
     weighted_average_poses,
     MedianPoseBuffer,
@@ -230,6 +231,21 @@ class ObjectTrackState:
     def __post_init__(self):
         if self.kalman is None:
             self.kalman = PoseKalmanFilter()
+
+
+@dataclass
+class MemoryCrop:
+    """A clean appearance snapshot of a tracked object, captured when ICP
+    fitness was good. Used at reinit to re-rank SAM/DINO candidates so the
+    pipeline picks the same instance it was tracking instead of a same-class
+    look-alike."""
+    object_id: str
+    cam_id: str
+    frame_idx: int
+    fitness: float
+    embedding: np.ndarray            # L2-normalised DINO embedding
+    rgb_crop: Optional[np.ndarray] = None   # uint8 HxWx3; kept only if --memory-crop-keep-rgb
+    mask_crop: Optional[np.ndarray] = None  # bool HxW; kept only if --memory-crop-keep-rgb
 
 
 @dataclass
@@ -685,6 +701,7 @@ def lift_crop_masks_to_full_image(
                 bbox_xyxy=(bx0 + x0, by0 + y0, bx1 + x0, by1 + y0),
                 area=int(c.area),
                 score=float(c.score),
+                prompt_score=c.prompt_score,
             )
         )
     return lifted
@@ -741,9 +758,23 @@ def batch_dino_classify(
     dino: DINOIdentifier,
     crops_rgb: list[np.ndarray],
     crops_mask: list[np.ndarray | None],
+    objectness_priors: list[float | None] | None = None,
 ) -> list[DINOResult]:
+    """Embed `crops_rgb` in one forward pass, then classify each via the bank.
+
+    Supports every `embedding_mode` declared by DINOIdentifierConfig
+    (cls, patch_gem, concat, two_stream, patch_match).
+
+    `objectness_priors`, if provided, must have the same length as `crops_rgb`
+    and carries the per-proposal box-objectness score (e.g. from Grounding
+    DINO). It is forwarded into `classify_embedding` for MUSE Eq.10 scaling.
+    """
     if not crops_rgb:
         return []
+    if objectness_priors is not None and len(objectness_priors) != len(crops_rgb):
+        raise ValueError(
+            f"objectness_priors len {len(objectness_priors)} != crops {len(crops_rgb)}"
+        )
 
     tensors = []
     for rgb, mask in zip(crops_rgb, crops_mask):
@@ -753,22 +784,85 @@ def batch_dino_classify(
         tensors.append(t)
 
     batch = torch.cat(tensors, dim=0)
+    mode = dino.cfg.embedding_mode
 
-    with torch.inference_mode():
-        feats = dino.model(batch)
-
-    if isinstance(feats, dict):
-        if "x_norm_clstoken" in feats:
+    # B2 / M1: patch_match keeps the full per-patch grid alongside an explicit
+    # foreground patch mask derived from each crop's input mask.
+    query_patch_masks: list[np.ndarray | None] = [None] * len(crops_rgb)
+    if mode == "patch_match":
+        with torch.inference_mode():
+            out = dino.model.forward_features(batch)
+        if not isinstance(out, dict):
+            raise RuntimeError(
+                f"forward_features returned {type(out)}; expected dict"
+            )
+        patch_toks = out["x_norm_patchtokens"]  # (B, N_p, D)
+        patch_toks = F.normalize(patch_toks, dim=2)
+        embeddings = patch_toks.detach().cpu().numpy()  # (B, N_p, D)
+        for i, m in enumerate(crops_mask):
+            if m is None:
+                query_patch_masks[i] = None
+            else:
+                query_patch_masks[i] = dino._patch_mask_from_input_mask(m)
+    elif mode == "cls":
+        with torch.inference_mode():
+            feats = dino.model(batch)
+        if isinstance(feats, dict):
+            if "x_norm_clstoken" not in feats:
+                raise RuntimeError(f"Unexpected DINO output keys: {list(feats.keys())}")
             feats = feats["x_norm_clstoken"]
-        else:
-            raise RuntimeError(f"Unexpected DINO output keys: {list(feats.keys())}")
+        feats = feats.reshape(batch.shape[0], -1)
+        if dino.cfg.normalize_embeddings:
+            feats = F.normalize(feats, dim=1)
+        embeddings = feats.detach().cpu().numpy()
+    elif mode in ("patch_gem", "concat", "two_stream"):
+        # patch_gem / concat / two_stream — need forward_features for the
+        # patch-token grid.
+        with torch.inference_mode():
+            out = dino.model.forward_features(batch)
+        if not isinstance(out, dict):
+            raise RuntimeError(
+                f"forward_features returned {type(out)}; expected dict"
+            )
+        cls_tok = out["x_norm_clstoken"].reshape(batch.shape[0], -1)
+        patch_toks = out["x_norm_patchtokens"]  # (B, N, D)
+        gem = dino._gem_pool(patch_toks, p=float(dino.cfg.gem_p)).reshape(
+            batch.shape[0], -1
+        )
+        if mode == "patch_gem":
+            feats = gem
+            if dino.cfg.normalize_embeddings:
+                feats = F.normalize(feats, dim=1)
+            embeddings = feats.detach().cpu().numpy()
+        elif mode == "concat":
+            cls_n = F.normalize(cls_tok, dim=1)
+            gem_n = F.normalize(gem, dim=1)
+            feats = torch.cat([cls_n, gem_n], dim=1)
+            if dino.cfg.normalize_embeddings:
+                feats = F.normalize(feats, dim=1)
+            embeddings = feats.detach().cpu().numpy()
+        else:  # two_stream — return (B, 2, D)
+            cls_n = F.normalize(cls_tok, dim=1)
+            gem_n = F.normalize(gem, dim=1)
+            stacked = torch.stack([cls_n, gem_n], dim=1)  # (B, 2, D)
+            embeddings = stacked.detach().cpu().numpy()
+    else:
+        raise ValueError(f"Unknown DINO embedding_mode: {mode!r}")
 
-    feats = feats.reshape(batch.shape[0], -1)
-    if dino.cfg.normalize_embeddings:
-        feats = F.normalize(feats, dim=1)
-
-    embeddings = feats.detach().cpu().numpy()
-    results = [dino.classify_embedding(emb) for emb in embeddings]
+    results: list[DINOResult] = []
+    for i, emb in enumerate(embeddings):
+        prior = None
+        if objectness_priors is not None:
+            p = objectness_priors[i]
+            if p is not None:
+                prior = float(p)
+        results.append(
+            dino.classify_embedding(
+                emb,
+                objectness_prior=prior,
+                query_patch_mask=query_patch_masks[i],
+            )
+        )
     return results
 
 
@@ -837,12 +931,35 @@ class FoundationPoseTrackerNode(Node):
                 gem_p=float(args.dino_gem_p),
                 similarity=args.dino_similarity,
                 joint_score_alpha=float(args.dino_joint_score_alpha),
+                stream_alpha=float(args.dino_stream_alpha),
+                relative_score_mode=args.dino_relative_score_mode,
+                tau=float(args.dino_tau),
+                objectness_prior_gamma=float(args.dino_objectness_prior_gamma),
+                bank_pca_dim=int(args.dino_bank_pca_dim),
+                patch_match_lowe_ratio=float(args.dino_patch_match_lowe_ratio),
+                patch_match_min_cos=float(args.dino_patch_match_min_cos),
+                patch_match_use_mutual_nn=bool(args.dino_patch_match_mutual_nn),
+                patch_match_bg_threshold=int(args.dino_patch_match_bg_threshold),
             )
         )
         self.get_logger().info(
             f"Building DINO reference bank | source={ref_source} primary={primary_ref}"
             + (f" extra={extra_refs}" if extra_refs else "")
         )
+        self.get_logger().info(
+            f"DINO cfg | mode={args.dino_embedding_mode} sim={args.dino_similarity} "
+            f"gem_p={args.dino_gem_p} stream_alpha={args.dino_stream_alpha} "
+            f"beta(joint)={args.dino_joint_score_alpha} rel={args.dino_relative_score_mode} "
+            f"tau={args.dino_tau} gamma(prior)={args.dino_objectness_prior_gamma} "
+            f"pca_dim={args.dino_bank_pca_dim} muse_preset={bool(args.muse_preset)}"
+        )
+        if args.dino_embedding_mode == "patch_match":
+            self.get_logger().info(
+                f"DINO patch_match | lowe={args.dino_patch_match_lowe_ratio} "
+                f"min_cos={args.dino_patch_match_min_cos} "
+                f"mutual_nn={bool(args.dino_patch_match_mutual_nn)} "
+                f"bg_thr={args.dino_patch_match_bg_threshold}"
+            )
         self.dino.build_reference_bank_from_folder(extra_dirs=extra_refs)
         self.get_logger().info(
             f"DINO ready | objects={sorted(set(r.object_id for r in self.dino.reference_bank))}"
@@ -851,9 +968,10 @@ class FoundationPoseTrackerNode(Node):
         self.sam_by_cam: dict[str, SAMSegmenter] = {}
         self.sam_tiny_by_cam: dict[str, SAMSegmenter] = {}
 
-        # gdino_sam reuses the same SAM instance — only the proposal stage
-        # differs (boxes from Grounding DINO instead of automatic mask gen).
-        sam_modes = {"sam", "gdino_sam"}
+        # gdino_sam and yolo_sam reuse the same SAM instance — only the
+        # proposal stage differs (boxes from Grounding DINO / YOLO instead
+        # of automatic mask generation).
+        sam_modes = {"sam", "gdino_sam", "yolo_sam"}
         if args.mask_source in sam_modes:
             for cam in CAMERAS:
                 cam_params = self.cam_sam_params[cam.cam_id]
@@ -876,7 +994,11 @@ class FoundationPoseTrackerNode(Node):
             from src.perception.learned.GDINO.grounding_dino_proposal import (
                 GDINOConfig, GroundingDINOProposer,
             )
-            text_prompts = [p.strip() for p in args.gdino_text_prompts.split(",") if p.strip()]
+            if bool(getattr(args, "gdino_use_items_prompt", False)):
+                # M-new3: MUSE-style class-agnostic prompt.
+                text_prompts = ["items"]
+            else:
+                text_prompts = [p.strip() for p in args.gdino_text_prompts.split(",") if p.strip()]
             self.gdino_proposer = GroundingDINOProposer(
                 GDINOConfig(
                     model_id=args.gdino_model_id,
@@ -892,33 +1014,58 @@ class FoundationPoseTrackerNode(Node):
                 f"prompts={text_prompts}"
             )
 
-            if args.tiny_objects_enabled:
-                # A3/A4/A7: dedicated tiny-pass SAM config. Lighter checkpoint
-                # (if provided), fewer prompt points, lower acceptance thresholds.
-                # Defaults still produce a working pipeline if the user has not
-                # downloaded a smaller checkpoint — falls back to main ckpt.
-                # Bundle 11: build the tiny segmenter for every camera so the
-                # tiny-pass runs on both cams (was previously zed2i_2-only).
-                tiny_ckpt = args.tiny_sam_checkpoint or args.sam_checkpoint
-                tiny_cfg = args.tiny_sam_model_cfg or args.sam_model_cfg
-                tiny_sam_cfg = SAMSegmenterConfig(
-                    repo_root=args.sam_repo_root,
-                    checkpoint=tiny_ckpt,
-                    model_cfg=tiny_cfg,
+        # YOLO proposer (lazy-loaded) for the yolo_sam path. Class-agnostic
+        # counterpart to GDINO: pure objectness boxes, no text prompts.
+        self.yolo_proposer = None
+        if args.mask_source == "yolo_sam":
+            from src.perception.learned.YOLO.yolo_proposal import (
+                YOLOConfig, YOLOProposer,
+            )
+            class_filter = [c.strip() for c in args.yolo_class_filter.split(",") if c.strip()]
+            self.yolo_proposer = YOLOProposer(
+                YOLOConfig(
+                    model_name=args.yolo_model,
                     device=args.device,
-                    max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
-                    min_mask_area=args.tiny_sam_min_mask_area,
-                    min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
-                    attach_rgb_crops=False,
-                    auto_points_per_side=int(args.tiny_sam_points_per_side),
-                    auto_pred_iou_thresh=float(args.tiny_sam_pred_iou_thresh),
-                    auto_stability_score_thresh=float(args.tiny_sam_stability_score_thresh),
-                    max_aspect_ratio=float(args.tiny_sam_max_aspect_ratio),
+                    conf_threshold=float(args.yolo_conf_threshold),
+                    iou_threshold=float(args.yolo_iou_threshold),
+                    image_size=int(args.yolo_image_size),
+                    max_boxes_per_image=int(args.yolo_max_boxes),
+                    class_filter=class_filter,
+                    class_agnostic=bool(args.yolo_class_agnostic),
                 )
-                # Share weights across cams: build the model once and reuse.
-                tiny_segmenter = SAMSegmenter(tiny_sam_cfg)
-                for cam in CAMERAS:
-                    self.sam_tiny_by_cam[cam.cam_id] = tiny_segmenter
+            )
+            self.get_logger().info(
+                f"YOLO proposer ready | model={args.yolo_model} "
+                f"conf={args.yolo_conf_threshold} class_filter={class_filter or 'all'}"
+            )
+
+        if args.mask_source in sam_modes and args.tiny_objects_enabled:
+            # A3/A4/A7: dedicated tiny-pass SAM config. Lighter checkpoint
+            # (if provided), fewer prompt points, lower acceptance thresholds.
+            # Defaults still produce a working pipeline if the user has not
+            # downloaded a smaller checkpoint — falls back to main ckpt.
+            # Bundle 11: build the tiny segmenter for every camera so the
+            # tiny-pass runs on both cams (was previously zed2i_2-only).
+            tiny_ckpt = args.tiny_sam_checkpoint or args.sam_checkpoint
+            tiny_cfg = args.tiny_sam_model_cfg or args.sam_model_cfg
+            tiny_sam_cfg = SAMSegmenterConfig(
+                repo_root=args.sam_repo_root,
+                checkpoint=tiny_ckpt,
+                model_cfg=tiny_cfg,
+                device=args.device,
+                max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
+                min_mask_area=args.tiny_sam_min_mask_area,
+                min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
+                attach_rgb_crops=False,
+                auto_points_per_side=int(args.tiny_sam_points_per_side),
+                auto_pred_iou_thresh=float(args.tiny_sam_pred_iou_thresh),
+                auto_stability_score_thresh=float(args.tiny_sam_stability_score_thresh),
+                max_aspect_ratio=float(args.tiny_sam_max_aspect_ratio),
+            )
+            # Share weights across cams: build the model once and reuse.
+            tiny_segmenter = SAMSegmenter(tiny_sam_cfg)
+            for cam in CAMERAS:
+                self.sam_tiny_by_cam[cam.cam_id] = tiny_segmenter
 
 
         self.fp_tracker_by_cam: dict[str, FoundationPoseWrapper] = {}
@@ -956,11 +1103,16 @@ class FoundationPoseTrackerNode(Node):
         self.pub_debug_frame: dict[str, Any] = {}
 
 
-        # Pre-warm Cutie to avoid 2.5s delay on first track
-        self.get_logger().info("Pre-warming Cutie model...")
-        self._cutie_prewarmer = CutieTracker(CutieConfig())
-        self._cutie_prewarmer._lazy_load()
-        self.get_logger().info("Cutie pre-warmed")
+        # Pre-warm Cutie to avoid 2.5s delay on first track. Skipped when
+        # SAM2 is the selected video tracker, since Cutie is not used and
+        # not kept as a fallback in that mode.
+        if str(getattr(args, "video_tracker", "cutie")).lower() == "sam2":
+            self.get_logger().info("Skipping Cutie pre-warm (video_tracker=sam2)")
+        else:
+            self.get_logger().info("Pre-warming Cutie model...")
+            self._cutie_prewarmer = CutieTracker(CutieConfig())
+            self._cutie_prewarmer._lazy_load()
+            self.get_logger().info("Cutie pre-warmed")
 
         for c in CAMERAS:
             cid = c.cam_id
@@ -990,6 +1142,16 @@ class FoundationPoseTrackerNode(Node):
         # T_object_camera}. Populated by _track_multicam_fused and consumed
         # by _process_multicam_init when --skip-dino-when-tracker-healthy.
         self._recent_tracker_health: dict[tuple[str, str], dict] = {}
+
+        # Per-object appearance memory bank. Persists across reinits so that
+        # when SAM proposes several look-alike candidates, the re-id step can
+        # compare each candidate's DINO embedding against snapshots taken when
+        # ICP fitness was high. Keyed by object_id (not cam_id) so views from
+        # both cameras share the bank.
+        max_crops = int(getattr(args, "memory_crop_max_per_object", 8))
+        self._memory_crops_by_object: dict[str, deque[MemoryCrop]] = defaultdict(
+            lambda: deque(maxlen=max(1, max_crops))
+        )
 
     @staticmethod
     def _build_mesh_map(cad_dir: str) -> dict[str, str]:
@@ -1638,19 +1800,37 @@ class FoundationPoseTrackerNode(Node):
 
         # --- Main proposal stage ---
         # Default: SAM automatic mask generator. With --mask-source gdino_sam,
-        # boxes come from Grounding DINO and SAM is run as a box-prompted
-        # segmenter (one mask per box).
+        # boxes come from Grounding DINO; with --mask-source yolo_sam, boxes
+        # come from a class-agnostic YOLO. Both feed SAM as box prompts.
         t1 = time.time()
         if (self.args.mask_source == "gdino_sam"
                 and self.gdino_proposer is not None):
             proposals = self.gdino_proposer.propose(rgb_crop_masked)
             if proposals:
                 boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
-                masks_crop = sam.generate_from_boxes(rgb_crop_masked, boxes)
+                box_scores = np.array([p.score for p in proposals], dtype=np.float32)
+                masks_crop = sam.generate_from_boxes(
+                    rgb_crop_masked, boxes, box_scores=box_scores,
+                )
             else:
                 masks_crop = []
             print(
                 f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
+                f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
+            )
+        elif (self.args.mask_source == "yolo_sam"
+                and self.yolo_proposer is not None):
+            proposals = self.yolo_proposer.propose(rgb_crop_masked)
+            if proposals:
+                boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
+                box_scores = np.array([p.score for p in proposals], dtype=np.float32)
+                masks_crop = sam.generate_from_boxes(
+                    rgb_crop_masked, boxes, box_scores=box_scores,
+                )
+            else:
+                masks_crop = []
+            print(
+                f"[TIMING]   YOLO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
                 f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
             )
         else:
@@ -1709,6 +1889,111 @@ class FoundationPoseTrackerNode(Node):
 
         return masks
 
+    # ── per-object appearance memory ─────────────────────────────────────
+    def _maybe_save_memory_crop(
+        self,
+        object_id: str,
+        cam_id: str,
+        rgb_full: np.ndarray,
+        mask_full: np.ndarray,
+        bbox_xyxy: Optional[tuple[int, int, int, int]],
+        fitness: float,
+    ) -> bool:
+        """Snapshot a clean RGB crop into the per-object memory bank when the
+        fused ICP fitness is good. Returns True if a crop was saved."""
+        if not getattr(self.args, "memory_crop_enable", False):
+            return False
+        if self.dino is None:
+            return False
+        threshold = float(self.args.memory_crop_fitness_threshold)
+        if fitness < threshold:
+            return False
+
+        bank = self._memory_crops_by_object[object_id]
+        gap = int(self.args.memory_crop_min_frame_gap)
+        if gap > 0 and bank:
+            for entry in reversed(bank):
+                if entry.cam_id == cam_id:
+                    if self.frame_counter - entry.frame_idx < gap:
+                        return False
+                    break
+
+        if bbox_xyxy is None:
+            ys, xs = np.where(mask_full.astype(bool))
+            if xs.size == 0:
+                return False
+            bbox_xyxy = (int(xs.min()), int(ys.min()),
+                         int(xs.max()) + 1, int(ys.max()) + 1)
+
+        try:
+            crop_rgb, crop_mask = bbox_crop_with_local_mask(
+                rgb_full, mask_full.astype(bool), bbox_xyxy,
+            )
+        except Exception as e:
+            self.get_logger().warn(f"memory-crop bbox crop failed: {e}")
+            return False
+        if crop_rgb.size == 0 or int(crop_mask.sum()) == 0:
+            return False
+
+        try:
+            embedding = self.dino.embed_image(crop_rgb, crop_mask)
+        except Exception as e:
+            self.get_logger().warn(f"memory-crop DINO embed failed: {e}")
+            return False
+
+        keep_rgb = bool(getattr(self.args, "memory_crop_keep_rgb", False))
+        entry = MemoryCrop(
+            object_id=object_id,
+            cam_id=cam_id,
+            frame_idx=self.frame_counter,
+            fitness=float(fitness),
+            embedding=np.asarray(embedding, dtype=np.float32),
+            rgb_crop=crop_rgb if keep_rgb else None,
+            mask_crop=crop_mask if keep_rgb else None,
+        )
+        bank.append(entry)
+
+        save_dir = str(self.args.memory_crop_save_dir or "").strip()
+        if save_dir:
+            try:
+                out_dir = Path(save_dir) / object_id
+                out_dir.mkdir(parents=True, exist_ok=True)
+                fname = f"f{self.frame_counter:06d}_{cam_id}_fit{fitness:.2f}.png"
+                bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(out_dir / fname), bgr)
+            except Exception as e:
+                self.get_logger().warn(f"memory-crop save_dir write failed: {e}")
+
+        self.get_logger().info(
+            f"[memcrop] saved {object_id} from {cam_id} fit={fitness:.3f} "
+            f"bank={len(bank)}/{bank.maxlen}"
+        )
+        return True
+
+    def _memory_similarity_by_object(
+        self,
+        query_embedding: np.ndarray,
+    ) -> dict[str, float]:
+        """Return max cosine similarity between the query embedding and each
+        object's memory bank. Objects with empty banks are omitted. Assumes
+        all embeddings are L2-normalised (DINO default)."""
+        out: dict[str, float] = {}
+        if query_embedding is None:
+            return out
+        q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        if q.size == 0:
+            return out
+        for obj_id, bank in self._memory_crops_by_object.items():
+            if not bank:
+                continue
+            mat = np.stack([e.embedding.reshape(-1) for e in bank], axis=0)
+            if mat.shape[1] != q.shape[0]:
+                # Embedding dim mismatch (e.g., bank built with different mode)
+                continue
+            sims = mat @ q
+            out[obj_id] = float(np.max(sims))
+        return out
+
     def _classify_masks_batched(
         self,
         rgb: np.ndarray,
@@ -1719,6 +2004,7 @@ class FoundationPoseTrackerNode(Node):
 
         crops_rgb: list[np.ndarray] = []
         crops_mask: list[np.ndarray | None] = []
+        crops_prior: list[float | None] = []
         valid_indices: list[int] = []
 
         dino_min_crop = int(getattr(self.args, "dino_min_crop_side", 0))
@@ -1731,13 +2017,16 @@ class FoundationPoseTrackerNode(Node):
             crop_rgb, crop_mask = upscale_crop_if_small(crop_rgb, crop_mask, dino_min_crop)
             crops_rgb.append(crop_rgb)
             crops_mask.append(crop_mask)
+            crops_prior.append(getattr(cand, "prompt_score", None))
             valid_indices.append(i)
 
         if not crops_rgb:
             return []
 
         try:
-            dino_results = batch_dino_classify(self.dino, crops_rgb, crops_mask)
+            dino_results = batch_dino_classify(
+                self.dino, crops_rgb, crops_mask, objectness_priors=crops_prior,
+            )
         except Exception as e:
             self.get_logger().warn(f"Batched DINO failed: {e}")
             return []
@@ -1745,12 +2034,48 @@ class FoundationPoseTrackerNode(Node):
         out: list[CandidateSelection] = []
         img_area = float(rgb.shape[0] * rgb.shape[1])
 
+        mem_weight = float(getattr(self.args, "memory_crop_weight", 0.0))
+        mem_floor = float(getattr(self.args, "memory_crop_min_score_floor", 0.0))
+        mem_enabled = (
+            bool(getattr(self.args, "memory_crop_enable", False))
+            and mem_weight > 0.0
+            and any(len(b) > 0 for b in self._memory_crops_by_object.values())
+        )
+
         for j, res in enumerate(dino_results):
             mask_idx = valid_indices[j]
             cand = masks[mask_idx]
 
+            raw_scores = {k: float(v) for k, v in res.scores_by_object.items()}
+
+            # Memory-crop re-ranking: blend raw cosine score against the max
+            # cosine similarity to past clean snapshots of each object class.
+            # Only kicks in once the bank has entries and weight > 0.
+            mem_sims: dict[str, float] = {}
+            if mem_enabled and raw_scores:
+                raw_top = max(raw_scores.values())
+                if raw_top >= mem_floor:
+                    mem_sims = self._memory_similarity_by_object(res.embedding)
+                    if mem_sims:
+                        blended: dict[str, float] = {}
+                        for k, v in raw_scores.items():
+                            if k in mem_sims:
+                                blended[k] = (1.0 - mem_weight) * v + mem_weight * mem_sims[k]
+                            else:
+                                blended[k] = v
+                        # Log if the memory bank flips the top-1 pick.
+                        raw_top1 = max(raw_scores, key=raw_scores.get)
+                        new_top1 = max(blended, key=blended.get)
+                        if new_top1 != raw_top1:
+                            self.get_logger().info(
+                                f"[memcrop] cand {j} flipped top1 {raw_top1}->{new_top1} "
+                                f"(raw={raw_scores[raw_top1]:.3f}->{raw_scores.get(new_top1, 0.0):.3f}, "
+                                f"mem={mem_sims.get(raw_top1, 0.0):.3f}->{mem_sims.get(new_top1, 0.0):.3f})"
+                            )
+                        raw_scores = blended
+
             sorted_scores = sorted(
-                res.scores_by_object.items(), key=lambda kv: kv[1], reverse=True
+                raw_scores.items(), key=lambda kv: kv[1], reverse=True
             )
 
             top1_name, top1_score = sorted_scores[0]
@@ -1857,7 +2182,7 @@ class FoundationPoseTrackerNode(Node):
                 CandidateSelection(
                     object_id=object_id,
                     score=final_score,
-                    scores_by_object={k: float(v) for k, v in res.scores_by_object.items()},
+                    scores_by_object={k: float(v) for k, v in raw_scores.items()},
                     candidate=cand,
                 )
             )
@@ -2174,11 +2499,16 @@ class FoundationPoseTrackerNode(Node):
                         from src.perception.tracking.cutie_tracker import CutieConfig
                         from src.perception.tracking.icp_refiner import ICPConfig, ICPVariant
                         from src.perception.tracking.sam2_video_tracker import SAM2VideoConfig
+                        from src.perception.tracking.sam2_streaming_tracker import SAM2StreamingConfig
 
                         video_kind = str(getattr(self.args, "video_tracker", "cutie")).lower()
+                        use_video_pred = bool(getattr(self.args, "sam2_use_video_predictor", False))
                         sam2_cfg = SAM2VideoConfig(
                             max_internal_size=480,
                             memory_crop_padding_px=int(getattr(self.args, "track_memory_crop_padding", 0)),
+                        )
+                        sam2_streaming_cfg = SAM2StreamingConfig(
+                            max_memory_frames=int(getattr(self.args, "sam2_max_memory_frames", 16)),
                         )
                         cfg = RealtimeTrackerConfig(
                             cutie_cfg=CutieConfig(max_internal_size=480),
@@ -2195,6 +2525,8 @@ class FoundationPoseTrackerNode(Node):
                             verbose=False,
                             video_tracker_kind=video_kind,
                             sam2_cfg=sam2_cfg,
+                            sam2_use_video_predictor=use_video_pred,
+                            sam2_streaming_cfg=sam2_streaming_cfg,
                         )
                         rt = RealtimeTracker(cfg)
                         init_mask = state.recovery_mask
@@ -2460,6 +2792,10 @@ class FoundationPoseTrackerNode(Node):
                 T_base_init = (T_bc_0 @ first_cr["state"].T_object_camera.astype(np.float64)).astype(np.float32)
     
             # ── FIX G: Reduced ICP iterations ──
+            # Adaptive early-stop: pass looser relative_fitness/relative_rmse
+            # tolerances than Open3D's 1e-6 default so ICP bails as soon as
+            # improvements plateau. On healthy frames the pose is already good
+            # after the previous frame, so further iters waste compute.
             icp_iters = int(getattr(self.args, 'fused_track_icp_max_iteration', 30))
             T_base_fused, fitness, rmse = run_icp_in_base_frame(
                 scene_pcd=fused_cloud,
@@ -2468,6 +2804,8 @@ class FoundationPoseTrackerNode(Node):
                 max_correspondence_dist=float(self.args.fused_track_icp_max_correspondence_dist_m),
                 max_iteration=icp_iters,
                 variant=self.args.icp_variant,
+                relative_fitness=float(getattr(self.args, 'fused_track_icp_relative_fitness', 1e-4)),
+                relative_rmse=float(getattr(self.args, 'fused_track_icp_relative_rmse', 1e-4)),
             )
     
             dt, drot = self._pose_delta_from_base(prev_base_pose, T_base_fused)
@@ -2732,6 +3070,21 @@ class FoundationPoseTrackerNode(Node):
                         "occlusion_score": occ,
                         "T_object_camera": T_local.copy(),
                     }
+                    # Per-object appearance memory: stash a clean RGB crop
+                    # while ICP fitness is high so the next reinit can
+                    # disambiguate the instance from look-alikes.
+                    cr_view = cr.get("view")
+                    if cr_view is not None and getattr(cr_view, "rgb", None) is not None:
+                        fused_metrics_for_save = self._fused_icp_metrics.get(obj_id, {})
+                        fitness_for_save = float(fused_metrics_for_save.get("fitness", 0.0))
+                        self._maybe_save_memory_crop(
+                            object_id=state.object_id,
+                            cam_id=cam_id,
+                            rgb_full=cr_view.rgb,
+                            mask_full=current_mask,
+                            bbox_xyxy=cr.get("bbox_xyxy"),
+                            fitness=fitness_for_save,
+                        )
                 else:
                     if state.last_good_T is not None:
                         state.T_object_camera = state.last_good_T.copy()
@@ -3120,6 +3473,14 @@ class FoundationPoseTrackerNode(Node):
                         )
                         best_T = grid_T
                         best_chamfer = grid_chamfer
+                        # Recompute fitness/rmse against the new pose so the
+                        # downstream FINAL log and fusion weight don't mix
+                        # new chamfer with stale ICP metrics.
+                        best_fitness, best_rmse = evaluate_icp_in_base_frame(
+                            scene_pcd=fused_cloud,
+                            model_pcd=model_pcd,
+                            T_base_object=best_T,
+                        )
                     else:
                         print(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
 
@@ -3162,6 +3523,11 @@ class FoundationPoseTrackerNode(Node):
                             )
                             best_T = T_base_ref
                             best_chamfer = ref_chamfer
+                            best_fitness, best_rmse = evaluate_icp_in_base_frame(
+                                scene_pcd=fused_cloud,
+                                model_pcd=model_pcd,
+                                T_base_object=best_T,
+                            )
                         else:
                             print(
                                 f"    FP-refine no improvement [{cam_id}] "
@@ -3492,7 +3858,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--mask-source",
-                   choices=["sam", "projected", "gdino_sam"],
+                   choices=["sam", "projected", "gdino_sam", "yolo_sam"],
                    default="sam")
     # B7/B8/A9: Grounding DINO + SAM (MUSE-style) proposal stage. Only used
     # when --mask-source gdino_sam.
@@ -3506,6 +3872,18 @@ def parse_args() -> argparse.Namespace:
         "--gdino-text-prompts",
         default="cooling base,cooling f,cooling screw,blue cube,green cube,red cube,screwdriver,pb base,pb pipe,pb screw,pb top",
     )
+    # YOLO + SAM proposal stage (class-agnostic counterpart to gdino_sam).
+    # Only used when --mask-source yolo_sam.
+    p.add_argument("--yolo-model", default="yolov8x.pt")
+    p.add_argument("--yolo-conf-threshold", type=float, default=0.10)
+    p.add_argument("--yolo-iou-threshold", type=float, default=0.45)
+    p.add_argument("--yolo-image-size", type=int, default=640)
+    p.add_argument("--yolo-max-boxes", type=int, default=50)
+    # Optional comma-separated class whitelist. Empty = fully class-agnostic.
+    p.add_argument("--yolo-class-filter", default="")
+    # When True, downstream sees label "object" instead of YOLO's class name,
+    # so the DINO classifier owns the labeling decision.
+    p.add_argument("--yolo-class-agnostic", action="store_true", default=True)
     p.add_argument("--target-object", default=None)
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
 
@@ -3522,7 +3900,7 @@ def parse_args() -> argparse.Namespace:
 
     # DINO backbone. dinov2_vitb14 = current default (faster). Pass
     # dinov2_vitl14 for higher fidelity per DINOv2 paper Fig. 2/5.
-    p.add_argument("--dino-model-name", default="dinov2_vitb14")
+    p.add_argument("--dino-model-name", default="dinov2_vitl14")
     p.add_argument("--dino-min-score", type=float, default=0.55)
     p.add_argument("--dino-min-margin", type=float, default=0.0)
     # B4: softmax-entropy gate over per-object scores. Higher = less confident.
@@ -3534,6 +3912,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cooling-base-min-bbox-side-px", type=int, default=140)
     p.add_argument("--cooling-screw-max-bbox-side-px", type=int, default=90)
     p.add_argument("--cooling-f-min-bbox-side-px", type=int, default=60)
+
+    # Per-object appearance memory: snapshot a clean RGB crop whenever the
+    # fused ICP fitness is good, and at reinit re-rank SAM/DINO candidates by
+    # cosine similarity to those snapshots. This kills disambiguation
+    # ambiguity when two look-alike instances are on the table.
+    p.add_argument("--memory-crop-enable", action="store_true", default=True,
+                   help="Save high-fitness crops and use them at reinit.")
+    p.add_argument("--no-memory-crop", dest="memory_crop_enable",
+                   action="store_false",
+                   help="Disable the appearance memory bank.")
+    p.add_argument("--memory-crop-fitness-threshold", type=float, default=0.5,
+                   help="Minimum fused ICP fitness required to save a crop.")
+    p.add_argument("--memory-crop-min-frame-gap", type=int, default=15,
+                   help="Frames to wait between consecutive crop saves per object/cam.")
+    p.add_argument("--memory-crop-max-per-object", type=int, default=8,
+                   help="Ring-buffer capacity per object.")
+    p.add_argument("--memory-crop-weight", type=float, default=0.35,
+                   help="Blend weight for memory similarity vs raw DINO score at reinit. 0 disables re-ranking.")
+    p.add_argument("--memory-crop-min-score-floor", type=float, default=0.0,
+                   help="Skip memory re-ranking when raw DINO top1 < this (avoids boosting garbage).")
+    p.add_argument("--memory-crop-keep-rgb", action="store_true", default=False,
+                   help="Keep the raw RGB+mask alongside the embedding (debug only).")
+    p.add_argument("--memory-crop-save-dir", default="",
+                   help="If set, dump saved crops to this directory for inspection.")
 
     p.add_argument("--sam-repo-root", default="external/sam2")
     p.add_argument(
@@ -3641,6 +4043,12 @@ def parse_args() -> argparse.Namespace:
     # Tracking uses a tight init from the previous frame, so 30 iters is overkill;
     # 15 lands within ~0.5mm of the converged pose for our object scale.
     p.add_argument("--fused-track-icp-max-iteration", type=int, default=15)
+    # Adaptive early-stop tolerances for tracking ICP. Open3D's default is 1e-6
+    # (effectively never triggers — runs all max_iteration). 1e-4 lets it bail
+    # as soon as fitness/rmse improvement plateaus, which is the common case
+    # when the previous-frame init is already very close.
+    p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
+    p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
 
     # Positive = sensor reads too short, negative = too long
     # Calibrate: measure known distance, compare to depth reading
@@ -3732,16 +4140,71 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fp-refine-after-grid", action="store_true")
     p.add_argument("--fp-refine-iterations", type=int, default=1)
 
-    # B2 / Bundle 5: MUSE-style DINO upgrades. Defaults preserve original
-    # CLS-token + cosine behaviour.
-    #   --dino-embedding-mode concat enables MUSE-style CLS+GeM-patch
-    #   --dino-similarity tanimoto switches off cosine
-    #   --dino-joint-score-alpha > 0 blends raw scores with relative ranking
-    p.add_argument("--dino-embedding-mode", choices=["cls", "patch_gem", "concat"],
+    # B2 / Bundle 5 / MUSE: DINO upgrades. Defaults preserve original
+    # CLS-token + cosine behaviour. See MUSE.pdf §3.
+    #   --dino-embedding-mode concat       — CLS ++ GeM-patch
+    #   --dino-embedding-mode two_stream   — separate S_cls / S_patch blended by
+    #                                        --dino-stream-alpha (paper Eq.4)
+    #   --dino-similarity tanimoto         — paper §3.2
+    #   --dino-joint-score-alpha > 0       — paper Eq.6 "beta": blend absolute
+    #                                        and relative scores
+    p.add_argument("--dino-embedding-mode",
+                   choices=["cls", "patch_gem", "concat", "two_stream", "patch_match"],
                    default="cls")
-    p.add_argument("--dino-gem-p", type=float, default=3.0)
+    p.add_argument("--dino-gem-p", type=float, default=3.0,
+                   help="GeM exponent. MUSE paper uses 1.5; existing default 3.0.")
     p.add_argument("--dino-similarity", choices=["cosine", "tanimoto"], default="cosine")
-    p.add_argument("--dino-joint-score-alpha", type=float, default=0.0)
+    p.add_argument("--dino-joint-score-alpha", type=float, default=0.0,
+                   help="MUSE Eq.6 beta. 0=raw absolute score only; 1=pure relative.")
+
+    # M-new1 / B2 / M1: weight blending S_cls (CLS only) and S_patch (GeM only)
+    # when embedding_mode=two_stream. Paper Eq.4 uses alpha=0.5.
+    p.add_argument("--dino-stream-alpha", type=float, default=0.5,
+                   help="two_stream: S_int = alpha*S_cls + (1-alpha)*S_patch.")
+
+    # M3: how the relative score is derived from class scores. MUSE Eq.5
+    # uses softmax(S_abs/tau); legacy implementation used mean-subtraction.
+    p.add_argument("--dino-relative-score-mode",
+                   choices=["mean_sub", "softmax_tau"],
+                   default="mean_sub")
+    p.add_argument("--dino-tau", type=float, default=0.02,
+                   help="Temperature for the softmax-tau relative score.")
+
+    # M4: per-proposal objectness prior. MUSE Eq.8 uses P(O|p)^gamma.
+    # 0 disables the prior entirely (default). Paper uses 0.1.
+    p.add_argument("--dino-objectness-prior-gamma", type=float, default=0.0,
+                   help="Power exponent on per-proposal box-objectness prior.")
+
+    # M-new5: PCA-whiten the reference bank. 0 disables.
+    p.add_argument("--dino-bank-pca-dim", type=int, default=0,
+                   help="Project bank+queries to this many PCA-whitened dims.")
+
+    # B2 / M1: true per-patch token matching for disambiguation.
+    # Active only when --dino-embedding-mode patch_match.
+    p.add_argument("--dino-patch-match-lowe-ratio", type=float, default=1.05,
+                   help="Lowe ratio (best/second-best) for patch_match. "
+                        "<=0 disables. 1.05 = 5%% margin.")
+    p.add_argument("--dino-patch-match-min-cos", type=float, default=0.5,
+                   help="Minimum cosine to count a patch_match inlier.")
+    p.add_argument("--dino-patch-match-mutual-nn", action="store_true",
+                   default=True, help="Require mutual nearest-neighbour matches.")
+    p.add_argument("--no-dino-patch-match-mutual-nn",
+                   dest="dino_patch_match_mutual_nn", action="store_false")
+    p.add_argument("--dino-patch-match-bg-threshold", type=int, default=10,
+                   help="Pixel-sum threshold for deriving the foreground patch "
+                        "mask from a pre-masked reference image.")
+
+    # M-new6: convenience preset — once set, every --dino-* / --gdino-* flag
+    # left at its default is overridden with MUSE paper values. Explicit flags
+    # always win. Implemented in parse_args() post-processing.
+    p.add_argument("--muse-preset", action="store_true",
+                   help="Apply MUSE-paper defaults for the unset DINO/GDINO flags.")
+
+    # M-new3: convenience — replace --gdino-text-prompts with the generic
+    # MUSE-style "items" prompt at runtime. Detection becomes class-agnostic;
+    # DINO then names everything.
+    p.add_argument("--gdino-use-items-prompt", action="store_true",
+                   help="Override --gdino-text-prompts with the literal 'items'.")
     # B2: hardcoded cooling_f vs cooling_screw aspect rule. On for back-compat;
     # disable once MUSE features make the rule redundant (and dangerous if
     # extended to new objects).
@@ -3781,15 +4244,57 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--icp-mask-interior-erosion", type=int, default=0)
 
     # Bundle 10: A5/A6/B5 — alternative video tracker.
-    # A5: choose backend; default keeps current Cutie behaviour. SAM2 falls
-    # back to Cutie automatically if it fails to load or fails mid-stream.
+    # A5: choose backend; default keeps current Cutie behaviour. When set to
+    # sam2 we no longer fall back to Cutie — SAM2 failures propagate.
     p.add_argument("--video-tracker", choices=["cutie", "sam2"], default="cutie")
     # B5: pad (in internal-resolution px) of the memory crop used to re-prompt
     # SAM2 each frame. 0 disables the crop and feeds the full image, matching
-    # current behaviour. Only consulted when --video-tracker sam2.
+    # current behaviour. Only consulted when --video-tracker sam2 and the
+    # image-predictor path (default SAM2 mode).
     p.add_argument("--track-memory-crop-padding", type=int, default=0)
+    # True streaming SAM2VideoPredictor with full memory bank across frames
+    # (vs. the default SAM2ImagePredictor-with-prev-mask "length-1 memory"
+    # path). Only consulted when --video-tracker sam2.
+    p.add_argument("--sam2-use-video-predictor", action="store_true")
+    # Sliding-window size for the streaming video-predictor's per-object
+    # output dict. SAM2's memory attention attends to the most recent few
+    # frames (default num_maskmem=7); 16 gives a safe margin.
+    p.add_argument("--sam2-max-memory-frames", type=int, default=16)
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # M-new6: --muse-preset — apply MUSE paper defaults to any DINO/GDINO
+    # flag the user did NOT explicitly set on the command line. Explicit
+    # flags always win.
+    if bool(getattr(args, "muse_preset", False)):
+        import sys as _sys
+        cli_tokens = {tok.split("=", 1)[0] for tok in _sys.argv[1:] if tok.startswith("--")}
+
+        def _maybe_set(flag: str, attr: str, value):
+            if flag not in cli_tokens:
+                setattr(args, attr, value)
+
+        # Paper defaults (Section 4.1): alpha=0.5, beta=0.8, tau=0.02, gamma=0.1.
+        # We map: stream_alpha=alpha, joint_score_alpha=beta, tau=tau,
+        # objectness_prior_gamma=gamma. We also flip on tanimoto and the
+        # softmax-tau relative score, switch to two_stream embeddings, and use
+        # the MUSE GeM exponent e=1.5.
+        _maybe_set("--dino-embedding-mode", "dino_embedding_mode", "two_stream")
+        _maybe_set("--dino-similarity",     "dino_similarity",     "tanimoto")
+        _maybe_set("--dino-stream-alpha",   "dino_stream_alpha",   0.5)
+        _maybe_set("--dino-joint-score-alpha", "dino_joint_score_alpha", 0.8)
+        _maybe_set("--dino-relative-score-mode", "dino_relative_score_mode", "softmax_tau")
+        _maybe_set("--dino-tau",            "dino_tau",            0.02)
+        _maybe_set("--dino-objectness-prior-gamma", "dino_objectness_prior_gamma", 0.1)
+        _maybe_set("--dino-gem-p",          "dino_gem_p",          1.5)
+        # Paper prompts GDINO with the generic 'items' token.
+        _maybe_set("--gdino-use-items-prompt", "gdino_use_items_prompt", True)
+        # B2 / M1 patch_match defaults are tuned for cosine on DINOv2
+        # patch tokens; users can opt in by passing --dino-embedding-mode
+        # patch_match. The preset itself stays on two_stream so the existing
+        # MUSE-paper pipeline reproduces without changes.
+
+    return args
 
 
 def main() -> None:
