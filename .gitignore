@@ -11,3 +11,8 @@ Data
 build/
 log/
 .png
+plots/
+outputs/
+log/
+init_renders/
+install/
