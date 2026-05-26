@@ -459,7 +459,7 @@ class FrameData:
 
 class FoundationPoseExternalVisualizer(Node):
     def __init__(self, args: argparse.Namespace) -> None:
-        super().__init__("foundationpose_external_visualizer")
+        super().__init__(args.node_name)
         self.args = args
 
         self.palette = [
@@ -938,6 +938,7 @@ class FoundationPoseExternalVisualizer(Node):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
+    p.add_argument("--node-name", type=str, default="foundationpose_external_visualizer")
     p.add_argument("--cam-id", type=str, default="zed2i_2")
     p.add_argument("--rgb-topic", type=str, default="/zed2i_2/zed_node/rgb/color/rect/image")
     p.add_argument(

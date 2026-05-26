@@ -109,13 +109,26 @@ class GroundingDINOProposer:
         with torch.inference_mode():
             outputs = self._model(**inputs)
 
-        results = self._processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=self.cfg.box_threshold,
-            text_threshold=self.cfg.text_threshold,
-            target_sizes=[pil.size[::-1]],  # (H, W)
-        )
+        try:
+            results = self._processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=self.cfg.box_threshold,
+                text_threshold=self.cfg.text_threshold,
+                target_sizes=[pil.size[::-1]],  # (H, W)
+            )
+        except TypeError as e:
+            if "box_threshold" not in str(e):
+                raise
+            # Transformers versions differ here: some expect the box score
+            # cutoff as "threshold" instead of "box_threshold".
+            results = self._processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=self.cfg.box_threshold,
+                text_threshold=self.cfg.text_threshold,
+                target_sizes=[pil.size[::-1]],  # (H, W)
+            )
         if not results:
             return []
         res = results[0]

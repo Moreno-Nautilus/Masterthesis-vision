@@ -45,7 +45,7 @@ class SAMSegmenterConfig:
     auto_points_per_side: int = 64 #64
     auto_pred_iou_thresh: float = 0.70 #0.60
     auto_stability_score_thresh: float = 0.65 #0.75
-    auto_crop_n_layers: int = 0 # WAS 1
+    auto_crop_n_layers: int = 1 # WAS 1
     auto_crop_n_points_downscale_factor: int = 2
     auto_min_mask_region_area: int = 150 #200
 

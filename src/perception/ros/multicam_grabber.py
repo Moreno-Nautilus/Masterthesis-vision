@@ -4,6 +4,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 
 from src.utils.se3 import SE3
@@ -136,7 +137,7 @@ class MultiCamGrabber(Node):
                     Image,
                     c.depth_topic,
                     lambda msg, cam_id=c.cam_id: self._on_depth(cam_id, msg),
-                    10,
+                    qos_profile_sensor_data,
                 )
             )
             self._subs.append(
@@ -144,7 +145,7 @@ class MultiCamGrabber(Node):
                     CameraInfo,
                     c.info_topic,
                     lambda msg, cam_id=c.cam_id: self._on_depth_info(cam_id, msg),
-                    10,
+                    qos_profile_sensor_data,
                 )
             )
 
@@ -153,7 +154,7 @@ class MultiCamGrabber(Node):
                     Image,
                     c.rgb_topic,
                     lambda msg, cam_id=c.cam_id: self._on_rgb(cam_id, msg),
-                    10,
+                    qos_profile_sensor_data,
                 )
             )
             self._subs.append(
@@ -161,7 +162,7 @@ class MultiCamGrabber(Node):
                     CameraInfo,
                     c.rgb_info_topic,
                     lambda msg, cam_id=c.cam_id: self._on_rgb_info(cam_id, msg),
-                    10,
+                    qos_profile_sensor_data,
                 )
             )
 

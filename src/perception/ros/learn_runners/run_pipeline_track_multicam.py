@@ -1002,7 +1002,7 @@ class FoundationPoseTrackerNode(Node):
             self.gdino_proposer = GroundingDINOProposer(
                 GDINOConfig(
                     model_id=args.gdino_model_id,
-                    device=args.device,
+                    device=args.gdino_device or args.device,
                     box_threshold=float(args.gdino_box_threshold),
                     text_threshold=float(args.gdino_text_threshold),
                     max_boxes_per_image=int(args.gdino_max_boxes),
@@ -1025,7 +1025,7 @@ class FoundationPoseTrackerNode(Node):
             self.yolo_proposer = YOLOProposer(
                 YOLOConfig(
                     model_name=args.yolo_model,
-                    device=args.device,
+                    device=args.yolo_device or args.device,
                     conf_threshold=float(args.yolo_conf_threshold),
                     iou_threshold=float(args.yolo_iou_threshold),
                     image_size=int(args.yolo_image_size),
@@ -1244,7 +1244,7 @@ class FoundationPoseTrackerNode(Node):
         fused_cloud,
         per_cam_clouds,
         T: np.ndarray,
-    ) -> float:
+        ) -> float:
         """Chamfer score for grid evaluation. Optionally averages over per-cam clouds."""
         if (getattr(self.args, "icp_grid_cross_cam_chamfer", False)
                 and per_cam_clouds is not None and len(per_cam_clouds) >= 2):
@@ -1280,9 +1280,9 @@ class FoundationPoseTrackerNode(Node):
             Returns (best_T, best_chamfer).
             """
             use_fib = bool(getattr(self.args, "icp_grid_fibonacci", False))
-            n_rot = int(getattr(self.args, "icp_grid_n_rot", 60))
+            n_rot = int(getattr(self.args, "icp_grid_n_rot", 100))
             prescreen = bool(getattr(self.args, "icp_grid_prescreen", False))
-            prescreen_tau = float(getattr(self.args, "icp_grid_prescreen_tau", 0.04))
+            prescreen_tau = float(getattr(self.args, "icp_grid_prescreen_tau", 0.06))
             second_pass = bool(getattr(self.args, "icp_grid_second_pass", False))
             second_k = int(getattr(self.args, "icp_grid_second_pass_k", 3))
             second_n = int(getattr(self.args, "icp_grid_second_pass_n", 8))
@@ -1642,7 +1642,7 @@ class FoundationPoseTrackerNode(Node):
 
     def _inherit_from_tracker_health(
         self, cam_id: str, masks: list[SAMMaskCandidate],
-    ) -> tuple[list[CandidateSelection], list[SAMMaskCandidate]]:
+        ) -> tuple[list[CandidateSelection], list[SAMMaskCandidate]]:
         """Bundle 11: assign masks to objects whose tracker was healthy on a
         recent frame, by IoU with the tracker's last good mask. Returns
         (inherited_selections, remaining_masks_for_dino).
@@ -1898,7 +1898,7 @@ class FoundationPoseTrackerNode(Node):
         mask_full: np.ndarray,
         bbox_xyxy: Optional[tuple[int, int, int, int]],
         fitness: float,
-    ) -> bool:
+        ) -> bool:
         """Snapshot a clean RGB crop into the per-object memory bank when the
         fused ICP fitness is good. Returns True if a crop was saved."""
         if not getattr(self.args, "memory_crop_enable", False):
@@ -1973,7 +1973,7 @@ class FoundationPoseTrackerNode(Node):
     def _memory_similarity_by_object(
         self,
         query_embedding: np.ndarray,
-    ) -> dict[str, float]:
+        ) -> dict[str, float]:
         """Return max cosine similarity between the query embedding and each
         object's memory bank. Objects with empty banks are omitted. Assumes
         all embeddings are L2-normalised (DINO default)."""
@@ -2119,8 +2119,8 @@ class FoundationPoseTrackerNode(Node):
             is_small_object = bbox_area < 5000
 
             if is_small_object:
-                min_score_for_small = 0.40
-                min_margin_for_small = 0.02
+                min_score_for_small = 0.20
+                min_margin_for_small = 0.0
                 if raw_best_score < min_score_for_small:
                     object_id = "unknown"
                 elif margin < min_margin_for_small and not geometric_resolved:
@@ -3244,6 +3244,14 @@ class FoundationPoseTrackerNode(Node):
 
             if not masks:
                 selections_by_cam[cam_id] = []
+                if cam_id in self.pub_debug_frame:
+                    frame = self._build_debug_frame(
+                        cam_id=cam_id, stamp=stamp,
+                        update_sam=True, update_dino=True,
+                        sam_candidates=[], dino_candidates=[],
+                        pose_items=[],
+                    )
+                    self.pub_debug_frame[cam_id].publish(frame)
                 continue
 
             # Bundle 11: skip DINO for masks that match a recently-healthy
@@ -3262,6 +3270,16 @@ class FoundationPoseTrackerNode(Node):
             selected = self._select_top_candidates(inherited + ranked, view.depth)
             print(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
             selections_by_cam[cam_id] = selected
+
+            if cam_id in self.pub_debug_frame:
+                frame = self._build_debug_frame(
+                    cam_id=cam_id, stamp=stamp,
+                    update_sam=True, update_dino=True,
+                    sam_candidates=self._sam_candidates_to_msgs(masks),
+                    dino_candidates=self._dino_ranked_to_msgs(inherited + ranked),
+                    pose_items=[],
+                )
+                self.pub_debug_frame[cam_id].publish(frame)
 
         if sum(len(v) for v in selections_by_cam.values()) == 0:
             for view in views:
@@ -3863,9 +3881,11 @@ def parse_args() -> argparse.Namespace:
     # B7/B8/A9: Grounding DINO + SAM (MUSE-style) proposal stage. Only used
     # when --mask-source gdino_sam.
     p.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base")
-    p.add_argument("--gdino-box-threshold", type=float, default=0.30)
+    p.add_argument("--gdino-box-threshold", type=float, default=0.20)
     p.add_argument("--gdino-text-threshold", type=float, default=0.25)
     p.add_argument("--gdino-max-boxes", type=int, default=30)
+    p.add_argument("--gdino-device", choices=["", "cpu", "cuda"], default="",
+                   help="Device for Grounding DINO. Empty reuses --device.")
     # Comma-separated text prompts. Default covers the current object set;
     # override via --gdino-text-prompts "a,b,c" to extend.
     p.add_argument(
@@ -3879,6 +3899,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yolo-iou-threshold", type=float, default=0.45)
     p.add_argument("--yolo-image-size", type=int, default=640)
     p.add_argument("--yolo-max-boxes", type=int, default=50)
+    p.add_argument("--yolo-device", choices=["", "cpu", "cuda"], default="",
+                   help="Device for YOLO proposal model. Empty reuses --device.")
     # Optional comma-separated class whitelist. Empty = fully class-agnostic.
     p.add_argument("--yolo-class-filter", default="")
     # When True, downstream sees label "object" instead of YOLO's class name,
@@ -3901,7 +3923,7 @@ def parse_args() -> argparse.Namespace:
     # DINO backbone. dinov2_vitb14 = current default (faster). Pass
     # dinov2_vitl14 for higher fidelity per DINOv2 paper Fig. 2/5.
     p.add_argument("--dino-model-name", default="dinov2_vitl14")
-    p.add_argument("--dino-min-score", type=float, default=0.55)
+    p.add_argument("--dino-min-score", type=float, default=0.45)
     p.add_argument("--dino-min-margin", type=float, default=0.0)
     # B4: softmax-entropy gate over per-object scores. Higher = less confident.
     # Disabled at 0.0 (default); typical effective range ~0.6-0.9 with tau=0.05.
@@ -3909,7 +3931,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dino-entropy-tau", type=float, default=0.05)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
-    p.add_argument("--cooling-base-min-bbox-side-px", type=int, default=140)
+    p.add_argument("--cooling-base-min-bbox-side-px", type=int, default=100)
     p.add_argument("--cooling-screw-max-bbox-side-px", type=int, default=90)
     p.add_argument("--cooling-f-min-bbox-side-px", type=int, default=60)
 
@@ -3952,17 +3974,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cam1-sam-border-px", type=int, default=6)
     p.add_argument("--cam1-sam-max-border-fraction", type=float, default=0.00)
 
-    p.add_argument("--cam2-sam-min-mask-area", type=int, default=20)
-    p.add_argument("--cam2-sam-min-bbox-side-px", type=int, default=3)
+    p.add_argument("--cam2-sam-min-mask-area", type=int, default=10)
+    p.add_argument("--cam2-sam-min-bbox-side-px", type=int, default=2)
     p.add_argument("--cam2-sam-max-mask-area-ratio", type=float, default=0.06)
     p.add_argument("--cam2-sam-max-bbox-area-ratio", type=float, default=0.06)
     p.add_argument("--cam2-sam-border-px", type=int, default=6)
     p.add_argument("--cam2-sam-max-border-fraction", type=float, default=0.00)
 
     p.add_argument("--cam1-roi-polygon", type=str,
-        default="950,104,210,530,735,1080,1160,1080,1250,560,1630,320")
+        default="306,664,1031,346,1506,520,1080,800,1080,1080,550,1080")
     p.add_argument("--cam2-roi-polygon", type=str,
-        default="430,410,1190,160,1920,500,1920,780,1720,1080,940,1080")
+        default="530,610,1350,260,1920,500,1700,1080,914,1080")
 
     p.add_argument("--tiny-objects-enabled", action="store_true")
     # Bundle 11: per-cam tiny ROIs. Empty string disables the tiny pass on
@@ -4116,7 +4138,7 @@ def parse_args() -> argparse.Namespace:
     #   --icp-grid-cross-cam-chamfer  : score by mean Chamfer across per-cam clouds
     #   --icp-grid-tie-by-inliers     : break Chamfer ties by ICP fitness (≈ inlier count)
     p.add_argument("--icp-grid-fibonacci", action="store_true")
-    p.add_argument("--icp-grid-n-rot", type=int, default=60)
+    p.add_argument("--icp-grid-n-rot", type=int, default=100)
     p.add_argument("--icp-grid-prescreen", action="store_true")
     p.add_argument("--icp-grid-prescreen-tau", type=float, default=0.04)
     p.add_argument("--icp-grid-second-pass", action="store_true")
@@ -4133,7 +4155,7 @@ def parse_args() -> argparse.Namespace:
 
     # C7: threshold above which the rotation grid runs. Below this, FP+ICP
     # is already in the good regime and the grid sweep is skipped.
-    p.add_argument("--icp-grid-skip-chamfer-m", type=float, default=0.008)
+    p.add_argument("--icp-grid-skip-chamfer-m", type=float, default=0.004)
 
     # C8: run FP's neural refiner after the rotation grid to lock in the
     # geometry-best seed. Off by default — only useful when the grid runs.
