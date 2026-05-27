@@ -26,6 +26,13 @@ from src.perception.learned.DINO.dino_identifier import (
     DINOIdentifier,
     DINOIdentifierConfig,
     DINOResult,
+    MUSE_EMBEDDING_MODE,
+    MUSE_JOINT_SCORE_ALPHA,
+    MUSE_OBJECTNESS_PRIOR_GAMMA,
+    MUSE_RELATIVE_SCORE_MODE,
+    MUSE_SIMILARITY,
+    MUSE_STREAM_ALPHA,
+    MUSE_TAU,
 )
 from src.perception.learned.FP.pose_foundation import (
     FoundationPoseConfig,
@@ -60,6 +67,23 @@ from src.perception.fused_multicam_helpers import (
     apply_x_bias_correction,
     fill_depth_holes_in_mask,
 )
+
+
+_DEBUG_LOGGING = False
+
+
+def _dprint(*args, **kwargs) -> None:
+    if _DEBUG_LOGGING:
+        print(*args, **kwargs)
+
+
+class _NullLogger:
+    def info(self, *a, **kw): pass
+    def warn(self, *a, **kw): pass
+    def warning(self, *a, **kw): pass
+    def error(self, *a, **kw): pass
+    def debug(self, *a, **kw): pass
+    def fatal(self, *a, **kw): pass
 
 
 FAST_QOS = QoSProfile(
@@ -324,7 +348,7 @@ def save_init_pose_render(
         plt.savefig(save_path, dpi=120, bbox_inches='tight')
         plt.close(fig)
     except Exception as e:
-        print(f"  [WARN] save_init_pose_render failed: {e}")
+        _dprint(f"  [WARN] save_init_pose_render failed: {e}")
 
 
 def rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
@@ -722,66 +746,21 @@ def batch_dino_classify(
         tensors.append(t)
 
     batch = torch.cat(tensors, dim=0)
-    mode = dino.cfg.embedding_mode
 
-    query_patch_masks: list[np.ndarray | None] = [None] * len(crops_rgb)
-    if mode == "patch_match":
-        with torch.inference_mode():
-            out = dino.model.forward_features(batch)
-        if not isinstance(out, dict):
-            raise RuntimeError(
-                f"forward_features returned {type(out)}; expected dict"
-            )
-        patch_toks = out["x_norm_patchtokens"]  # (B, N_p, D)
-        patch_toks = F.normalize(patch_toks, dim=2)
-        embeddings = patch_toks.detach().cpu().numpy()  # (B, N_p, D)
-        for i, m in enumerate(crops_mask):
-            if m is None:
-                query_patch_masks[i] = None
-            else:
-                query_patch_masks[i] = dino._patch_mask_from_input_mask(m)
-    elif mode == "cls":
-        with torch.inference_mode():
-            feats = dino.model(batch)
-        if isinstance(feats, dict):
-            if "x_norm_clstoken" not in feats:
-                raise RuntimeError(f"Unexpected DINO output keys: {list(feats.keys())}")
-            feats = feats["x_norm_clstoken"]
-        feats = feats.reshape(batch.shape[0], -1)
-        if dino.cfg.normalize_embeddings:
-            feats = F.normalize(feats, dim=1)
-        embeddings = feats.detach().cpu().numpy()
-    elif mode in ("patch_gem", "concat", "two_stream"):
-        with torch.inference_mode():
-            out = dino.model.forward_features(batch)
-        if not isinstance(out, dict):
-            raise RuntimeError(
-                f"forward_features returned {type(out)}; expected dict"
-            )
-        cls_tok = out["x_norm_clstoken"].reshape(batch.shape[0], -1)
-        patch_toks = out["x_norm_patchtokens"]  # (B, N, D)
-        gem = dino._gem_pool(patch_toks, p=float(dino.cfg.gem_p)).reshape(
-            batch.shape[0], -1
+    with torch.inference_mode():
+        out = dino.model.forward_features(batch)
+    if not isinstance(out, dict):
+        raise RuntimeError(
+            f"forward_features returned {type(out)}; expected dict"
         )
-        if mode == "patch_gem":
-            feats = gem
-            if dino.cfg.normalize_embeddings:
-                feats = F.normalize(feats, dim=1)
-            embeddings = feats.detach().cpu().numpy()
-        elif mode == "concat":
-            cls_n = F.normalize(cls_tok, dim=1)
-            gem_n = F.normalize(gem, dim=1)
-            feats = torch.cat([cls_n, gem_n], dim=1)
-            if dino.cfg.normalize_embeddings:
-                feats = F.normalize(feats, dim=1)
-            embeddings = feats.detach().cpu().numpy()
-        else:  # two_stream — return (B, 2, D)
-            cls_n = F.normalize(cls_tok, dim=1)
-            gem_n = F.normalize(gem, dim=1)
-            stacked = torch.stack([cls_n, gem_n], dim=1)  # (B, 2, D)
-            embeddings = stacked.detach().cpu().numpy()
-    else:
-        raise ValueError(f"Unknown DINO embedding_mode: {mode!r}")
+    cls_tok = out["x_norm_clstoken"].reshape(batch.shape[0], -1)
+    patch_toks = out["x_norm_patchtokens"]  # (B, N, D)
+    gem = dino._gem_pool(patch_toks, p=float(dino.cfg.gem_p)).reshape(
+        batch.shape[0], -1
+    )
+    cls_n = F.normalize(cls_tok, dim=1)
+    gem_n = F.normalize(gem, dim=1)
+    embeddings = torch.stack([cls_n, gem_n], dim=1).detach().cpu().numpy()
 
     results: list[DINOResult] = []
     for i, emb in enumerate(embeddings):
@@ -794,7 +773,6 @@ def batch_dino_classify(
             dino.classify_embedding(
                 emb,
                 objectness_prior=prior,
-                query_patch_mask=query_patch_masks[i],
             )
         )
     return results
@@ -807,6 +785,10 @@ class FoundationPoseTrackerNode(Node):
         self.args = args
         self.grabber = grabber
         self.T_base_cam_map = T_base_cam_map
+
+        if not bool(getattr(args, "debug_logging", False)):
+            self._null_logger = _NullLogger()
+            self.get_logger = lambda: self._null_logger
 
         self.palette = [
             (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
@@ -859,19 +841,9 @@ class FoundationPoseTrackerNode(Node):
                 device=args.device,
                 reference_dir=primary_ref,
                 use_masked_background=False,
-                embedding_mode=args.dino_embedding_mode,
                 gem_p=float(args.dino_gem_p),
-                similarity=args.dino_similarity,
-                joint_score_alpha=float(args.dino_joint_score_alpha),
-                stream_alpha=float(args.dino_stream_alpha),
-                relative_score_mode=args.dino_relative_score_mode,
-                tau=float(args.dino_tau),
-                objectness_prior_gamma=float(args.dino_objectness_prior_gamma),
                 bank_pca_dim=int(args.dino_bank_pca_dim),
-                patch_match_lowe_ratio=float(args.dino_patch_match_lowe_ratio),
-                patch_match_min_cos=float(args.dino_patch_match_min_cos),
-                patch_match_use_mutual_nn=bool(args.dino_patch_match_mutual_nn),
-                patch_match_bg_threshold=int(args.dino_patch_match_bg_threshold),
+                verbose=bool(getattr(args, "debug_logging", False)),
             )
         )
         self.get_logger().info(
@@ -879,19 +851,12 @@ class FoundationPoseTrackerNode(Node):
             + (f" extra={extra_refs}" if extra_refs else "")
         )
         self.get_logger().info(
-            f"DINO cfg | mode={args.dino_embedding_mode} sim={args.dino_similarity} "
-            f"gem_p={args.dino_gem_p} stream_alpha={args.dino_stream_alpha} "
-            f"beta(joint)={args.dino_joint_score_alpha} rel={args.dino_relative_score_mode} "
-            f"tau={args.dino_tau} gamma(prior)={args.dino_objectness_prior_gamma} "
-            f"pca_dim={args.dino_bank_pca_dim} muse_preset={bool(args.muse_preset)}"
+            f"DINO cfg | mode={MUSE_EMBEDDING_MODE} sim={MUSE_SIMILARITY} "
+            f"gem_p={args.dino_gem_p} stream_alpha={MUSE_STREAM_ALPHA} "
+            f"beta(joint)={MUSE_JOINT_SCORE_ALPHA} rel={MUSE_RELATIVE_SCORE_MODE} "
+            f"tau={MUSE_TAU} gamma(prior)={MUSE_OBJECTNESS_PRIOR_GAMMA} "
+            f"pca_dim={args.dino_bank_pca_dim}"
         )
-        if args.dino_embedding_mode == "patch_match":
-            self.get_logger().info(
-                f"DINO patch_match | lowe={args.dino_patch_match_lowe_ratio} "
-                f"min_cos={args.dino_patch_match_min_cos} "
-                f"mutual_nn={bool(args.dino_patch_match_mutual_nn)} "
-                f"bg_thr={args.dino_patch_match_bg_threshold}"
-            )
         self.dino.build_reference_bank_from_folder(extra_dirs=extra_refs)
         self.get_logger().info(
             f"DINO ready | objects={sorted(set(r.object_id for r in self.dino.reference_bank))}"
@@ -1709,7 +1674,7 @@ class FoundationPoseTrackerNode(Node):
                 grid_size=int(self.args.clahe_grid_size),
             )
 
-        print(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
+        _dprint(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
 
         # --- Main proposal stage ---
         t1 = time.time()
@@ -1724,13 +1689,13 @@ class FoundationPoseTrackerNode(Node):
                 )
             else:
                 masks_crop = []
-            print(
+            _dprint(
                 f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
                 f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
             )
         else:
             masks_crop = sam.generate_auto(rgb_crop_masked)
-            print(f"[TIMING]   SAM generate_auto (main): {(time.time() - t1)*1000:.0f}ms -> {len(masks_crop)} raw masks")
+            _dprint(f"[TIMING]   SAM generate_auto (main): {(time.time() - t1)*1000:.0f}ms -> {len(masks_crop)} raw masks")
 
         if not masks_crop:
             masks = []
@@ -1751,7 +1716,7 @@ class FoundationPoseTrackerNode(Node):
             masks = lift_crop_masks_to_full_image(
                 masks_crop, full_h, full_w, crop_x0, crop_y0
             )
-            print(f"[TIMING]   Mask filtering: {(time.time() - t2)*1000:.0f}ms -> {len(masks)} after filter")
+            _dprint(f"[TIMING]   Mask filtering: {(time.time() - t2)*1000:.0f}ms -> {len(masks)} after filter")
 
         masks = sorted(masks, key=lambda m: m.area)
 
@@ -1759,7 +1724,7 @@ class FoundationPoseTrackerNode(Node):
         t5 = time.time()
         masks = reject_outside_roi_polygon(masks, cam_params.roi_polygon)
         masks = dedup_masks_by_bbox_iou(masks, iou_thresh=self.args.mask_dedup_iou)
-        print(f"[TIMING]   Final filter + dedup: {(time.time() - t5)*1000:.0f}ms -> {len(masks)} final")
+        _dprint(f"[TIMING]   Final filter + dedup: {(time.time() - t5)*1000:.0f}ms -> {len(masks)} final")
 
         return masks
 
@@ -3002,7 +2967,7 @@ class FoundationPoseTrackerNode(Node):
             self._fused_warmup_count[track_id] = warmup_count + 1
 
         if getattr(self.args, "debug_verbose_logs", False):
-            print(f"[TIMING] Fused ICP all objects: {(time.time()-t_fuse)*1000:.0f}ms")
+            _dprint(f"[TIMING] Fused ICP all objects: {(time.time()-t_fuse)*1000:.0f}ms")
 
         # ── Kalman update ──
         for tid, decision in object_decisions.items():
@@ -3288,7 +3253,7 @@ class FoundationPoseTrackerNode(Node):
         Multi-camera fusion init with single-FP + symmetry-grid refinement.
         """
         t_start = time.time()
-        print(f"\n[TIMING] ========== MULTICAM INIT START ==========")
+        _dprint(f"\n[TIMING] ========== MULTICAM INIT START ==========")
 
         # Reset the per-init-pass claim set so each fused detection picks
         # an unused (or newly allocated) track_id.
@@ -3308,7 +3273,7 @@ class FoundationPoseTrackerNode(Node):
 
             t_sam = time.time()
             masks = self._generate_and_filter_masks(view.rgb, cam_id)
-            print(f"[TIMING] SAM {cam_id}: {(time.time()-t_sam)*1000:.0f}ms -> {len(masks)} masks")
+            _dprint(f"[TIMING] SAM {cam_id}: {(time.time()-t_sam)*1000:.0f}ms -> {len(masks)} masks")
 
             if not masks:
                 selections_by_cam[cam_id] = []
@@ -3329,7 +3294,7 @@ class FoundationPoseTrackerNode(Node):
                     cam_id=cam_id, masks=masks, depth=view.depth, K=view.K,
                 )
                 if inherited:
-                    print(f"[TIMING] DINO-skip {cam_id}: inherited {len(inherited)} masks from tracker (skipped DINO)")
+                    _dprint(f"[TIMING] DINO-skip {cam_id}: inherited {len(inherited)} masks from tracker (skipped DINO)")
 
             t_dino = time.time()
             ranked = (
@@ -3340,7 +3305,7 @@ class FoundationPoseTrackerNode(Node):
                 if remaining_masks else []
             )
             selected = self._select_top_candidates(inherited + ranked, view.depth)
-            print(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
+            _dprint(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
             selections_by_cam[cam_id] = selected
 
             if cam_id in self.pub_debug_frame:
@@ -3356,7 +3321,7 @@ class FoundationPoseTrackerNode(Node):
         if sum(len(v) for v in selections_by_cam.values()) == 0:
             for view in views:
                 self.track_states[view.cam_id] = []
-            print(f"[TIMING] MULTICAM INIT: no detections")
+            _dprint(f"[TIMING] MULTICAM INIT: no detections")
             return
 
         # ── Phase 2: Fusion matching ──
@@ -3370,7 +3335,7 @@ class FoundationPoseTrackerNode(Node):
             T_base_cam_map=self.T_base_cam_map,
             cfg=fusion_cfg,
         )
-        print(f"[TIMING] Fusion matching: {(time.time()-t_fusion)*1000:.0f}ms -> {len(fused_detections)} fused objects")
+        _dprint(f"[TIMING] Fusion matching: {(time.time()-t_fusion)*1000:.0f}ms -> {len(fused_detections)} fused objects")
 
         # ── Phase 3: Single-FP + ICP + symmetry grid + weighted average ──
         t_fp_all = time.time()
@@ -3418,7 +3383,7 @@ class FoundationPoseTrackerNode(Node):
                 )
                 if pcd is not None:
                     per_cam_clouds.append(pcd)
-                    print(f"  [{cam_id}] Lifted {len(pcd.points)} pts for {fused.object_id}")
+                    _dprint(f"  [{cam_id}] Lifted {len(pcd.points)} pts for {fused.object_id}")
 
             # ─── Cloud overlap diagnostic ───
             if len(per_cam_clouds) >= 2 and getattr(self.args, "debug_verbose_logs", False):
@@ -3426,7 +3391,7 @@ class FoundationPoseTrackerNode(Node):
                 d10 = per_cam_clouds[1].compute_point_cloud_distance(per_cam_clouds[0])
                 mean_overlap_dist = (float(np.mean(d01)) + float(np.mean(d10))) / 2.0
                 cam_ids_str = [det.cam_id for det in fused.detections if det.cam_id in views_by_cam]
-                print(
+                _dprint(
                     f"  CLOUD OVERLAP {fused.object_id}: "
                     f"{cam_ids_str[0]}<->{cam_ids_str[1]} "
                     f"mean_dist={mean_overlap_dist*1000:.1f}mm"
@@ -3442,9 +3407,9 @@ class FoundationPoseTrackerNode(Node):
             fused_cloud = merge_point_clouds(per_cam_clouds, voxel_size=INIT_VOXEL_SIZE)
 
             if fused_cloud is None or len(fused_cloud.points) < 50:
-                print(f"  Fused cloud too small for {fused.object_id}, skipping")
+                _dprint(f"  Fused cloud too small for {fused.object_id}, skipping")
                 continue
-            print(f"  Fused cloud: {len(fused_cloud.points)} pts ({(time.time()-t_lift)*1000:.0f}ms)")
+            _dprint(f"  Fused cloud: {len(fused_cloud.points)} pts ({(time.time()-t_lift)*1000:.0f}ms)")
 
             # Get mesh point cloud for ICP
             model_pcd = mesh_to_pcd_cached(mesh_path, float(self.args.mesh_scale), num_points=5000)
@@ -3461,7 +3426,7 @@ class FoundationPoseTrackerNode(Node):
 
             is_single_cam = len(fused.detections) == 1
             if is_single_cam:
-                print(f"  ⚠ SINGLE-CAM init for {fused.object_id}")
+                _dprint(f"  ⚠ SINGLE-CAM init for {fused.object_id}")
 
             for det_idx, det in enumerate(fused.detections):
                 cam_id = det.cam_id
@@ -3522,7 +3487,7 @@ class FoundationPoseTrackerNode(Node):
 
                 chamfer = chamfer_distance_one_way(model_pcd, fused_cloud, T_refined)
 
-                print(
+                _dprint(
                     f"  FP+ICP [{cam_id}] {fused.object_id}: "
                     f"fp={fp_ms:.0f}ms icp={icp_ms:.0f}ms "
                     f"fitness={fitness:.3f} chamfer={chamfer*1000:.2f}mm"
@@ -3545,7 +3510,7 @@ class FoundationPoseTrackerNode(Node):
                     grid_ms = (time.time() - t_grid) * 1000
 
                     if grid_T is not None and grid_chamfer < best_chamfer:
-                        print(
+                        _dprint(
                             f"    Symmetry grid improved [{cam_id}]: "
                             f"{best_chamfer*1000:.2f}mm → {grid_chamfer*1000:.2f}mm "
                             f"({grid_ms:.0f}ms)"
@@ -3559,7 +3524,7 @@ class FoundationPoseTrackerNode(Node):
                             T_base_object=best_T,
                         )
                     else:
-                        print(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
+                        _dprint(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
 
                 if getattr(self.args, 'log_init_poses', False):
                     accepted_attempt = (best_chamfer <= CHAMFER_REJECT_M)
@@ -3583,7 +3548,7 @@ class FoundationPoseTrackerNode(Node):
                                 f'{best_chamfer*1000:.2f},{accepted_attempt}\n'
                             )
                     except Exception as e:
-                        print(f"  [WARN] init pose CSV log failed: {e}")
+                        _dprint(f"  [WARN] init pose CSV log failed: {e}")
 
                     save_init_pose_render(
                         best_T, model_pcd, fused.object_id,
@@ -3591,7 +3556,7 @@ class FoundationPoseTrackerNode(Node):
                         accepted=accepted_attempt,
                     )
 
-                print(
+                _dprint(
                     f"  FINAL [{cam_id}] {fused.object_id}: "
                     f"fitness={best_fitness:.3f} rmse={best_rmse*1000:.1f}mm "
                     f"chamfer={best_chamfer*1000:.2f}mm"
@@ -3690,7 +3655,7 @@ class FoundationPoseTrackerNode(Node):
             )
             polish_chamfer = chamfer_distance_one_way(model_pcd, fused_cloud, T_base_canonical)
             polish_ms = (time.time() - t_polish) * 1000
-            print(
+            _dprint(
                 f"  POLISH ICP {fused.object_id}: "
                 f"fitness={polish_fitness:.3f} rmse={polish_rmse*1000:.1f}mm "
                 f"chamfer={polish_chamfer*1000:.2f}mm ({polish_ms:.0f}ms)"
@@ -3703,7 +3668,7 @@ class FoundationPoseTrackerNode(Node):
             weights_str = ", ".join(
                 f"{cid}:{w:.2f}" for cid, w in zip(candidate_cam_ids, candidate_weights)
             )
-            print(
+            _dprint(
                 f"  CANONICAL {fused.object_id}: "
                 f"t=[{t_canon[0]:.4f}, {t_canon[1]:.4f}, {t_canon[2]:.4f}] "
                 f"weights=[{weights_str}]"
@@ -3720,7 +3685,7 @@ class FoundationPoseTrackerNode(Node):
                     dist_m > self.args.distance_confidence_max_m
                     or min_mask_area < self.args.distance_confidence_min_mask_area
                 ):
-                    print(
+                    _dprint(
                         f"  LOW-CONFIDENCE {fused.object_id}: "
                         f"dist={dist_m:.2f}m min_mask_area={min_mask_area}"
                     )
@@ -3784,7 +3749,7 @@ class FoundationPoseTrackerNode(Node):
                 T_to_pose_stamped(T_publish, frame_id="base", stamp=stamp)
             )
 
-        print(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms")
+        _dprint(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms")
 
         # ─── Per-camera Chamfer drift detection ───
         self._check_chamfer_drift()
@@ -3816,7 +3781,7 @@ class FoundationPoseTrackerNode(Node):
         torch.cuda.empty_cache()
         t_total = (time.time() - t_start) * 1000
         total_inited = sum(len(s) for s in new_states_by_cam.values())
-        print(f"[TIMING] ========== MULTICAM INIT TOTAL: {t_total:.0f}ms | {total_inited} objects ==========\n")
+        _dprint(f"[TIMING] ========== MULTICAM INIT TOTAL: {t_total:.0f}ms | {total_inited} objects ==========\n")
 
     def _reset_tracking_state_for_reinit(self, fused_detections):
         """
@@ -3856,7 +3821,7 @@ class FoundationPoseTrackerNode(Node):
         views = self.grabber.get_latest_views()
         if views is None:
             if getattr(self.args, "debug_verbose_logs", False):
-                print("[TICK] No views yet...")
+                _dprint("[TICK] No views yet...")
             return
     
         self.busy = True
@@ -4090,6 +4055,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--debug-per-cam-pose-publish", action="store_true")
     # When true, emit per-frame INFO logs and [TIMING] prints. Off by default.
     p.add_argument("--debug-verbose-logs", action="store_true")
+    # Master switch for all logging/print statements across the pipeline.
+    p.add_argument("--debug-logging", action="store_true",
+                   help="Enable all pipeline logging (prints + ROS logger info/warn).")
 
     # Tracking ICP can be skipped entirely (per-cam ICP is redundant because the
     # fused-cloud ICP refines the pose anyway).
@@ -4137,59 +4105,19 @@ def parse_args() -> argparse.Namespace:
     # threshold above which the rotation grid runs. 
     p.add_argument("--icp-grid-skip-chamfer-m", type=float, default=0.004)
 
-    p.add_argument("--dino-embedding-mode",
-                   choices=["cls", "patch_gem", "concat", "two_stream", "patch_match"],
-                   default="cls")
-    p.add_argument("--dino-gem-p", type=float, default=3.0,
-                   help="GeM exponent. MUSE paper uses 1.5; existing default 3.0.")
-    p.add_argument("--dino-similarity", choices=["cosine", "tanimoto"], default="cosine")
-    p.add_argument("--dino-joint-score-alpha", type=float, default=0.0,
-                   help="MUSE Eq.6 beta. 0=raw absolute score only; 1=pure relative.")
-
-    # weight blending S_cls (CLS only) and S_patch (GeM only)
-    # when embedding_mode=two_stream. Paper Eq.4 uses alpha=0.5.
-    p.add_argument("--dino-stream-alpha", type=float, default=0.5,
-                   help="two_stream: S_int = alpha*S_cls + (1-alpha)*S_patch.")
-
-    # how the relative score is derived from class scores.
-    p.add_argument("--dino-relative-score-mode",
-                   choices=["mean_sub", "softmax_tau"],
-                   default="mean_sub")
-    p.add_argument("--dino-tau", type=float, default=0.02,
-                   help="Temperature for the softmax-tau relative score.")
-
-    # per-proposal objectness prior. MUSE Eq.8 uses P(O|p)^gamma.
-    p.add_argument("--dino-objectness-prior-gamma", type=float, default=0.0,
-                   help="Power exponent on per-proposal box-objectness prior.")
+    p.add_argument("--dino-gem-p", type=float, default=1.5,
+                   help="GeM exponent for the MUSE two-stream patch stream.")
 
     # PCA-whiten the reference bank. 0 disables.
     p.add_argument("--dino-bank-pca-dim", type=int, default=0,
                    help="Project bank+queries to this many PCA-whitened dims.")
 
-    # true per-patch token matching for disambiguation.
-    # Active only when --dino-embedding-mode patch_match.
-    p.add_argument("--dino-patch-match-lowe-ratio", type=float, default=1.05,
-                   help="Lowe ratio (best/second-best) for patch_match. "
-                        "<=0 disables. 1.05 = 5%% margin.")
-    p.add_argument("--dino-patch-match-min-cos", type=float, default=0.5,
-                   help="Minimum cosine to count a patch_match inlier.")
-    p.add_argument("--dino-patch-match-mutual-nn", action="store_true",
-                   default=True, help="Require mutual nearest-neighbour matches.")
-    p.add_argument("--no-dino-patch-match-mutual-nn",
-                   dest="dino_patch_match_mutual_nn", action="store_false")
-    p.add_argument("--dino-patch-match-bg-threshold", type=int, default=10,
-                   help="Pixel-sum threshold for deriving the foreground patch "
-                        "mask from a pre-masked reference image.")
-
-    # convenience preset — once set, every --dino-* / --gdino-* flag
-    # left at its default is overridden with MUSE paper values. Explicit flags
-    # always win. Implemented in parse_args() post-processing.
-    p.add_argument("--muse-preset", action="store_true",
-                   help="Apply MUSE-paper defaults for the unset DINO/GDINO flags.")
-
-  
-    p.add_argument("--gdino-use-items-prompt", action="store_true",
-                   help="Override --gdino-text-prompts with the literal 'items'.")
+    p.add_argument("--gdino-use-items-prompt", dest="gdino_use_items_prompt",
+                   action="store_true", default=True,
+                   help="Use the MUSE class-agnostic literal 'items' prompt.")
+    p.add_argument("--no-gdino-use-items-prompt", dest="gdino_use_items_prompt",
+                   action="store_false",
+                   help="Use --gdino-text-prompts instead of the MUSE 'items' prompt.")
 
     # bicubic-upscale DINO crops whose short side is below this many pixels
     p.add_argument("--dino-min-crop-side", type=int, default=0)
@@ -4236,36 +4164,14 @@ def parse_args() -> argparse.Namespace:
     # frames (default num_maskmem=7); 16 gives a safe margin.
     p.add_argument("--sam2-max-memory-frames", type=int, default=16)
 
-    args = p.parse_args()
-
-    # --muse-preset — apply MUSE paper defaults to any DINO/GDINO
-    if bool(getattr(args, "muse_preset", False)):
-        import sys as _sys
-        cli_tokens = {tok.split("=", 1)[0] for tok in _sys.argv[1:] if tok.startswith("--")}
-
-        def _maybe_set(flag: str, attr: str, value):
-            if flag not in cli_tokens:
-                setattr(args, attr, value)
-
-        # Paper defaults (Section 4.1): alpha=0.5, beta=0.8, tau=0.02, gamma=0.1.
-        _maybe_set("--dino-embedding-mode", "dino_embedding_mode", "two_stream")
-        _maybe_set("--dino-similarity",     "dino_similarity",     "tanimoto")
-        _maybe_set("--dino-stream-alpha",   "dino_stream_alpha",   0.5)
-        _maybe_set("--dino-joint-score-alpha", "dino_joint_score_alpha", 0.8)
-        _maybe_set("--dino-relative-score-mode", "dino_relative_score_mode", "softmax_tau")
-        _maybe_set("--dino-tau",            "dino_tau",            0.02)
-        _maybe_set("--dino-objectness-prior-gamma", "dino_objectness_prior_gamma", 0.1)
-        _maybe_set("--dino-gem-p",          "dino_gem_p",          1.5)
-        # Paper prompts GDINO with the generic 'items' token.
-        _maybe_set("--gdino-use-items-prompt", "gdino_use_items_prompt", True)
-    
-
-    return args
+    return p.parse_args()
 
 
 def main() -> None:
     torch.cuda.empty_cache()
     args = parse_args()
+    global _DEBUG_LOGGING
+    _DEBUG_LOGGING = bool(args.debug_logging)
     rclpy.init()
 
     T_map = load_extrinsics_yaml("config/camera_extrinsics_base.yaml")
