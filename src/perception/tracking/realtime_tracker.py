@@ -5,24 +5,6 @@ Real-time 6DoF object tracker combining:
 
 Target: 10Hz tracking for robot manipulation feedback.
 
-Usage:
-    tracker = RealtimeTracker(RealtimeTrackerConfig())
-    
-    # Initialize with first detection
-    tracker.initialize(
-        rgb=first_frame,
-        depth=first_depth,
-        mask=initial_mask,
-        T_init=initial_pose,  # From FoundationPose
-        K=camera_intrinsics,
-        mesh_path=object_mesh,
-    )
-    
-    # Track loop
-    for rgb, depth in camera_stream:
-        result = tracker.track(rgb, depth, K)
-        if result.valid:
-            robot.update_target(result.T_object_camera)
 """
 
 from __future__ import annotations
@@ -176,12 +158,11 @@ class RealtimeTracker:
         K: np.ndarray,
         mesh_path: Optional[str] = None,
         model_vertices: Optional[np.ndarray] = None,
-        model_colors: Optional[np.ndarray] = None,
     ) -> None:
         """
         Initialize tracker with first detection.
         
-        Must provide either mesh_path OR (model_vertices, model_colors).
+        Must provide either mesh_path or model_vertices.
         
         Args:
             rgb: (H, W, 3) uint8 RGB image
@@ -191,7 +172,6 @@ class RealtimeTracker:
             K: (3, 3) camera intrinsics
             mesh_path: Path to object mesh file
             model_vertices: (N, 3) model point cloud (alternative to mesh)
-            model_colors: (N, 3) model colors [0, 1] (optional)
         """
         # Initialize the chosen mask-tracking backend with first frame + mask.
         # When SAM2 is selected we do not fall back to Cutie on init failure —
@@ -205,7 +185,7 @@ class RealtimeTracker:
         if mesh_path is not None:
             self._icp.set_model_from_mesh(mesh_path,  scale=0.01)
         elif model_vertices is not None:
-            self._icp.set_model_cloud(model_vertices, model_colors)
+            self._icp.set_model_cloud(model_vertices)
         else:
             raise ValueError("Must provide mesh_path or model_vertices")
         

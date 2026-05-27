@@ -3,7 +3,8 @@ multicam_fusion.py — Multi-camera point cloud fusion for improved 6D pose esti
 
 Pipeline:
   1. Back-project per-object masked depth → 3D point cloud in base frame
-  2. Match objects across cameras by DINO label + 3D centroid proximity
+  2. Cluster detections across cameras by 3D centroid proximity (geometry-first),
+     then arbitrate the class label by summed DINO-score voting within each cluster
   3. ICP-align per-object clouds from different cameras
   4. Fuse (concatenate + voxel downsample) into a single cloud
   5. Render fused cloud back into reference camera's depth image
@@ -32,8 +33,8 @@ import open3d as o3d
 class PerCamDetection:
     """One detected object from one camera."""
     cam_id: str
-    object_id: str          # DINO label
-    dino_score: float
+    object_id: str          # DINO label (winner per-cam; may be overwritten by cross-cam arbitration)
+    dino_score: float       # final selection-ranking score (mixes raw DINO + area/fill priors)
     mask: np.ndarray        # (H, W) bool
     mask_area: int
     bbox_xyxy: tuple[int, int, int, int]
@@ -43,6 +44,10 @@ class PerCamDetection:
     T_base_cam: np.ndarray  # 4x4 cam-to-base extrinsic
     centroid_base: np.ndarray | None = None  # (3,) computed lazily
     cloud_base: np.ndarray | None = None     # (N, 3) in base frame
+    # Raw per-class DINO scores carried from CandidateSelection — used by
+    # cross-camera label arbitration so each member contributes a vote for
+    # every candidate label, not just its own self-pick.
+    scores_by_object: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,12 +123,75 @@ def compute_cloud_centroid(pts: np.ndarray) -> np.ndarray:
 # Cross-camera object matching
 # ---------------------------------------------------------------------------
 
+def _arbitrate_label(
+    group: list[PerCamDetection],
+    min_margin: float = 0.10,
+) -> tuple[str, bool]:
+    """Pick the class label for a matched group by summed raw-DINO voting.
+
+    Each member contributes its *raw per-class* DINO score (from
+    `scores_by_object`) for every candidate label, not just its own
+    self-pick. This is critical: if cam_a's raw DINO had
+    {cooling_screw: 0.85, cooling_f: 0.30} and cam_b had
+    {cooling_screw: 0.05, cooling_f: 0.70}, the right answer is cooling_f
+    (sum 1.00 > 0.90), even though both cams' self-picks were cooling_screw
+    and cooling_f respectively.
+
+    `dino_score` (the selection-ranking heuristic that mixes raw DINO with
+    area/fill priors) is only used as a fallback for the member's self-pick
+    when `scores_by_object` is empty.
+
+    Returns:
+        (winner_label, ambiguous_flag). When `ambiguous_flag` is True, the
+        top-1 and top-2 summed scores are within `min_margin` of each
+        other — the caller should drop the cluster rather than commit to a
+        coin-flip class assignment.
+    """
+    if not group:
+        return "", False
+
+    candidate_labels: set[str] = set()
+    for d in group:
+        sbo = getattr(d, "scores_by_object", None) or {}
+        candidate_labels.update(sbo.keys())
+        if d.object_id:
+            candidate_labels.add(d.object_id)
+    if not candidate_labels:
+        return group[0].object_id, False
+
+    sums: dict[str, float] = {lbl: 0.0 for lbl in candidate_labels}
+    for d in group:
+        sbo = getattr(d, "scores_by_object", None) or {}
+        for lbl in candidate_labels:
+            if lbl in sbo:
+                sums[lbl] += float(sbo[lbl])
+            elif lbl == d.object_id:
+                sums[lbl] += float(d.dino_score)
+
+    ranked = sorted(sums.items(), key=lambda kv: (-kv[1], kv[0]))
+    winner_lbl, winner_score = ranked[0]
+    if len(ranked) > 1:
+        runner_score = ranked[1][1]
+        ambiguous = (winner_score - runner_score) < float(min_margin)
+    else:
+        ambiguous = False
+    return winner_lbl, ambiguous
+
+
 def match_detections_across_cameras(
     detections_by_cam: dict[str, list[PerCamDetection]],
     max_centroid_distance: float = 0.08,
+    label_arbitration_min_margin: float = 0.10,
 ) -> list[list[PerCamDetection]]:
     """
-    Match detected objects across cameras by DINO label + 3D centroid proximity.
+    Cluster detections across cameras by 3D centroid proximity (geometry-first),
+    then arbitrate the class label per cluster by summed DINO-score voting.
+
+    This handles the failure mode where cam1 labels a physical object as
+    cooling_screw while cam2 labels the same physical object as cooling_f:
+    both detections still cluster together by centroid, vote on the label,
+    and produce a single fused detection with the winning label written back
+    onto every member's object_id.
 
     Args:
         detections_by_cam: cam_id -> list of detections (with centroid_base populated)
@@ -132,10 +200,13 @@ def match_detections_across_cameras(
     Returns:
         List of matched groups. Each group is a list of 1-2 PerCamDetections
         representing the same physical object seen from different cameras.
+        Every detection's `object_id` is overwritten with the arbitrated label
+        so downstream code (mesh lookup, FP, tracking init) sees one consistent
+        class per cluster.
     """
     cam_ids = list(detections_by_cam.keys())
     if len(cam_ids) < 2:
-        # Single camera: every detection is its own group
+        # Single camera: every detection is its own group (label unchanged)
         groups = []
         for dets in detections_by_cam.values():
             for d in dets:
@@ -145,95 +216,88 @@ def match_detections_across_cameras(
     # For now, handle exactly 2 cameras
     cam_a, cam_b = cam_ids[0], cam_ids[1]
     dets_a = detections_by_cam[cam_a]
-    dets_b = list(detections_by_cam[cam_b])  # copy so we can mark used
+    dets_b = detections_by_cam[cam_b]
+
+    # Geometry-first cost matrix between ALL cam_a x cam_b detections,
+    # independent of DINO label. Label disagreement is handled by voting
+    # after clustering, not by partitioning the search space upfront.
+    na, nb = len(dets_a), len(dets_b)
+    cost = np.full((na, nb), np.inf, dtype=np.float32)
+    for ia in range(na):
+        ca = dets_a[ia].centroid_base
+        if ca is None:
+            continue
+        for ib in range(nb):
+            cb = dets_b[ib].centroid_base
+            if cb is None:
+                continue
+            cost[ia, ib] = float(np.linalg.norm(ca - cb))
 
     matched_groups: list[list[PerCamDetection]] = []
-    used_b: set[int] = set()
+    matched_a: set[int] = set()
+    matched_b: set[int] = set()
+    # Detections that were geometrically paired but dropped for label ambiguity.
+    # Crucially these MUST NOT fall through to the singleton path, or we re-
+    # introduce the phantom-duplicate-track failure mode the matcher exists
+    # to prevent.
+    dropped_a: set[int] = set()
+    dropped_b: set[int] = set()
 
-    # Group detections by DINO label
-    labels_a: dict[str, list[int]] = {}
-    for i, d in enumerate(dets_a):
-        labels_a.setdefault(d.object_id, []).append(i)
-
-    labels_b: dict[str, list[int]] = {}
-    for j, d in enumerate(dets_b):
-        labels_b.setdefault(d.object_id, []).append(j)
-
-    # For each label that appears in both cameras, match by centroid proximity
-    for label in labels_a:
-        if label not in labels_b:
-            # Only seen in cam_a
-            for i in labels_a[label]:
-                matched_groups.append([dets_a[i]])
+    # Greedy minimum-distance assignment (one-to-one). Fine for small N.
+    while cost.size > 0:
+        min_val = float(cost.min())
+        if not np.isfinite(min_val) or min_val > max_centroid_distance:
+            break
+        ia_best, ib_best = np.unravel_index(cost.argmin(), cost.shape)
+        ia_best, ib_best = int(ia_best), int(ib_best)
+        if ia_best in matched_a or ib_best in matched_b:
+            cost[ia_best, ib_best] = np.inf
             continue
-
-        indices_a = labels_a[label]
-        indices_b = [j for j in labels_b[label] if j not in used_b]
-
-        if not indices_b:
-            for i in indices_a:
-                matched_groups.append([dets_a[i]])
-            continue
-
-        # Build cost matrix based on centroid distance
-        cost = np.full((len(indices_a), len(indices_b)), np.inf, dtype=np.float32)
-        for ia, idx_a in enumerate(indices_a):
-            ca = dets_a[idx_a].centroid_base
-            if ca is None:
-                continue
-            for ib, idx_b in enumerate(indices_b):
-                cb = dets_b[idx_b].centroid_base
-                if cb is None:
-                    continue
-                cost[ia, ib] = float(np.linalg.norm(ca - cb))
-
-        # Greedy matching (sufficient for small numbers of objects)
-        matched_a: set[int] = set()
-        matched_b_local: set[int] = set()
-
-        while True:
-            if cost.size == 0:
-                break
-            min_val = cost.min()
-            if min_val > max_centroid_distance:
-                break
-            ia_best, ib_best = np.unravel_index(cost.argmin(), cost.shape)
-            if ia_best in matched_a or ib_best in matched_b_local:
-                cost[ia_best, ib_best] = np.inf
-                continue
-
-            idx_a = indices_a[ia_best]
-            idx_b = indices_b[ib_best]
-            matched_groups.append([dets_a[idx_a], dets_b[idx_b]])
+        group = [dets_a[ia_best], dets_b[ib_best]]
+        winner, ambiguous = _arbitrate_label(
+            group, min_margin=label_arbitration_min_margin,
+        )
+        if ambiguous:
+            print(
+                f"[FUSION] LABEL AMBIGUOUS at "
+                f"{tuple(np.round(dets_a[ia_best].centroid_base, 3))}: "
+                f"{cam_a}={dets_a[ia_best].object_id}({dets_a[ia_best].dino_score:.2f}) "
+                f"+ {cam_b}={dets_b[ib_best].object_id}({dets_b[ib_best].dino_score:.2f}) "
+                f"-> DROP cluster (top-2 margin < {label_arbitration_min_margin:.2f})"
+            )
+            dropped_a.add(ia_best)
+            dropped_b.add(ib_best)
+            # Mark both endpoints consumed so neither becomes a singleton.
             matched_a.add(ia_best)
-            matched_b_local.add(ib_best)
-            used_b.add(idx_b)
+            matched_b.add(ib_best)
             cost[ia_best, :] = np.inf
             cost[:, ib_best] = np.inf
-
-        # Unmatched from cam_a for this label
-        for ia, idx_a in enumerate(indices_a):
-            if ia not in matched_a:
-                matched_groups.append([dets_a[idx_a]])
-
-    # Labels only in cam_b (not processed above)
-    for label in labels_b:
-        if label in labels_a:
             continue
-        for j in labels_b[label]:
-            if j not in used_b:
-                matched_groups.append([dets_b[j]])
-
-    # Unmatched cam_b detections from shared labels
-    for j, d in enumerate(dets_b):
-        if j not in used_b:
-            # Check it wasn't already added
-            already_added = any(
-                any(dd is d for dd in group)
-                for group in matched_groups
+        loser_labels = {d.object_id for d in group if d.object_id != winner}
+        if loser_labels:
+            print(
+                f"[FUSION] LABEL ARBITRATION at "
+                f"{tuple(np.round(dets_a[ia_best].centroid_base, 3))}: "
+                f"{cam_a}={dets_a[ia_best].object_id}({dets_a[ia_best].dino_score:.2f}) "
+                f"+ {cam_b}={dets_b[ib_best].object_id}({dets_b[ib_best].dino_score:.2f}) "
+                f"-> {winner}"
             )
-            if not already_added:
-                matched_groups.append([d])
+        for d in group:
+            d.object_id = winner
+        matched_groups.append(group)
+        matched_a.add(ia_best)
+        matched_b.add(ib_best)
+        cost[ia_best, :] = np.inf
+        cost[:, ib_best] = np.inf
+
+    # Singletons: detections never matched across cams keep their original
+    # label. Detections dropped for ambiguity are NOT singletonised.
+    for ia in range(na):
+        if ia not in matched_a and ia not in dropped_a:
+            matched_groups.append([dets_a[ia]])
+    for ib in range(nb):
+        if ib not in matched_b and ib not in dropped_b:
+            matched_groups.append([dets_b[ib]])
 
     return matched_groups
 
@@ -448,6 +512,12 @@ class FusionConfig:
     icp_min_fitness: float = 0.10           # below this, skip ICP correction
     min_depth: float = 0.05
     max_depth: float = 3.0
+    # Cross-camera label arbitration: when summed per-class DINO votes for
+    # the top-1 and top-2 labels in a cluster differ by less than this, the
+    # cluster is declared ambiguous and dropped entirely (no group, no
+    # singleton fallback). Prevents confidently-wrong class assignments
+    # that would feed the wrong mesh into FoundationPose.
+    label_arbitration_min_margin: float = 0.10
     debug_dir: str = ""                     # set to a path to dump debug PLY/PNG
     debug_enabled: bool = False
 
@@ -570,6 +640,10 @@ def build_per_cam_detections(
                 T_base_cam=T_bc,
                 centroid_base=centroid,
                 cloud_base=cloud,
+                scores_by_object={
+                    str(k): float(v)
+                    for k, v in (getattr(sel, "scores_by_object", {}) or {}).items()
+                },
             )
             dets.append(det)
 
@@ -775,7 +849,9 @@ def run_multicam_fusion(
     )
 
     matched_groups = match_detections_across_cameras(
-        dets_by_cam, max_centroid_distance=cfg.max_centroid_distance,
+        dets_by_cam,
+        max_centroid_distance=cfg.max_centroid_distance,
+        label_arbitration_min_margin=cfg.label_arbitration_min_margin,
     )
 
     results = []

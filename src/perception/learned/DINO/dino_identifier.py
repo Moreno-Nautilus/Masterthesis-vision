@@ -2,14 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import os
-import time
+
 
 @dataclass
 class DINOIdentifierConfig:
@@ -22,56 +20,22 @@ class DINOIdentifierConfig:
     reference_dir: str = "Data/reference_crops"
     allowed_exts: tuple[str, ...] = (".png", ".jpg", ".jpeg")
 
-    # Bundle 5 / MUSE-style options. All defaults preserve the original
-    # CLS-token + cosine behaviour.
-    #
-    # embedding_mode:
-    #   "cls"         — original DINOv2 CLS token (unchanged behaviour).
-    #   "patch_gem"   — Generalised-Mean-pooled patch tokens (more spatial
-    #                   detail; better at distinguishing similar objects).
-    #   "concat"      — concatenate L2-normalised CLS + GeM patch features.
-    #   "two_stream"  — MUSE Eq.4: separate Tanimoto/cosine on CLS-only and
-    #                   GeM-patch-only banks, blended by stream_alpha.
-    #   "patch_match" — B2/M1: true per-patch token matching for
-    #                   disambiguation. Stores the full (N_patches, D) grid
-    #                   per reference; scores via mutual-NN + Lowe-ratio
-    #                   inlier counting (SuperGlue-style spatial matching).
+    # "cls", "patch_gem", "concat", "two_stream" or "patch_match".
     embedding_mode: str = "cls"
-    gem_p: float = 3.0  # GeM pooling exponent. Higher = closer to max-pool.
-    # similarity:
-    #   "cosine"   — original.
-    #   "tanimoto" — generalised Tanimoto / Jaccard for normalised vectors.
-    #                Penalises descriptors that share magnitude only.
+    gem_p: float = 3.0
     similarity: str = "cosine"
-    # Joint absolute + relative score. In MUSE Eq.6 this is `beta`:
-    #   S_joint = beta * S_abs + (1 - beta) * S_rel.
-    # alpha=0 -> pure raw score (legacy default).
+    # Blend absolute and relative class score
     joint_score_alpha: float = 0.0
-    # M-new1 / B2 / M1: per-stream blend weight (paper's "alpha" in Eq.4).
-    # Only consulted when embedding_mode == "two_stream":
-    #   S_int = stream_alpha * S_cls + (1 - stream_alpha) * S_patch.
+    # Used only in two_stream mode: CLS vs patch stream blend.
     stream_alpha: float = 0.5
-    # M3: how to derive the relative score from absolute per-class scores.
-    #   "mean_sub"     — legacy: (score - mean(scores_of_other_classes)).
-    #   "softmax_tau"  — MUSE Eq.5: softmax(S_abs / tau) over classes.
     relative_score_mode: str = "mean_sub"
-    tau: float = 0.02  # MUSE temperature for the softmax-tau relative score.
-    # M4: power-scaling exponent on the per-proposal objectness prior
-    # (MUSE Eq.8). 0 disables the prior entirely; the paper uses 0.1.
+    tau: float = 0.02
+    # 0 disables objectness-prior scaling.
     objectness_prior_gamma: float = 0.0
-    # M-new5: PCA-whiten the reference bank to this many components before
-    # matching. 0 disables; recommended values: 64 / 128. The same projection
-    # is applied to every query embedding.
+    # PCA-whiten reference bank before matching. 0 disables.
     bank_pca_dim: int = 0
 
-    # B2 / M1: knobs for the "patch_match" embedding mode.
-    #   lowe_ratio:    Lowe's ratio test, keep matches with
-    #                  best_sim / second_best_sim >= ratio. <=0 disables.
-    #   min_cos:       minimum cosine similarity for an inlier match.
-    #   use_mutual_nn: require the match to be mutual nearest-neighbour
-    #                  in both directions (query<->reference).
-    #   bg_threshold:  pixel-sum threshold used to derive the foreground
-    #                  patch mask from a pre-masked (black-background) RGB.
+    # Patch-match knobs.
     patch_match_lowe_ratio: float = 1.05
     patch_match_min_cos: float = 0.5
     patch_match_use_mutual_nn: bool = True
@@ -101,27 +65,14 @@ class DINOIdentifier:
         )
 
         self.model = self._build_model()
-        # self.model.eval()
 
         self.reference_bank: list[ReferenceEmbedding] = []
-        # Shape depends on embedding_mode:
-        #   single-stream modes -> (N, D)
-        #   "two_stream"        -> (N, 2, D)        rows = [CLS, GeM]
-        #   "patch_match"       -> (N, N_patches, D) per-ref patch grids
         self.reference_matrix: np.ndarray | None = None
         self.reference_object_ids: list[str] = []
-        # B2 / M1: foreground patch mask per reference, shape (N, N_patches).
-        # Only populated when embedding_mode == "patch_match".
+        # Foreground patch mask per reference, only for patch_match mode.
         self.reference_patch_masks: np.ndarray | None = None
-        # M-new5: bank whitening state (None when --dino-bank-pca-dim == 0).
         self._pca_mean: np.ndarray | None = None  # (D,)
         self._pca_components: np.ndarray | None = None  # (k, D)
-        self.debug_dir = "/home/moreno/MasterThesis/outputs/DINODEBUG"
-        self.debug_enabled = False  # Set False to disable
-        if self.debug_enabled:
-            os.makedirs(self.debug_dir, exist_ok=True)
-            os.makedirs(f"{self.debug_dir}/query_crops", exist_ok=True)
-            os.makedirs(f"{self.debug_dir}/matches", exist_ok=True)
 
     def _build_model(self) -> torch.nn.Module:
         model = torch.hub.load("facebookresearch/dinov2", self.cfg.model_name)
@@ -167,15 +118,12 @@ class DINOIdentifier:
 
     @staticmethod
     def _gem_pool(patch_tokens: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
-        """Generalised Mean pooling over patch tokens.
-
-        patch_tokens: (B, N_patches, D). Returns (B, D).
-        """
+        """Generalised Mean pooling over patch tokens"""
         x = patch_tokens.clamp(min=eps)
         return x.pow(p).mean(dim=1).pow(1.0 / p)
 
     def _patch_size(self) -> int:
-        """Return the DINOv2 patch side length (14 for ViT-B/L/14, 16 otherwise)."""
+        """Return the DINOv2 patch side length"""
         name = (self.cfg.model_name or "").lower()
         if "14" in name:
             return 14
@@ -199,9 +147,6 @@ class DINOIdentifier:
 
     def _patch_mask_from_input_mask(self, mask: np.ndarray) -> np.ndarray:
         """Downsample a HxW binary mask onto the patch grid (max-pool).
-
-        Mirrors the center-crop + resize chain used in _preprocess so the
-        returned (N_patches,) bool vector aligns with the patch tokens.
         """
         m = mask.astype(np.uint8)
         m = self._center_crop_square(m)
@@ -227,17 +172,6 @@ class DINOIdentifier:
 
     def embed_image(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         """Compute the embedding for one RGB crop.
-
-        Return shape depends on embedding_mode:
-          - "cls" / "patch_gem"             -> (D,)
-          - "concat"                        -> (2D,)
-          - "two_stream"                    -> (2, D)         rows = [CLS, GeM]
-          - "patch_match"                   -> (N_patches, D) L2-normalised
-                                              patch tokens. The matching
-                                              foreground patch mask is derived
-                                              separately via
-                                              `_patch_mask_from_input_mask` /
-                                              `_patch_mask_from_masked_rgb`.
         """
         rgb = self._ensure_rgb(rgb)
         rgb = self._apply_mask(rgb, mask)
@@ -322,9 +256,7 @@ class DINOIdentifier:
 
         primary_root = roots[0]
 
-        # Default cache path next to primary reference dir. Tag with model + mode
-        # AND a digest of all root paths so caches don't get reused across
-        # different reference-source combinations.
+        # Default cache path next to primary reference dir. 
         if cache_path is None:
             roots_tag = "_".join(sorted(r.name for r in roots))
             # gem_p affects patch-pool output; size affects raw token grid.
@@ -369,7 +301,7 @@ class DINOIdentifier:
                     self.reference_bank = bank
                     self.reference_matrix = cached_embeddings
                     self.reference_object_ids = cached_object_ids
-                    # B2 / M1: restore patch masks when present (patch_match cache).
+                    # Restore patch masks when present.
                     pm = None
                     try:
                         if "patch_masks" in cached.files:
@@ -419,9 +351,6 @@ class DINOIdentifier:
             )
 
         self.reference_bank = bank
-        # Two-stream embeddings have shape (2, D) per sample; np.stack pushes
-        # the new axis to front, giving (N, 2, D). Single-stream stays (N, D).
-        # patch_match per-sample shape is (N_p, D) -> stacked (N, N_p, D).
         self.reference_matrix = np.stack([r.embedding for r in bank], axis=0)
         self.reference_object_ids = [r.object_id for r in bank]
         self.reference_patch_masks = (
@@ -448,24 +377,9 @@ class DINOIdentifier:
 
 
 
-    def set_reference_bank(self, refs: Iterable[ReferenceEmbedding]) -> None:
-        refs = list(refs)
-        if not refs:
-            raise ValueError("Reference bank is empty")
-
-        self.reference_bank = refs
-        self.reference_matrix = np.stack([r.embedding for r in refs], axis=0)
-        self.reference_object_ids = [r.object_id for r in refs]
-        self._maybe_fit_bank_pca()
-        
-
     @staticmethod
     def _pairwise_similarity(query: np.ndarray, bank: np.ndarray, kind: str) -> np.ndarray:
         """Compute (N,) similarity row between query (1, D) and bank (N, D).
-
-        Both are assumed L2-normalised when the caller normalises embeddings.
-        For Tanimoto we recompute on the raw values to handle the
-        |q|^2 + |r|^2 - q.r denominator.
         """
         if kind == "cosine":
             return (query @ bank.T).reshape(-1)
@@ -477,15 +391,9 @@ class DINOIdentifier:
             return qr / np.maximum(denom, 1e-12)
         raise ValueError(f"Unknown similarity kind: {kind!r}")
 
-    # ── M-new5: PCA / whitening on the reference bank ──────────────────────
+    # ── PCA / whitening on the reference bank ──────────────────────────────
     def _maybe_fit_bank_pca(self) -> None:
         """Fit a PCA-whitening projection on the current reference matrix.
-
-        Only used when `bank_pca_dim > 0`. After fitting, the stored matrix
-        is the projected version (the original raw embeddings are dropped
-        from `reference_matrix`; ReferenceEmbedding entries keep the raw
-        vectors for cache integrity). Two-stream mode fits one PCA *per
-        stream* and stores the projected (N, 2, k) matrix.
         """
         k = int(self.cfg.bank_pca_dim)
         if k <= 0 or self.reference_matrix is None:
@@ -512,20 +420,10 @@ class DINOIdentifier:
     @staticmethod
     def _fit_one_pca(mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         """Return (mean (D,), whitened_components (k, D)).
-
-        True PCA whitening: the top-k right-singular vectors are pre-scaled
-        by 1/σ so that ``centred @ comp.T`` yields per-axis unit-variance
-        outputs. A small ε is added to σ for numerical stability on
-        near-zero modes. The 1/sqrt(N-1) sample-variance factor is omitted
-        because the downstream comparison is cosine similarity (which is
-        invariant to a global scale, and we L2-renorm after projection).
         """
         mat = np.asarray(mat, dtype=np.float32)
         mean = mat.mean(axis=0)
         centred = mat - mean
-        # SVD on the centred data: rows of Vt are the principal directions,
-        # s are the singular values (sqrt of eigenvalues of the covariance,
-        # up to the omitted 1/sqrt(N-1) factor).
         _, s, vt = np.linalg.svd(centred, full_matrices=False)
         k_eff = max(1, min(k, vt.shape[0]))
         vt_k = vt[:k_eff]
@@ -569,7 +467,7 @@ class DINOIdentifier:
             return out
         return query
 
-    # ── B2 / M1: per-patch token matching ──────────────────────────────────
+    # ── Per-patch token matching ───────────────────────────────────────────
     def _score_query_vs_ref_patches(
         self,
         q_patches: np.ndarray,        # (n_q, D), L2-normalised
@@ -615,11 +513,6 @@ class DINOIdentifier:
 
     def _patch_match_sims(self, query_patches: np.ndarray, query_mask: np.ndarray | None) -> np.ndarray:
         """Compute per-reference inlier-fraction scores for a patch_match query.
-
-        query_patches: (N_pq, D)  L2-normalised patch tokens of the query.
-        query_mask:    (N_pq,) bool — True for foreground patches, or None to
-                       use all patches.
-        Returns:       (N_refs,) per-reference scalar score in [0, 1].
         """
         if self.reference_matrix is None or self.reference_matrix.ndim != 3:
             raise RuntimeError(
@@ -669,21 +562,6 @@ class DINOIdentifier:
         query_patch_mask: np.ndarray | None = None,
     ) -> DINOResult:
         """Classify a query embedding against the reference bank.
-
-        objectness_prior:
-            * float    — MUSE Eq.10: per-proposal scalar applied as
-                         `prior^gamma * S_joint` to every class score.
-                         `gamma` comes from `cfg.objectness_prior_gamma`.
-                         Note: this uniformly scales class scores, so it
-                         does not change argmax — but it scales the final
-                         score used for downstream proposal ranking.
-            * dict     — legacy per-object multiplicative weight (changes argmax).
-            * None     — no prior.
-
-        query_patch_mask:
-            Only used when embedding_mode == "patch_match". Bool array of
-            shape (N_patches,) selecting foreground patches of the query.
-            When None, all query patches are used.
         """
         if self.reference_matrix is None or len(self.reference_bank) == 0:
             raise RuntimeError("Reference bank is empty. Build or set it first.")
@@ -703,10 +581,6 @@ class DINOIdentifier:
             and self.reference_matrix.ndim == 3
         )
 
-        # PCA projection (no-op when not configured). patch_match buckets
-        # disable PCA because the projection is fit on aggregate embeddings
-        # rather than per-patch tokens; mixing the two would silently corrupt
-        # the matching geometry.
         if not patch_match:
             embedding = self._maybe_project_query(embedding)
 
@@ -796,70 +670,4 @@ class DINOIdentifier:
             score=float(best_score),
             embedding=embedding_out,
             scores_by_object=agg_for_decision,
-        )
-
-
-    def classify_crop(self, rgb: np.ndarray, mask: np.ndarray | None = None) -> DINOResult:
-        # Apply mask if enabled
-        print(f"[DINO DEBUG] classify_crop called, rgb shape: {rgb.shape}")
-
-        rgb_processed = self._apply_mask(rgb, mask)
-        
-        # Debug: save the crop before preprocessing
-        if self.debug_enabled:
-            ts = int(time.time() * 1000)
-            cv2.imwrite(
-                f"{self.debug_dir}/query_crops/crop_{ts}.png",
-                cv2.cvtColor(rgb_processed, cv2.COLOR_RGB2BGR)
-            )
-        
-        emb = self.embed_image(rgb, mask=mask)
-        result = self.classify_embedding(emb)
-        
-        # Debug: save match visualization
-        if self.debug_enabled and result.score > 0.5:
-            self._save_match_debug(rgb_processed, result, ts)
-        
-        return result
-
-    def _save_match_debug(self, query_crop: np.ndarray, result: DINOResult, ts: int) -> None:
-        """Save side-by-side of query crop and best matching reference."""
-        # Find best matching reference image. patch_match references are
-        # (N_patches, D); fall back to picking the first ref of the class.
-        is_patch_match = (self.cfg.embedding_mode == "patch_match")
-        best_ref = None
-        for ref in self.reference_bank:
-            if ref.object_id == result.object_id:
-                if best_ref is None:
-                    best_ref = ref
-                elif not is_patch_match:
-                    sim = np.dot(result.embedding, ref.embedding)
-                    best_sim = np.dot(result.embedding, best_ref.embedding)
-                    if sim > best_sim:
-                        best_ref = ref
-        
-        if best_ref is None:
-            return
-        
-        # Load reference image
-        ref_bgr = cv2.imread(best_ref.image_path)
-        if ref_bgr is None:
-            return
-        ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
-        
-        # Resize both to same height for comparison
-        h = 200
-        query_resized = cv2.resize(query_crop, (h, h))
-        ref_resized = cv2.resize(ref_rgb, (h, h))
-        
-        # Concatenate side by side
-        combined = np.hstack([query_resized, ref_resized])
-        
-        # Add text
-        cv2.putText(combined, f"{result.object_id}: {result.score:.3f}", 
-                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
-        cv2.imwrite(
-            f"{self.debug_dir}/matches/match_{ts}_{result.object_id}_{result.score:.2f}.png",
-            cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
         )

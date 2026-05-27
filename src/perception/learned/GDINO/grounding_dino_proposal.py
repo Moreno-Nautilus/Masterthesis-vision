@@ -1,17 +1,4 @@
-"""Grounding DINO text-prompted box proposer.
-
-Wraps the IDEA-Research Grounding DINO model so the pipeline can produce
-class-conditioned box proposals before SAM segmentation (MUSE-style).
-The boxes are then handed to SAM as box prompts, replacing the default
-automatic-mask-generator stage.
-
-The model is loaded lazily on the first call so importing this file is
-free even when --mask-source != gdino_sam.
-
-Default checkpoint: HuggingFace 'IDEA-Research/grounding-dino-base' via
-the transformers library. To use the larger variant, pass
---gdino-model-id IDEA-Research/grounding-dino-large.
-"""
+"""Grounding DINO text-prompted box proposer."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,8 +14,6 @@ class GDINOConfig:
     box_threshold: float = 0.30
     text_threshold: float = 0.25
     max_boxes_per_image: int = 30
-    # One prompt string per object class. Multiple words inside a string
-    # are concatenated with a period as Grounding DINO expects.
     text_prompts: list[str] = field(default_factory=list)
 
 
@@ -42,10 +27,6 @@ class GDINOProposal:
 class GroundingDINOProposer:
     """Thin wrapper around HuggingFace transformers' AutoModelForZeroShotObjectDetection.
 
-    Usage:
-        cfg = GDINOConfig(text_prompts=["cooling base", "cooling f", "cooling screw"])
-        proposer = GroundingDINOProposer(cfg)
-        proposals = proposer.propose(rgb)  # list[GDINOProposal]
     """
 
     def __init__(self, cfg: GDINOConfig | None = None) -> None:

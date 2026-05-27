@@ -11,13 +11,11 @@ import torch
 @dataclass
 class SAMMaskCandidate:
     mask: np.ndarray  # (H, W) bool
-    score: float                              # SAM IoU / stability score
+    score: float  # SAM IoU / stability score
     bbox_xyxy: tuple[int, int, int, int]
     area: int
     crop_rgb: np.ndarray | None = None
-    # MUSE Eq.10 objectness prior. For the gdino_sam / yolo_sam paths this
-    # carries the box-proposer's confidence (Grounding DINO or YOLO). Stays
-    # None on the automatic-mask-generator path.
+    # Box-proposer confidence for prompted masks; None for auto masks.
     prompt_score: float | None = None
 
 
@@ -31,8 +29,8 @@ class SAMSegmenterConfig:
     use_bfloat16: bool = True
 
     # proposal filtering
-    min_mask_area: int = 800 # 1500
-    max_mask_area_ratio: float = 0.06 #0.85
+    min_mask_area: int = 800
+    max_mask_area_ratio: float = 0.06
     min_bbox_side_px: int = 20
 
     # image resizing before mask generation
@@ -42,38 +40,25 @@ class SAMSegmenterConfig:
     attach_rgb_crops: bool = True
 
     # automatic mask generation
-    auto_points_per_side: int = 64 #64
-    auto_pred_iou_thresh: float = 0.70 #0.60
-    auto_stability_score_thresh: float = 0.65 #0.75
-    auto_crop_n_layers: int = 1 # WAS 1
+    auto_points_per_side: int = 64
+    auto_pred_iou_thresh: float = 0.70
+    auto_stability_score_thresh: float = 0.65
+    auto_crop_n_layers: int = 1
     auto_crop_n_points_downscale_factor: int = 2
-    auto_min_mask_region_area: int = 150 #200
+    auto_min_mask_region_area: int = 150
 
-    # Maximum allowed bbox aspect ratio (max_side / min_side). Bumped 2.5 -> 4.5
-    # because cooling_f at oblique viewing angles can hit ~3.5:1 and was being
-    # silently rejected before DINO ever saw it.
+    # max_side / min_side
     max_aspect_ratio: float = 4.5
 
-    # Shadow rejection (HSV-based)
+    # HSV shadow rejection
     shadow_filter_enabled: bool = True
-    min_saturation: int = 60           # Reject masks with mean saturation below this (0-255)
-    min_value: int = 80                # Reject very dark regions
-    max_value_for_low_sat: int = 220   # Shadows are mid-brightness + low saturation
+    min_saturation: int = 60
+    min_value: int = 80
+    max_value_for_low_sat: int = 220
 
 
 class SAMSegmenter:
-    """
-    Thin SAM2 image-segmentation wrapper.
-
-    Current design goal:
-    - take one RGB image
-    - return a list of candidate masks
-    - keep everything simple and deterministic for later DINO integration
-
-    Notes:
-    - This wrapper intentionally does NOT do semantic classification.
-    - It is only a mask proposal generator.
-    """
+    """SAM2 wrapper for auto and box-prompted mask proposals."""
 
     def __init__(self, cfg: SAMSegmenterConfig | None = None) -> None:
         self.cfg = cfg or SAMSegmenterConfig()
@@ -165,7 +150,6 @@ class SAMSegmenter:
         x0, y0, x1, y1 = bbox_xyxy
         return rgb[y0:y1, x0:x1].copy()
 
-
     def _filter_mask(
         self,
         mask: np.ndarray,
@@ -190,117 +174,48 @@ class SAMSegmenter:
         if not np.isfinite(score):
             return False
 
-        # Reject overly elongated masks (likely merged objects or artifacts)
         aspect_ratio = max(bw, bh) / (min(bw, bh) + 1e-6)
         if aspect_ratio > self.cfg.max_aspect_ratio:
             return False
 
-        # Reject masks where fill ratio is too low (bbox much larger than mask)
         bbox_area = bw * bh
         if bbox_area > 0:
             fill_ratio = area / bbox_area
-            if fill_ratio < 0.20:  # Mask should fill at least 20% of its bbox
+            if fill_ratio < 0.20:
                 return False
 
-        # NEW: HSV-based shadow rejection
         if self.cfg.shadow_filter_enabled and rgb is not None:
             import cv2
-            # Get pixels within the mask
             mask_bool = mask.astype(bool)
             masked_pixels = rgb[mask_bool]
-            
-            if len(masked_pixels) > 10:  # Need enough pixels to analyze
-                # Convert to HSV (need to reshape for cv2)
-                # Create a small image from masked pixels for conversion
+
+            if len(masked_pixels) > 10:
                 pixels_rgb = masked_pixels.reshape(1, -1, 3).astype(np.uint8)
                 pixels_hsv = cv2.cvtColor(pixels_rgb, cv2.COLOR_RGB2HSV)
                 pixels_hsv = pixels_hsv.reshape(-1, 3)
-                
+
                 mean_saturation = pixels_hsv[:, 1].mean()
                 mean_value = pixels_hsv[:, 2].mean()
-                
-                # Reject low-saturation regions that aren't very dark (shadows on white table)
-                # Real blue objects have saturation, shadows don't
+
                 if mean_saturation < self.cfg.min_saturation:
                     if mean_value > self.cfg.min_value and mean_value < self.cfg.max_value_for_low_sat:
-                        return False  # Low saturation + mid brightness = shadow
+                        return False
 
-        # Reject masks that cover multiple disconnected or weakly connected regions
         if area > 5000 and rgb is not None:
             import cv2
             from scipy import ndimage
-            
+
             mask_uint8 = mask.astype(np.uint8)
-            labeled, num_features = ndimage.label(mask_uint8)
+            _, num_features = ndimage.label(mask_uint8)
             if num_features > 1:
-                return False  # Multiple disconnected regions
-            
-            # Check for "necking" - mask that pinches thin (merged objects)
+                return False
+
             eroded = cv2.erode(mask_uint8, np.ones((5, 5), np.uint8), iterations=3)
             _, num_after_erode = ndimage.label(eroded)
             if num_after_erode > 1:
-                return False  # Eroding splits it = weakly connected
+                return False
 
         return True
-
-
-    def generate_from_points(
-        self,
-        rgb: np.ndarray,
-        prompt_points_xy: np.ndarray,
-        prompt_labels: np.ndarray | None = None,
-        multimask_output: bool = True,
-    ) -> list[SAMMaskCandidate]:
-        """
-        Generate masks from explicit point prompts.
-
-        Parameters
-        ----------
-        rgb : np.ndarray
-            RGB image, uint8, shape (H, W, 3)
-        prompt_points_xy : np.ndarray
-            Shape (N, 2), image coordinates in pixels
-        prompt_labels : np.ndarray | None
-            Shape (N,), 1 for foreground, 0 for background.
-            If None, all prompts are treated as foreground.
-        """
-        if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
-
-        rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
-
-        pts = np.asarray(prompt_points_xy, dtype=np.float32).reshape(-1, 2)
-        if prompt_labels is None:
-            labels = np.ones((pts.shape[0],), dtype=np.int32)
-        else:
-            labels = np.asarray(prompt_labels, dtype=np.int32).reshape(-1)
-
-        if scale != 1.0:
-            pts = pts * scale
-
-        with torch.inference_mode():
-            if self.device.type == "cuda" and self.cfg.use_bfloat16:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    self._predictor.set_image(rgb_small)
-                    masks, scores, _ = self._predictor.predict(
-                        point_coords=pts,
-                        point_labels=labels,
-                        multimask_output=multimask_output,
-                    )
-            else:
-                self._predictor.set_image(rgb_small)
-                masks, scores, _ = self._predictor.predict(
-                    point_coords=pts,
-                    point_labels=labels,
-                    multimask_output=multimask_output,
-                )
-
-        return self._postprocess_masks(
-            rgb_original=rgb,
-            masks_pred=masks,
-            scores_pred=scores,
-            scale=scale,
-        )
 
     def generate_from_boxes(
         self,
@@ -308,14 +223,7 @@ class SAMSegmenter:
         boxes_xyxy: np.ndarray,
         box_scores: np.ndarray | None = None,
     ) -> list[SAMMaskCandidate]:
-        """Box-prompted segmentation. One mask per box; uses each box as a
-        prompt to SAM's image predictor. Used by the Grounding-DINO + SAM
-        proposal path (Bundle 8 / MUSE-style).
-
-        If `box_scores` is provided (same length as `boxes_xyxy`), the
-        corresponding objectness/confidence is attached to each returned
-        candidate as `prompt_score`. MUSE Eq.10 consumes this downstream.
-        """
+        """Segment one mask per box prompt."""
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
         boxes = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
@@ -372,9 +280,7 @@ class SAMSegmenter:
         return out
 
     def generate_auto(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
-        """
-        Automatic mask proposals from a single RGB image.
-        """
+        """Automatic mask proposals from one RGB image."""
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
 
@@ -401,7 +307,7 @@ class SAMSegmenter:
 
             score = float(item.get("predicted_iou", 0.0))
 
-            if not self._filter_mask(mask, score, (h0, w0), rgb = rgb):
+            if not self._filter_mask(mask, score, (h0, w0), rgb=rgb):
                 continue
 
             bbox = self._bbox_from_mask(mask)
@@ -419,86 +325,4 @@ class SAMSegmenter:
             )
 
         out.sort(key=lambda x: (x.score, x.area), reverse=True)
-        return out
-
-    def generate_auto_on_crop(
-        self,
-        rgb_full: np.ndarray,
-        crop_xyxy: tuple[int, int, int, int],
-        reuse_embedding: bool = False,
-    ) -> list[SAMMaskCandidate]:
-        """
-        Generate masks for a crop region, optionally reusing the full-image embedding.
-        
-        Args:
-            rgb_full: Full RGB image
-            crop_xyxy: (x0, y0, x1, y1) crop region in full image coords
-            reuse_embedding: If True, assumes set_image was already called on rgb_full
-        """
-        x0, y0, x1, y1 = crop_xyxy
-        rgb_crop = rgb_full[y0:y1, x0:x1].copy()
-        
-        if rgb_crop.size == 0:
-            return []
-        
-        # Generate masks on the crop
-        masks_crop = self.generate_auto(rgb_crop)
-        
-        # Lift masks back to full image coordinates
-        h_full, w_full = rgb_full.shape[:2]
-        lifted = []
-        for m in masks_crop:
-            full_mask = np.zeros((h_full, w_full), dtype=bool)
-            full_mask[y0:y1, x0:x1] = m.mask
-            
-            bx0, by0, bx1, by1 = m.bbox_xyxy
-            lifted.append(
-                SAMMaskCandidate(
-                    mask=full_mask,
-                    bbox_xyxy=(bx0 + x0, by0 + y0, bx1 + x0, by1 + y0),
-                    area=m.area,
-                    score=m.score,
-                    crop_rgb=m.crop_rgb,
-                )
-            )
-        return lifted
-
-    def _postprocess_masks(
-        self,
-        rgb_original: np.ndarray,
-        masks_pred: np.ndarray,
-        scores_pred: np.ndarray,
-        scale: float,
-    ) -> list[SAMMaskCandidate]:
-        import cv2
-
-        h0, w0 = rgb_original.shape[:2]
-        out: list[SAMMaskCandidate] = []
-
-        for mask_small, score in zip(masks_pred, scores_pred):
-            mask_small = np.asarray(mask_small, dtype=np.uint8)
-
-            if scale != 1.0:
-                mask = cv2.resize(mask_small, (w0, h0), interpolation=cv2.INTER_NEAREST) > 0
-            else:
-                mask = mask_small > 0
-
-            if not self._filter_mask(mask, float(score), (h0, w0), rgb = rgb_original):
-                continue
-
-            bbox = self._bbox_from_mask(mask)
-            area = int(mask.sum())
-            crop_rgb = self._crop_rgb(rgb_original, bbox) if self.cfg.attach_rgb_crops else None
-
-            out.append(
-                SAMMaskCandidate(
-                    mask=mask,
-                    score=float(score),
-                    bbox_xyxy=bbox,
-                    area=area,
-                    crop_rgb=crop_rgb,
-                )
-            )
-
-        out.sort(key=lambda x: x.score, reverse=True)
         return out

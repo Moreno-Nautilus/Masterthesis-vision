@@ -4,12 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import sys
-import pickle
-import hashlib
-from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+
 
 @dataclass
 class FoundationPoseConfig:
@@ -17,9 +14,7 @@ class FoundationPoseConfig:
     weights_dir: str = "external/FoundationPose/weights"
     debug_dir: str = "outputs/foundationpose/fp_internal_debug"
     debug: int = 0
-    est_refine_iter: int = 5
     mesh_scale: float = 0.01  # STL is in mm, convert to meters
-
 
 
 @dataclass
@@ -32,18 +27,7 @@ class FoundationPoseResult:
 
 
 class FoundationPoseWrapper:
-    """
-    Thin lazy wrapper around FoundationPose registration.
-
-    Current scope:
-    - model-based pose initialization from RGB + depth + K + mask + mesh
-    - no tracking yet
-
-    Notes
-    -----
-    We intentionally keep imports lazy so the rest of the repo can still run
-    even when FoundationPose dependencies are only available in its own env.
-    """
+    """Lazy wrapper for FoundationPose registration."""
 
     def __init__(self, cfg: FoundationPoseConfig | None = None) -> None:
         self.cfg = cfg or FoundationPoseConfig()
@@ -59,14 +43,12 @@ class FoundationPoseWrapper:
         self._dr = None
         self._FoundationPose = None
         self._ScorePredictor = None
-        self._PoseRefinePredictor = None
 
         self._mesh_path_loaded: str | None = None
         self._est = None
         self._mesh = None
         self._glctx = None
         self._scorer = None
-        self._refiner = None
 
     def _ensure_repo_on_path(self) -> None:
         if not self.repo_root.exists():
@@ -80,7 +62,6 @@ class FoundationPoseWrapper:
         if not self.weights_dir.exists():
             raise FileNotFoundError(f"FoundationPose weights_dir does not exist: {self.weights_dir}")
 
-        # Helpful for code that assumes cwd-relative weights lookup
         os.environ.setdefault("FOUNDATIONPOSE_WEIGHTS_DIR", str(self.weights_dir))
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", os.environ.get("TORCH_CUDA_ARCH_LIST", ""))
 
@@ -93,28 +74,17 @@ class FoundationPoseWrapper:
 
         import trimesh
         import nvdiffrast.torch as dr
-        import learning.training.predict_score as ps
-        #print(f"[FP DEBUG import] predict_score file = {ps.__file__}")
-
-        from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
+        from estimater import FoundationPose, ScorePredictor
 
         self._trimesh = trimesh
         self._dr = dr
         self._FoundationPose = FoundationPose
         self._ScorePredictor = ScorePredictor
-        self._PoseRefinePredictor = PoseRefinePredictor
 
         self._imports_ready = True
 
-    def _get_mesh_cache_path(self, mesh_path: str) -> Path:
-        """Get cache path for preprocessed mesh data."""
-        mesh_hash = hashlib.md5(f"{mesh_path}_{self.cfg.mesh_scale}".encode()).hexdigest()[:12]
-        cache_dir = Path("/workspace/MasterThesis/cache/fp_meshes")
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / f"{Path(mesh_path).stem}_{mesh_hash}.pkl"
-
-    def preload_mesh(self, mesh_path: str, object_id: str = None) -> None:
-        """Pre-cache mesh."""
+    def preload_mesh(self, mesh_path: str, object_id: str | None = None) -> None:
+        """Build the estimator once so first init is faster."""
         if object_id is None:
             object_id = Path(mesh_path).stem
         
@@ -175,40 +145,20 @@ class FoundationPoseWrapper:
             return
 
         mesh = self._trimesh.load(mesh_path)
-        # Center mesh at origin (required for correct FP pose)
         mesh.vertices -= mesh.centroid
-        mesh_scale = self.cfg.mesh_scale
 
-        # Scale mesh to meters if needed
         if self.cfg.mesh_scale != 1.0:
             mesh.apply_scale(self.cfg.mesh_scale)
 
-        # trimesh usually computes these lazily; force availability
-        _ = mesh.vertex_normals
-
-        # trimesh usually computes these lazily; force availability
         _ = mesh.vertex_normals
 
         object_debug_dir = self.debug_dir / object_id
         object_debug_dir.mkdir(parents=True, exist_ok=True)
 
         scorer = self._ScorePredictor()
-        refiner = self._PoseRefinePredictor()
-
-        import torch
 
         if hasattr(scorer, "model") and scorer.model is not None:
             scorer.model = scorer.model.float().cuda().eval()
-        # if hasattr(refiner, "model") and refiner.model is not None:
-        #     refiner.model = refiner.model.float().cuda().eval()
-
-        # DEBUG: print model param dtype/device once when estimator is built
-        if hasattr(scorer, "model") and scorer.model is not None:
-            p = next(scorer.model.parameters())
-            #print(f"[FP DEBUG] scorer model dtype={p.dtype}, device={p.device}")
-        if hasattr(refiner, "model") and refiner.model is not None:
-            p = next(refiner.model.parameters())
-            #print(f"[FP DEBUG] refiner model dtype={p.dtype}, device={p.device}")
 
         glctx = self._dr.RasterizeCudaContext()
 
@@ -221,16 +171,13 @@ class FoundationPoseWrapper:
             debug_dir=str(object_debug_dir),
             debug=int(self.cfg.debug),
             glctx=glctx,
-        
         )
 
         self._mesh_path_loaded = mesh_path
         self._mesh = mesh
         self._scorer = scorer
-        self._refiner = refiner
         self._glctx = glctx
         self._est = est
-
 
     def estimate_pose(
         self,
@@ -241,7 +188,6 @@ class FoundationPoseWrapper:
         depth: np.ndarray,
         K: np.ndarray,
         mask: np.ndarray,
-        est_refine_iter: int | None = None,
     ) -> FoundationPoseResult:
         try:
             self._build_estimator(object_id=object_id, mesh_path=mesh_path)
@@ -255,19 +201,10 @@ class FoundationPoseWrapper:
         depth = self._sanitize_depth(depth).astype(np.float32)
         K = self._sanitize_K(K).astype(np.float32)
         mask = self._sanitize_mask(mask, rgb.shape[:2])
-        mask_bool = mask.astype(bool)
-        d = depth[mask_bool]
-        valid = d[np.isfinite(d) & (d > 0)]
-        
-        try:
-            import torch
 
+        try:
             if hasattr(self._scorer, "model") and self._scorer.model is not None:
                 self._scorer.model = self._scorer.model.float().cuda().eval()
-            if hasattr(self._refiner, "model") and self._refiner.model is not None:
-                self._refiner.model = self._refiner.model.float().cuda().eval()
-            # RIGHT BEFORE self._est.register():
-            # print(f"[DEBUG depth check] has_nan={np.isnan(depth).any()} has_inf={np.isinf(depth).any()} min={np.nanmin(depth):.3f} max={np.nanmax(depth):.3f}")
             pose = self._est.register(
                 K=K,
                 rgb=rgb,
@@ -275,7 +212,6 @@ class FoundationPoseWrapper:
                 ob_mask=mask,
                 iteration=0,
             )
-            # print("FP raw translation:", pose[:3, 3])
         except Exception as e:
             raise RuntimeError(
                 f"FoundationPose register() failed for {object_id} "
@@ -289,61 +225,10 @@ class FoundationPoseWrapper:
             )
         pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
 
-        t_raw = pose[:3, 3].copy()
-
-
         return FoundationPoseResult(
             object_id=object_id,
             mesh_path=str(Path(mesh_path).resolve()),
             T_object_camera=pose,
             mask_area=int(mask.sum()),
-            debug_dir=str((self.debug_dir / object_id).resolve()),
-        )
-
-    def refine_pose(
-        self,
-        *,
-        object_id: str,
-        mesh_path: str,
-        rgb: np.ndarray,
-        depth: np.ndarray,
-        K: np.ndarray,
-        T_object_camera_init: np.ndarray,
-        iterations: int = 1,
-    ) -> "FoundationPoseResult":
-        """C8: run only FP's neural refiner starting from a given pose.
-
-        Used post-rotation-grid to lock in the geometry-best seed with the
-        learned refiner. Skips the full proposal+scoring of register() —
-        the grid has already chosen the rotation hypothesis.
-        """
-        self._build_estimator(object_id=object_id, mesh_path=mesh_path)
-        rgb = self._sanitize_rgb(rgb)
-        depth = self._sanitize_depth(depth).astype(np.float32)
-        K = self._sanitize_K(K).astype(np.float32)
-        T0 = np.asarray(T_object_camera_init, dtype=np.float32).reshape(4, 4)
-
-        import torch
-        if hasattr(self._refiner, "model") and self._refiner.model is not None:
-            self._refiner.model = self._refiner.model.float().cuda().eval()
-
-        # The underlying FP estimator caches pose state in `self._est.pose_last`.
-        # track_one() refines from that cached pose, so seed it explicitly.
-        self._est.pose_last = torch.from_numpy(T0[None, ...]).cuda().float()
-
-        pose_raw = self._est.track_one(
-            rgb=rgb, depth=depth, K=K, iteration=int(iterations),
-        )
-        if isinstance(pose_raw, torch.Tensor):
-            pose = pose_raw.detach().cpu().numpy()
-        else:
-            pose = np.asarray(pose_raw, dtype=np.float32)
-        pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
-
-        return FoundationPoseResult(
-            object_id=object_id,
-            mesh_path=str(Path(mesh_path).resolve()),
-            T_object_camera=pose,
-            mask_area=0,
             debug_dir=str((self.debug_dir / object_id).resolve()),
         )

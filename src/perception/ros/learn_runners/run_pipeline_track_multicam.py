@@ -41,13 +41,11 @@ from src.perception.tracking.realtime_tracker import RealtimeTracker, RealtimeTr
 from src.perception.tracking.cutie_tracker import CutieConfig, CutieTracker
 from src.perception.tracking.icp_refiner import ICPConfig, ICPVariant
 from dataclasses import dataclass, field
-from typing import Optional
 from src.perception.multicam_fusion import (
     FusionConfig,
-    FusedDetection,
     run_multicam_fusion,
 )
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 import open3d as o3d
 from src.perception.fused_multicam_helpers import (
     lift_masked_depth_to_base,
@@ -111,10 +109,10 @@ class PoseKalmanFilter:
         # Covariance matrix
         self.P = np.eye(6, dtype=np.float64) * 0.1
         
-        # Process noise (velocity can change)
+        # Process noise 
         self.Q = np.eye(6, dtype=np.float64)
-        self.Q[:3, :3] *= process_noise ** 2  # Position process noise
-        self.Q[3:, 3:] *= (process_noise * 2) ** 2  # Velocity process noise (higher)
+        self.Q[:3, :3] *= process_noise ** 2  # Position 
+        self.Q[3:, 3:] *= (process_noise * 2) ** 2  # Velocity
         
         # Measurement noise (position only)
         self.R = np.eye(3, dtype=np.float64) * measurement_noise ** 2
@@ -125,7 +123,7 @@ class PoseKalmanFilter:
         self.F[1, 4] = 1.0  # y += vy
         self.F[2, 5] = 1.0  # z += vz
         
-        # Measurement matrix (we only measure position)
+        # Measurement matrix (only position)
         self.H = np.zeros((3, 6), dtype=np.float64)
         self.H[0, 0] = 1.0
         self.H[1, 1] = 1.0
@@ -136,7 +134,6 @@ class PoseKalmanFilter:
        
     
     def initialize(self, position: np.ndarray) -> None:
-        """Initialize filter with first position."""
         self.state[:3] = position
         self.state[3:] = 0.0  # Zero initial velocity
         self.P = np.eye(6, dtype=np.float64) * 0.1
@@ -145,19 +142,16 @@ class PoseKalmanFilter:
     
     def predict(self) -> np.ndarray:
         """
-        Predict next position based on current state.
-        Returns predicted [x, y, z].
+        Advance state one step using the constant-velocity model and
+        propagate covariance.
         """
         if not self._initialized:
             return np.zeros(3)
-        
-        # Predict state
-        state_pred = self.F @ self.state
-        
-        # Predict covariance
+
+        self.state = self.F @ self.state
         self.P = self.F @ self.P @ self.F.T + self.Q
-        
-        return state_pred[:3].copy()
+
+        return self.state[:3].copy()
     
     def update(self, position: np.ndarray) -> None:
         """
@@ -211,6 +205,7 @@ class PoseKalmanFilter:
 class ObjectTrackState:
     object_id: str
     mesh_path: str
+    track_id: str = ""
     mode: str = "search"
     T_object_camera: Optional[np.ndarray] = None
     dino_score: float = 0.0
@@ -244,9 +239,9 @@ class MemoryCrop:
     frame_idx: int
     fitness: float
     embedding: np.ndarray            # L2-normalised DINO embedding
-    rgb_crop: Optional[np.ndarray] = None   # uint8 HxWx3; kept only if --memory-crop-keep-rgb
-    mask_crop: Optional[np.ndarray] = None  # bool HxW; kept only if --memory-crop-keep-rgb
-
+    track_id: str = ""
+    rgb_crop: Optional[np.ndarray] = None   # uint8 HxWx3;
+    mask_crop: Optional[np.ndarray] = None  # bool HxW
 
 @dataclass
 class CandidateSelection:
@@ -254,6 +249,11 @@ class CandidateSelection:
     score: float
     scores_by_object: dict[str, float]
     candidate: SAMMaskCandidate
+    base_scores_by_object: dict[str, float] = field(default_factory=dict)
+    score_source: str = "dino_base"
+    track_id_hint: str = ""
+    dino_class_score: float = 0.0
+    dino_margin: float = 0.0
 
 
 @dataclass
@@ -281,7 +281,6 @@ def save_init_pose_render(
     accepted: bool,
     gt_pos=None,
 ) -> None:
-    """Render a 3D scatter of the init pose estimate using matplotlib (headless-safe)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -297,11 +296,11 @@ def save_init_pose_render(
         fig = plt.figure(figsize=(8, 6))
         ax = fig.add_subplot(111, projection='3d')
 
-        color = '#3366CC' if accepted else '#CC3333'
+        color = '#3366CC' if accepted else "#AF2323"
         ax.scatter(pts_base[::3, 0], pts_base[::3, 1], pts_base[::3, 2],
                    s=1, c=color, alpha=0.4)
 
-        # Draw pose axes (50mm)
+        # Draw pose axes
         for axis_i, axis_color in enumerate(['r', 'g', 'b']):
             axis_end = t + R[:, axis_i] * 0.05
             ax.plot([t[0], axis_end[0]], [t[1], axis_end[1]], [t[2], axis_end[2]],
@@ -394,13 +393,6 @@ def parse_polygon_string(s: str) -> np.ndarray:
     return np.array(vals, dtype=np.int32).reshape(-1, 2)
 
 
-def parse_xyxy_string(s: str) -> tuple[int, int, int, int]:
-    vals = [int(v.strip()) for v in s.split(",")]
-    if len(vals) != 4:
-        raise ValueError(f"ROI box string must have 4 ints: {s}")
-    return vals[0], vals[1], vals[2], vals[3]
-
-
 def bbox_size_xyxy(b: tuple[int, int, int, int]) -> tuple[int, int]:
     x0, y0, x1, y1 = b
     return x1 - x0, y1 - y0
@@ -432,11 +424,15 @@ def nms_by_position(
             if obj_states[i].T_object_camera is None:
                 continue
             pos_i = obj_states[i].T_object_camera[:3, 3]
+            tid_i = getattr(obj_states[i], "track_id", "") or ""
 
             for j in range(i + 1, len(obj_states)):
                 if not keep_mask[j]:
                     continue
                 if obj_states[j].T_object_camera is None:
+                    continue
+                tid_j = getattr(obj_states[j], "track_id", "") or ""
+                if tid_i and tid_j and tid_i != tid_j:
                     continue
                 pos_j = obj_states[j].T_object_camera[:3, 3]
                 dist = np.linalg.norm(pos_i - pos_j)
@@ -480,9 +476,7 @@ def apply_clahe_rgb(
     clip_limit: float = 2.0,
     grid_size: int = 8,
 ) -> np.ndarray:
-    """D1: CLAHE on the L channel of LAB. Boosts local contrast on the
-    matte 3D-printed parts under flat lab lighting without colour shifts.
-    Returns a new (H, W, 3) uint8 RGB array.
+    """CLAHE on the L channel of LAB. Returns a new (H, W, 3) uint8 RGB array.
     """
     if rgb.size == 0:
         return rgb
@@ -500,10 +494,8 @@ def upscale_crop_if_small(
     mask: np.ndarray,
     min_side: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """A8: bicubic-upscale a small crop so DINOv2's input-size downsample
-    doesn't throw away detail. RGB uses bicubic, mask uses nearest neighbour
-    (so the boolean stays clean). No-op when min_side <= 0 or the crop is
-    already large enough.
+    """Bicubic-upscale a small crop so DINOv2's input-size downsample
+    doesn't throw away detail.
     """
     if min_side <= 0:
         return rgb, mask
@@ -707,68 +699,14 @@ def lift_crop_masks_to_full_image(
     return lifted
 
 
-def find_blue_blob_masks(
-    rgb: np.ndarray,
-    min_area: int = 20,
-    max_area: int = 3000,
-) -> list[np.ndarray]:
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-    lower = np.array([95, 90, 70], dtype=np.uint8)
-    upper = np.array([140, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-    out = []
-    for i in range(1, num_labels):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < min_area or area > max_area:
-            continue
-        comp = (labels == i).astype(np.uint8)
-        out.append(comp)
-    return out
-
-
-def blob_masks_to_candidates(blob_masks: list[np.ndarray]) -> list[SAMMaskCandidate]:
-    out = []
-    for m in blob_masks:
-        ys, xs = np.where(m > 0)
-        if xs.size == 0 or ys.size == 0:
-            continue
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        out.append(
-            SAMMaskCandidate(
-                mask=m.astype(bool),
-                bbox_xyxy=(x0, y0, x1, y1),
-                area=int(m.sum()),
-                score=1.0,
-            )
-        )
-    return out
-
-
 def batch_dino_classify(
     dino: DINOIdentifier,
     crops_rgb: list[np.ndarray],
     crops_mask: list[np.ndarray | None],
     objectness_priors: list[float | None] | None = None,
 ) -> list[DINOResult]:
-    """Embed `crops_rgb` in one forward pass, then classify each via the bank.
+    """Embed `crops_rgb` in one forward pass, then classify each via the ref bank."""
 
-    Supports every `embedding_mode` declared by DINOIdentifierConfig
-    (cls, patch_gem, concat, two_stream, patch_match).
-
-    `objectness_priors`, if provided, must have the same length as `crops_rgb`
-    and carries the per-proposal box-objectness score (e.g. from Grounding
-    DINO). It is forwarded into `classify_embedding` for MUSE Eq.10 scaling.
-    """
     if not crops_rgb:
         return []
     if objectness_priors is not None and len(objectness_priors) != len(crops_rgb):
@@ -786,8 +724,6 @@ def batch_dino_classify(
     batch = torch.cat(tensors, dim=0)
     mode = dino.cfg.embedding_mode
 
-    # B2 / M1: patch_match keeps the full per-patch grid alongside an explicit
-    # foreground patch mask derived from each crop's input mask.
     query_patch_masks: list[np.ndarray | None] = [None] * len(crops_rgb)
     if mode == "patch_match":
         with torch.inference_mode():
@@ -816,8 +752,6 @@ def batch_dino_classify(
             feats = F.normalize(feats, dim=1)
         embeddings = feats.detach().cpu().numpy()
     elif mode in ("patch_gem", "concat", "two_stream"):
-        # patch_gem / concat / two_stream — need forward_features for the
-        # patch-token grid.
         with torch.inference_mode():
             out = dino.model.forward_features(batch)
         if not isinstance(out, dict):
@@ -910,8 +844,6 @@ class FoundationPoseTrackerNode(Node):
             ),
         }
 
-        # B6: pick reference source. "real" uses --reference-dir (existing
-        # behaviour), "renders" uses --reference-renders-dir, "both" merges them.
         ref_source = args.reference_source
         primary_ref = (
             args.reference_renders_dir if ref_source == "renders"
@@ -966,12 +898,10 @@ class FoundationPoseTrackerNode(Node):
         )
 
         self.sam_by_cam: dict[str, SAMSegmenter] = {}
-        self.sam_tiny_by_cam: dict[str, SAMSegmenter] = {}
 
-        # gdino_sam and yolo_sam reuse the same SAM instance — only the
-        # proposal stage differs (boxes from Grounding DINO / YOLO instead
-        # of automatic mask generation).
-        sam_modes = {"sam", "gdino_sam", "yolo_sam"}
+        # gdino_sam reuses the same SAM instance; only the proposal stage
+        # differs (boxes from Grounding DINO instead of automatic masks).
+        sam_modes = {"sam", "gdino_sam"}
         if args.mask_source in sam_modes:
             for cam in CAMERAS:
                 cam_params = self.cam_sam_params[cam.cam_id]
@@ -988,14 +918,14 @@ class FoundationPoseTrackerNode(Node):
                     )
                 )
 
-        # Grounding-DINO proposer (lazy-loaded) for the gdino_sam path.
+        # Grounding-DINO proposer
         self.gdino_proposer = None
         if args.mask_source == "gdino_sam":
             from src.perception.learned.GDINO.grounding_dino_proposal import (
                 GDINOConfig, GroundingDINOProposer,
             )
             if bool(getattr(args, "gdino_use_items_prompt", False)):
-                # M-new3: MUSE-style class-agnostic prompt.
+                # MUSE-style class-agnostic prompt.
                 text_prompts = ["items"]
             else:
                 text_prompts = [p.strip() for p in args.gdino_text_prompts.split(",") if p.strip()]
@@ -1014,60 +944,6 @@ class FoundationPoseTrackerNode(Node):
                 f"prompts={text_prompts}"
             )
 
-        # YOLO proposer (lazy-loaded) for the yolo_sam path. Class-agnostic
-        # counterpart to GDINO: pure objectness boxes, no text prompts.
-        self.yolo_proposer = None
-        if args.mask_source == "yolo_sam":
-            from src.perception.learned.YOLO.yolo_proposal import (
-                YOLOConfig, YOLOProposer,
-            )
-            class_filter = [c.strip() for c in args.yolo_class_filter.split(",") if c.strip()]
-            self.yolo_proposer = YOLOProposer(
-                YOLOConfig(
-                    model_name=args.yolo_model,
-                    device=args.yolo_device or args.device,
-                    conf_threshold=float(args.yolo_conf_threshold),
-                    iou_threshold=float(args.yolo_iou_threshold),
-                    image_size=int(args.yolo_image_size),
-                    max_boxes_per_image=int(args.yolo_max_boxes),
-                    class_filter=class_filter,
-                    class_agnostic=bool(args.yolo_class_agnostic),
-                )
-            )
-            self.get_logger().info(
-                f"YOLO proposer ready | model={args.yolo_model} "
-                f"conf={args.yolo_conf_threshold} class_filter={class_filter or 'all'}"
-            )
-
-        if args.mask_source in sam_modes and args.tiny_objects_enabled:
-            # A3/A4/A7: dedicated tiny-pass SAM config. Lighter checkpoint
-            # (if provided), fewer prompt points, lower acceptance thresholds.
-            # Defaults still produce a working pipeline if the user has not
-            # downloaded a smaller checkpoint — falls back to main ckpt.
-            # Bundle 11: build the tiny segmenter for every camera so the
-            # tiny-pass runs on both cams (was previously zed2i_2-only).
-            tiny_ckpt = args.tiny_sam_checkpoint or args.sam_checkpoint
-            tiny_cfg = args.tiny_sam_model_cfg or args.sam_model_cfg
-            tiny_sam_cfg = SAMSegmenterConfig(
-                repo_root=args.sam_repo_root,
-                checkpoint=tiny_ckpt,
-                model_cfg=tiny_cfg,
-                device=args.device,
-                max_image_side=max(args.sam_max_image_side, args.tiny_sam_max_image_side),
-                min_mask_area=args.tiny_sam_min_mask_area,
-                min_bbox_side_px=args.tiny_sam_min_bbox_side_px,
-                attach_rgb_crops=False,
-                auto_points_per_side=int(args.tiny_sam_points_per_side),
-                auto_pred_iou_thresh=float(args.tiny_sam_pred_iou_thresh),
-                auto_stability_score_thresh=float(args.tiny_sam_stability_score_thresh),
-                max_aspect_ratio=float(args.tiny_sam_max_aspect_ratio),
-            )
-            # Share weights across cams: build the model once and reuse.
-            tiny_segmenter = SAMSegmenter(tiny_sam_cfg)
-            for cam in CAMERAS:
-                self.sam_tiny_by_cam[cam.cam_id] = tiny_segmenter
-
-
         self.fp_tracker_by_cam: dict[str, FoundationPoseWrapper] = {}
         for cam in CAMERAS:
             self.fp_tracker_by_cam[cam.cam_id] = FoundationPoseWrapper(
@@ -1076,7 +952,6 @@ class FoundationPoseTrackerNode(Node):
                     weights_dir=args.fp_weights_dir,
                     debug_dir=str(Path(args.output_root).resolve() / f"fp_debug_{cam.cam_id}"),
                     debug=args.fp_debug,
-                    est_refine_iter=args.est_refine_iter,
                     mesh_scale=args.mesh_scale,
                 )
             )
@@ -1087,10 +962,10 @@ class FoundationPoseTrackerNode(Node):
         for obj_id, mesh_path in self.mesh_map.items():
             for cam in CAMERAS:
                 self.fp_tracker_by_cam[cam.cam_id].preload_mesh(mesh_path=mesh_path, object_id=obj_id)
-                break  # Only need to cache once per object (mesh is shared)
+                break  
         self.get_logger().info(f"Pre-cached {len(self.mesh_map)} meshes")
         
-        # Real-time tracker (CuteVOS + ICP) — one per camera
+        # Real-time tracker (CuteVOS + ICP)
         self.realtime_trackers: dict[str, RealtimeTracker] = {}
         self.rt_active: dict[str, bool] = {c.cam_id: False for c in CAMERAS}
 
@@ -1103,9 +978,7 @@ class FoundationPoseTrackerNode(Node):
         self.pub_debug_frame: dict[str, Any] = {}
 
 
-        # Pre-warm Cutie to avoid 2.5s delay on first track. Skipped when
-        # SAM2 is the selected video tracker, since Cutie is not used and
-        # not kept as a fallback in that mode.
+        # Pre-warm Cutie to avoid 2.5s delay on first track.
         if str(getattr(args, "video_tracker", "cutie")).lower() == "sam2":
             self.get_logger().info("Skipping Cutie pre-warm (video_tracker=sam2)")
         else:
@@ -1128,9 +1001,24 @@ class FoundationPoseTrackerNode(Node):
             "zed2i_1": float(self.args.cam1_depth_bias_m),
             "zed2i_2": float(self.args.cam2_depth_bias_m),
             }
-        self._fused_warmup_count = {}       # obj_id -> frames since init
-        self._median_pose_buffers = {}      # obj_id -> MedianPoseBuffer
+        self._fused_warmup_count = {}       # track_id -> frames since init
+        self._median_pose_buffers = {}      # track_id -> MedianPoseBuffer
         self._T_cam_base_cache: dict[str, np.ndarray] = {}
+
+        # Per-track hold/lost tracking. lost_count is consecutive frames
+        # without an accepted fused pose. pose_status flips fresh→held→
+        # stale→lost
+        self._fused_lost_count: dict[str, int] = {}
+        self._fused_pose_status: dict[str, str] = {}
+        self._force_reinit_tracks: set[str] = set()
+
+        # Per-class monotonic counter feeding _allocate_track_id.
+        self._next_track_id_counter: dict[str, int] = {}
+        # Last accepted base-frame centroid per track_id.
+        self._last_known_track_centroids: dict[str, np.ndarray] = {}
+        # track_id -> object_id reverse map.
+        self._track_id_to_object_id: dict[str, str] = {}
+        self._claimed_track_ids_this_init: set[str] = set()
 
 
         self._consecutive_chamfer_fails: dict[str, int] = {}
@@ -1138,20 +1026,54 @@ class FoundationPoseTrackerNode(Node):
         self._init_chamfer_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=10)
         )
-        # Bundle 11: (cam_id, object_id) -> {frame_idx, mask, occlusion_score,
-        # T_object_camera}. Populated by _track_multicam_fused and consumed
-        # by _process_multicam_init when --skip-dino-when-tracker-healthy.
         self._recent_tracker_health: dict[tuple[str, str], dict] = {}
 
-        # Per-object appearance memory bank. Persists across reinits so that
-        # when SAM proposes several look-alike candidates, the re-id step can
-        # compare each candidate's DINO embedding against snapshots taken when
-        # ICP fitness was high. Keyed by object_id (not cam_id) so views from
-        # both cameras share the bank.
+        # Per-object appearance memory bank.
         max_crops = int(getattr(args, "memory_crop_max_per_object", 8))
         self._memory_crops_by_object: dict[str, deque[MemoryCrop]] = defaultdict(
             lambda: deque(maxlen=max(1, max_crops))
         )
+        self._memory_crops_by_track_id: dict[str, deque[MemoryCrop]] = defaultdict(
+            lambda: deque(maxlen=max(1, max_crops))
+        )
+
+    # ── track_id allocation / cross-init identity preservation ──────────
+    def _allocate_track_id(self, object_id: str) -> str:
+        n = self._next_track_id_counter.get(object_id, 0)
+        self._next_track_id_counter[object_id] = n + 1
+        tid = f"{object_id}_inst{n}"
+        self._track_id_to_object_id[tid] = object_id
+        return tid
+
+    def _resolve_track_id_for_new_detection(
+        self,
+        object_id: str,
+        base_centroid: np.ndarray,
+        match_radius_m: float = 0.08,
+    ) -> str:
+        """At init, try to reuse an existing track_id whose last accepted
+        base-frame centroid is within match_radius_m of the new detection's
+        centroid. Falls back to allocating a fresh id. Preserves Kalman /
+        memory / pose_status continuity across reinit cycles when the same
+        physical instance is re-detected."""
+        c = np.asarray(base_centroid, dtype=np.float64).reshape(3)
+        best_tid: Optional[str] = None
+        best_dist = float("inf")
+        for tid, last_c in self._last_known_track_centroids.items():
+            if self._track_id_to_object_id.get(tid) != object_id:
+                continue
+            if tid in self._claimed_track_ids_this_init:
+                continue
+            d = float(np.linalg.norm(np.asarray(last_c, dtype=np.float64).reshape(3) - c))
+            if d < best_dist:
+                best_dist = d
+                best_tid = tid
+        if best_tid is not None and best_dist <= match_radius_m:
+            self._claimed_track_ids_this_init.add(best_tid)
+            return best_tid
+        tid = self._allocate_track_id(object_id)
+        self._claimed_track_ids_this_init.add(tid)
+        return tid
 
     @staticmethod
     def _build_mesh_map(cad_dir: str) -> dict[str, str]:
@@ -1181,41 +1103,6 @@ class FoundationPoseTrackerNode(Node):
             f"q_base=[{q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f}]"
         )
     
-
-    @staticmethod
-    def _octahedral_rotations() -> list[np.ndarray]:
-        """24 elements of the chiral octahedral group (cube symmetries)."""
-        from scipy.spatial.transform import Rotation as SciRot
-        return [
-            np.eye(3),
-            SciRot.from_euler('x',  90, degrees=True).as_matrix(),
-            SciRot.from_euler('x', 180, degrees=True).as_matrix(),
-            SciRot.from_euler('x', 270, degrees=True).as_matrix(),
-            SciRot.from_euler('y',  90, degrees=True).as_matrix(),
-            SciRot.from_euler('y', 180, degrees=True).as_matrix(),
-            SciRot.from_euler('y', 270, degrees=True).as_matrix(),
-            SciRot.from_euler('z',  90, degrees=True).as_matrix(),
-            SciRot.from_euler('z', 180, degrees=True).as_matrix(),
-            SciRot.from_euler('z', 270, degrees=True).as_matrix(),
-            SciRot.from_euler('xz', [ 90,  90], degrees=True).as_matrix(),
-            SciRot.from_euler('xz', [ 90, 270], degrees=True).as_matrix(),
-            SciRot.from_euler('xz', [270,  90], degrees=True).as_matrix(),
-            SciRot.from_euler('xz', [270, 270], degrees=True).as_matrix(),
-            SciRot.from_euler('xy', [ 90,  90], degrees=True).as_matrix(),
-            SciRot.from_euler('xy', [ 90, 270], degrees=True).as_matrix(),
-            SciRot.from_euler('xy', [270,  90], degrees=True).as_matrix(),
-            SciRot.from_euler('xy', [270, 270], degrees=True).as_matrix(),
-            SciRot.from_euler('xz', [180,  90], degrees=True).as_matrix(),
-            SciRot.from_euler('xz', [180, 270], degrees=True).as_matrix(),
-            SciRot.from_euler('yz', [180,  90], degrees=True).as_matrix(),
-            SciRot.from_euler('yz', [180, 270], degrees=True).as_matrix(),
-            SciRot.from_rotvec(
-                np.array([1, 1, 1], dtype=float) / np.sqrt(3) * np.radians(120)
-            ).as_matrix(),
-            SciRot.from_rotvec(
-                np.array([1, 1, 1], dtype=float) / np.sqrt(3) * np.radians(240)
-            ).as_matrix(),
-        ]
 
     @staticmethod
     def _fibonacci_rotations(n: int) -> list[np.ndarray]:
@@ -1262,24 +1149,8 @@ class FoundationPoseTrackerNode(Node):
         ) -> tuple:
             """
             Search rotation seeds around translation `t_base`, refine each by ICP,
-            score by Chamfer (lowest = best). Translation stays fixed at the
-            FP estimate throughout the seed search; ICP is free to translate.
-
-            Default seed set: 24 elements of the chiral octahedral group.
-            With --icp-grid-fibonacci, switches to N uniformly-sampled SO(3) seeds.
-            With --icp-grid-prescreen, skips ICP for seeds whose raw-Chamfer
-            already exceeds tau (typical seeds are far enough off that ICP
-            won't recover — checking the seed first saves the ICP cost).
-            With --icp-grid-second-pass, re-refines around the top-K winners
-            with smaller angular jitter.
-            With --icp-grid-cross-cam-chamfer, scores by mean Chamfer across
-            the per-camera clouds (more discriminative for symmetric objects
-            where one camera sees a featureless face).
-            With --icp-grid-tie-by-inliers, breaks Chamfer ties by ICP fitness.
-
-            Returns (best_T, best_chamfer).
+            score by Chamfer (lowest = best)
             """
-            use_fib = bool(getattr(self.args, "icp_grid_fibonacci", False))
             n_rot = int(getattr(self.args, "icp_grid_n_rot", 100))
             prescreen = bool(getattr(self.args, "icp_grid_prescreen", False))
             prescreen_tau = float(getattr(self.args, "icp_grid_prescreen_tau", 0.06))
@@ -1290,8 +1161,7 @@ class FoundationPoseTrackerNode(Node):
             tie_by_inliers = bool(getattr(self.args, "icp_grid_tie_by_inliers", False))
             tie_chamfer_eps = float(getattr(self.args, "icp_grid_tie_chamfer_eps_m", 0.0005))
 
-            CANDIDATES = (self._fibonacci_rotations(n_rot) if use_fib
-                          else self._octahedral_rotations())
+            CANDIDATES = self._fibonacci_rotations(n_rot)
 
             # Each entry: (chamfer, T_refined, fitness, R_seed)
             scored: list[tuple[float, np.ndarray, float, np.ndarray]] = []
@@ -1355,19 +1225,18 @@ class FoundationPoseTrackerNode(Node):
         self,
         stage: str,
         cam_id: str,
-        object_id: str,
-        idx: int,
+        instance_key: str,
         T_object_camera: np.ndarray,
         extra: str = "",
         ) -> None:
         pose_str = self._base_pose_string(cam_id, T_object_camera)
         suffix = f" | {extra}" if extra else ""
         self.get_logger().info(
-            f"[{cam_id}] {stage} [{idx}] {object_id} | {pose_str}{suffix}"
+            f"[{cam_id}] {stage} {instance_key} | {pose_str}{suffix}"
         )
-    
-    def _get_or_create_pose_base_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
+
+    def _get_or_create_pose_base_pub(self, cam_id: str, instance_key: str) -> Any:
+        key = f"{cam_id}/{instance_key}"
         if key not in self.pub_pose_base:
             self.pub_pose_base[key] = self.create_publisher(
                 PoseStamped, f"/perception/fp/pose_base/{key}", FAST_QOS
@@ -1394,8 +1263,8 @@ class FoundationPoseTrackerNode(Node):
             self._T_cam_base_cache[cam_id] = np.linalg.inv(T_bc).astype(np.float32)
         return self._T_cam_base_cache[cam_id]
 
-    def _get_or_create_pose_base_track_pub(self, cam_id: str, object_id: str, idx: int) -> Any:
-        key = f"{cam_id}/{object_id}_{idx}"
+    def _get_or_create_pose_base_track_pub(self, cam_id: str, instance_key: str) -> Any:
+        key = f"{cam_id}/{instance_key}"
         if key not in self.pub_pose_base_track:
             self.pub_pose_base_track[key] = self.create_publisher(
                 PoseStamped, f"/perception/fp/pose_base_track/{key}", FAST_QOS
@@ -1405,25 +1274,23 @@ class FoundationPoseTrackerNode(Node):
     def _publish_pose_base(
         self,
         cam_id: str,
-        object_id: str,
-        idx: int,
+        instance_key: str,
         T_object_camera: np.ndarray,
         stamp,
         ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
-        pub = self._get_or_create_pose_base_pub(cam_id, object_id, idx)
+        pub = self._get_or_create_pose_base_pub(cam_id, instance_key)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
     def _publish_pose_base_track(
         self,
         cam_id: str,
-        object_id: str,
-        idx: int,
+        instance_key: str,
         T_object_camera: np.ndarray,
         stamp,
         ) -> None:
         T_base_object = self._to_base_pose(cam_id, T_object_camera)
-        pub = self._get_or_create_pose_base_track_pub(cam_id, object_id, idx)
+        pub = self._get_or_create_pose_base_track_pub(cam_id, instance_key)
         pub.publish(T_to_pose_stamped(T_base_object, frame_id="base", stamp=stamp))
 
     def _make_mask_crop_msg(
@@ -1451,8 +1318,6 @@ class FoundationPoseTrackerNode(Node):
 
         msg.width = int(crop.shape[1])
         msg.height = int(crop.shape[0])
-        # array.array('B', bytes) is ~50x faster than tolist() for uint8[] fields
-        # because rclpy serializes the buffer directly without per-element Python ops.
         msg.data = array.array('B', np.ascontiguousarray(crop).tobytes())
         return True, msg
 
@@ -1476,17 +1341,8 @@ class FoundationPoseTrackerNode(Node):
         roi = self.cam_sam_params[cam_id].roi_polygon.reshape(-1)
         frame.roi_polygon_xy_flat = [int(v) for v in roi.tolist()]
 
-        roi = (
-            self._tiny_roi_for_cam(cam_id)
-            if self.args.tiny_objects_enabled else None
-        )
-        if roi is not None:
-            x0, y0, x1, y1 = roi
-            frame.has_tiny_roi = True
-            frame.tiny_roi_xyxy = [int(x0), int(y0), int(x1), int(y1)]
-        else:
-            frame.has_tiny_roi = False
-            frame.tiny_roi_xyxy = [0, 0, 0, 0]
+        frame.has_tiny_roi = False
+        frame.tiny_roi_xyxy = [0, 0, 0, 0]
 
         frame.update_sam = bool(update_sam)
         frame.update_dino = bool(update_dino)
@@ -1570,15 +1426,13 @@ class FoundationPoseTrackerNode(Node):
             msg.mode = str(s.mode)
             msg.score = float(s.dino_score)
 
-            # 1) Convert raw camera-frame CAD pose to base frame.
+            # Convert raw camera-frame CAD pose to base frame.
             T_base_dbg = self._safe_to_base_pose(cam_id, s.T_object_camera)
 
-            # 3) Store corrected base pose.
+            # Store corrected base pose.
             msg.pose_base = T_to_pose_msg(T_base_dbg)
 
-            # 4) IMPORTANT:
             # Recompute corrected camera-frame pose from corrected base pose.
-            # Do NOT use raw s.T_object_camera here.
             T_cam_base = self._resolve_T_cam_base(cam_id)
             T_cam_dbg = (T_cam_base @ T_base_dbg).astype(np.float32)
 
@@ -1634,21 +1488,82 @@ class FoundationPoseTrackerNode(Node):
         if cam_id not in self.T_base_cam_map:
             raise KeyError(f"No base extrinsic for cam_id={cam_id}")
         T_object_camera = np.asarray(T_object_camera, dtype=np.float32).reshape(4, 4)
-        # Hits the _T_base_cam_cache populated lazily on first use; avoids the
-        # as_matrix/asarray fallback chain on the per-state per-tick hot path.
         T_base_cam = self._resolve_T_base_cam(cam_id)
         return (T_base_cam @ T_object_camera.astype(np.float64)).astype(np.float32)
 
+    def _mask_base_centroid(
+        self,
+        cam_id: str,
+        depth: np.ndarray | None,
+        K: np.ndarray | None,
+        mask: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        if depth is None or K is None:
+            return None
+        try:
+            pcd = lift_masked_depth_to_base(
+                depth=np.asarray(depth),
+                mask=np.asarray(mask).astype(bool),
+                K=np.asarray(K, dtype=np.float32).reshape(3, 3),
+                T_base_cam=self._resolve_T_base_cam(cam_id),
+                z_min=float(getattr(self.args, "min_valid_z_m", 0.05)),
+                z_max=float(getattr(self.args, "max_valid_z_m", 3.0)),
+                voxel_size=0.004,
+            )
+            if pcd is None or len(pcd.points) < 10:
+                return None
+            pts = np.asarray(pcd.points, dtype=np.float64)
+            return pts.mean(axis=0).reshape(3)
+        except Exception as e:
+            if bool(getattr(self.args, "debug_verbose_logs", False)):
+                self.get_logger().info(
+                    f"identity centroid failed cam={cam_id}: {e}"
+                )
+            return None
+
+    def _track_matches_by_object(
+        self,
+        base_centroid: Optional[np.ndarray],
+        object_ids: Iterable[str],
+    ) -> tuple[dict[str, str], set[str], dict[str, float]]:
+        matched: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        nearest_dist: dict[str, float] = {}
+        if base_centroid is None:
+            return matched, ambiguous, nearest_dist
+
+        c = np.asarray(base_centroid, dtype=np.float64).reshape(3)
+        max_dist = float(getattr(self.args, "identity_shortcut_max_centroid_dist_m", 0.05))
+        ambiguity_radius = float(getattr(self.args, "identity_shortcut_ambiguity_radius_m", 0.05))
+
+        for obj_id in {str(o) for o in object_ids if str(o)}:
+            candidates: list[tuple[float, str]] = []
+            for tid, last_c in self._last_known_track_centroids.items():
+                if self._track_id_to_object_id.get(tid) != obj_id:
+                    continue
+                d = float(np.linalg.norm(np.asarray(last_c, dtype=np.float64).reshape(3) - c))
+                candidates.append((d, tid))
+            if not candidates:
+                continue
+            candidates.sort(key=lambda x: x[0])
+            nearest_dist[obj_id] = candidates[0][0]
+            if len(candidates) >= 2 and candidates[1][0] <= ambiguity_radius:
+                ambiguous.add(obj_id)
+                continue
+            if candidates[0][0] <= max_dist:
+                matched[obj_id] = candidates[0][1]
+        return matched, ambiguous, nearest_dist
+
 
     def _inherit_from_tracker_health(
-        self, cam_id: str, masks: list[SAMMaskCandidate],
+        self,
+        cam_id: str,
+        masks: list[SAMMaskCandidate],
+        depth: np.ndarray | None = None,
+        K: np.ndarray | None = None,
         ) -> tuple[list[CandidateSelection], list[SAMMaskCandidate]]:
-        """Bundle 11: assign masks to objects whose tracker was healthy on a
-        recent frame, by IoU with the tracker's last good mask. Returns
-        (inherited_selections, remaining_masks_for_dino).
-
-        Skipped masks bypass DINO classification entirely — saving DINO
-        compute proportional to the number of healthy tracker objects.
+        """assign masks to objects whose tracker was healthy on a
+        recent frame, by IoU with the tracker's last good mask. R
         """
         if not masks:
             return [], masks
@@ -1656,9 +1571,12 @@ class FoundationPoseTrackerNode(Node):
         iou_thr = float(getattr(self.args, "tracker_health_iou_threshold", 0.5))
         max_occ = float(getattr(self.args, "tracker_health_max_occlusion", 0.4))
 
-        # Collect healthy entries for this cam.
-        healthy: list[tuple[str, np.ndarray]] = []  # (object_id, mask)
-        for (cid, obj_id), info in self._recent_tracker_health.items():
+        max_centroid_dist = float(getattr(self.args, "identity_shortcut_max_centroid_dist_m", 0.05))
+        ambiguity_radius = float(getattr(self.args, "identity_shortcut_ambiguity_radius_m", 0.05))
+
+        # Collect healthy entries for this cam, per-instance (track_id-keyed).
+        healthy: list[tuple[str, str, np.ndarray, Optional[np.ndarray]]] = []
+        for (cid, track_id), info in self._recent_tracker_health.items():
             if cid != cam_id:
                 continue
             if (self.frame_counter - int(info.get("frame_idx", 0))) > stale_frames:
@@ -1668,14 +1586,29 @@ class FoundationPoseTrackerNode(Node):
             mask = info.get("mask")
             if mask is None or int(np.asarray(mask).sum()) <= 0:
                 continue
-            healthy.append((obj_id, np.asarray(mask, dtype=bool)))
+            obj_id = str(info.get("object_id", ""))
+            if not obj_id or not track_id:
+                continue
+            centroid = info.get("centroid_base")
+            if centroid is None and info.get("T_object_camera") is not None:
+                try:
+                    centroid = self._safe_to_base_pose(
+                        cam_id, info["T_object_camera"]
+                    )[:3, 3]
+                except Exception:
+                    centroid = None
+            centroid_arr = (
+                np.asarray(centroid, dtype=np.float64).reshape(3)
+                if centroid is not None else None
+            )
+            healthy.append((track_id, obj_id, np.asarray(mask, dtype=bool), centroid_arr))
 
         if not healthy:
             return [], masks
 
         inherited: list[CandidateSelection] = []
         remaining: list[SAMMaskCandidate] = []
-        used_obj_ids: set[str] = set()
+        used_track_ids: set[str] = set()
         for cand in masks:
             cm = np.asarray(cand.mask, dtype=bool)
             cm_sum = int(cm.sum())
@@ -1684,10 +1617,18 @@ class FoundationPoseTrackerNode(Node):
                 continue
             best_iou = 0.0
             best_obj: Optional[str] = None
-            for obj_id, hmask in healthy:
-                if obj_id in used_obj_ids:
+            best_tid: Optional[str] = None
+            best_centroid_dist: Optional[float] = None
+            cand_centroid = self._mask_base_centroid(cam_id, depth, K, cm)
+            for tid, obj_id, hmask, hcentroid in healthy:
+                if tid in used_track_ids:
                     continue
                 if hmask.shape != cm.shape:
+                    continue
+                if cand_centroid is None or hcentroid is None:
+                    continue
+                centroid_dist = float(np.linalg.norm(cand_centroid - hcentroid))
+                if centroid_dist > max_centroid_dist:
                     continue
                 inter = int(np.logical_and(cm, hmask).sum())
                 if inter == 0:
@@ -1699,76 +1640,48 @@ class FoundationPoseTrackerNode(Node):
                 if iou > best_iou:
                     best_iou = iou
                     best_obj = obj_id
-            if best_obj is not None and best_iou >= iou_thr:
+                    best_tid = tid
+                    best_centroid_dist = centroid_dist
+            if best_obj is not None and best_tid is not None and best_iou >= iou_thr:
+                ambiguous = False
+                if cand_centroid is not None:
+                    for tid, obj_id, _hmask, hcentroid in healthy:
+                        if tid == best_tid or obj_id != best_obj or hcentroid is None:
+                            continue
+                        if float(np.linalg.norm(cand_centroid - hcentroid)) <= ambiguity_radius:
+                            ambiguous = True
+                            break
+                if ambiguous:
+                    remaining.append(cand)
+                    self.get_logger().info(
+                        f"[identity] DINO-skip blocked cam={cam_id} track={best_tid} "
+                        f"obj={best_obj}: nearby same-class track"
+                    )
+                    continue
                 inherited.append(CandidateSelection(
                     object_id=best_obj,
                     score=1.0,
                     scores_by_object={best_obj: 1.0},
                     candidate=cand,
+                    base_scores_by_object={best_obj: 1.0},
+                    score_source="tracker_health",
+                    track_id_hint=best_tid,
+                    dino_class_score=1.0,
+                    dino_margin=1.0,
                 ))
-                used_obj_ids.add(best_obj)
+                used_track_ids.add(best_tid)
+                dist_txt = (
+                    f"{best_centroid_dist:.3f}m"
+                    if best_centroid_dist is not None else "unknown"
+                )
+                self.get_logger().info(
+                    f"[identity] inherited cam={cam_id} track={best_tid} obj={best_obj} "
+                    f"iou={best_iou:.3f} centroid_dist={dist_txt}"
+                )
             else:
                 remaining.append(cand)
         return inherited, remaining
 
-    def _tiny_roi_for_cam(self, cam_id: str) -> Optional[tuple[int, int, int, int]]:
-        """Look up the tiny-object ROI for a camera. Returns None if no ROI
-        is configured (which means: skip the tiny pass on this cam)."""
-        roi_str = None
-        if cam_id == "zed2i_1":
-            roi_str = getattr(self.args, "cam1_tiny_roi", "") or ""
-        elif cam_id == "zed2i_2":
-            roi_str = getattr(self.args, "cam2_tiny_roi", "") or ""
-        if not roi_str.strip():
-            return None
-        return parse_xyxy_string(roi_str)
-
-    def _generate_tiny_object_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
-        if cam_id not in self.sam_tiny_by_cam:
-            return []
-
-        roi = self._tiny_roi_for_cam(cam_id)
-        if roi is None:
-            return []
-        x0, y0, x1, y1 = roi
-        h, w = rgb.shape[:2]
-        x0 = max(0, min(x0, w - 1))
-        x1 = max(x0 + 1, min(x1, w))
-        y0 = max(0, min(y0, h - 1))
-        y1 = max(y0 + 1, min(y1, h))
-
-        crop = rgb[y0:y1, x0:x1].copy()
-        if crop.size == 0:
-            return []
-
-        sam = self.sam_tiny_by_cam[cam_id]
-        masks = sam.generate_auto(crop)
-        self.get_logger().info(f"[{cam_id}] Tiny-object SAM raw masks: {len(masks)}")
-
-        if not masks:
-            return []
-
-        ch, cw = crop.shape[:2]
-        masks = reject_large_masks(
-            masks,
-            ch,
-            cw,
-            max_mask_area_ratio=self.args.tiny_max_mask_area_ratio,
-            max_bbox_area_ratio=self.args.tiny_max_bbox_area_ratio,
-        )
-
-        masks = [
-            m for m in masks
-            if m.area >= self.args.tiny_sam_min_mask_area
-            and (m.bbox_xyxy[2] - m.bbox_xyxy[0]) >= self.args.tiny_sam_min_bbox_side_px
-            and (m.bbox_xyxy[3] - m.bbox_xyxy[1]) >= self.args.tiny_sam_min_bbox_side_px
-        ]
-
-        lifted = lift_crop_masks_to_full_image(masks, h, w, x0, y0)
-        self.get_logger().info(f"[{cam_id}] Tiny-object SAM kept masks: {len(lifted)}")
-        return lifted
-
-   
     def _generate_and_filter_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
         if cam_id not in self.sam_by_cam:
             return []
@@ -1788,7 +1701,7 @@ class FoundationPoseTrackerNode(Node):
         rgb_crop_masked = rgb_crop.copy()
         rgb_crop_masked[roi_mask_crop == 0] = 0
 
-        # D1: CLAHE on the ROI before SAM. Off by default.
+        # CLAHE
         if bool(getattr(self.args, "clahe_enabled", False)):
             rgb_crop_masked = apply_clahe_rgb(
                 rgb_crop_masked,
@@ -1799,9 +1712,6 @@ class FoundationPoseTrackerNode(Node):
         print(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
 
         # --- Main proposal stage ---
-        # Default: SAM automatic mask generator. With --mask-source gdino_sam,
-        # boxes come from Grounding DINO; with --mask-source yolo_sam, boxes
-        # come from a class-agnostic YOLO. Both feed SAM as box prompts.
         t1 = time.time()
         if (self.args.mask_source == "gdino_sam"
                 and self.gdino_proposer is not None):
@@ -1816,21 +1726,6 @@ class FoundationPoseTrackerNode(Node):
                 masks_crop = []
             print(
                 f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
-                f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
-            )
-        elif (self.args.mask_source == "yolo_sam"
-                and self.yolo_proposer is not None):
-            proposals = self.yolo_proposer.propose(rgb_crop_masked)
-            if proposals:
-                boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
-                box_scores = np.array([p.score for p in proposals], dtype=np.float32)
-                masks_crop = sam.generate_from_boxes(
-                    rgb_crop_masked, boxes, box_scores=box_scores,
-                )
-            else:
-                masks_crop = []
-            print(
-                f"[TIMING]   YOLO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
                 f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
             )
         else:
@@ -1860,27 +1755,6 @@ class FoundationPoseTrackerNode(Node):
 
         masks = sorted(masks, key=lambda m: m.area)
 
-        # --- Tiny objects SAM (if enabled) ---
-        # Bundle 11: tiny-pass now runs on every cam that has a configured
-        # tiny ROI, not just zed2i_2.
-        if self.args.tiny_objects_enabled and cam_id in self.sam_tiny_by_cam:
-            t3 = time.time()
-            tiny_masks = self._generate_tiny_object_masks(rgb, cam_id)
-            print(f"[TIMING]   SAM tiny objects [{cam_id}]: {(time.time() - t3)*1000:.0f}ms -> {len(tiny_masks)} masks")
-            masks.extend(tiny_masks)
-
-        # --- Blue blob proposals (if enabled) ---
-        if cam_id == "zed2i_2" and self.args.blue_blob_proposals_enabled:
-            t4 = time.time()
-            blue_blobs = find_blue_blob_masks(
-                rgb,
-                min_area=self.args.blue_blob_min_area,
-                max_area=self.args.blue_blob_max_area,
-            )
-            blue_candidates = blob_masks_to_candidates(blue_blobs)
-            print(f"[TIMING]   Blue blob detection: {(time.time() - t4)*1000:.0f}ms -> {len(blue_candidates)} blobs")
-            masks.extend(blue_candidates)
-
         # --- Final filtering ---
         t5 = time.time()
         masks = reject_outside_roi_polygon(masks, cam_params.roi_polygon)
@@ -1893,6 +1767,7 @@ class FoundationPoseTrackerNode(Node):
     def _maybe_save_memory_crop(
         self,
         object_id: str,
+        track_id: str,
         cam_id: str,
         rgb_full: np.ndarray,
         mask_full: np.ndarray,
@@ -1910,10 +1785,11 @@ class FoundationPoseTrackerNode(Node):
             return False
 
         bank = self._memory_crops_by_object[object_id]
+        track_bank = self._memory_crops_by_track_id[track_id] if track_id else None
         gap = int(self.args.memory_crop_min_frame_gap)
         if gap > 0 and bank:
             for entry in reversed(bank):
-                if entry.cam_id == cam_id:
+                if entry.cam_id == cam_id and (not track_id or entry.track_id == track_id):
                     if self.frame_counter - entry.frame_idx < gap:
                         return False
                     break
@@ -1948,10 +1824,13 @@ class FoundationPoseTrackerNode(Node):
             frame_idx=self.frame_counter,
             fitness=float(fitness),
             embedding=np.asarray(embedding, dtype=np.float32),
+            track_id=str(track_id or ""),
             rgb_crop=crop_rgb if keep_rgb else None,
             mask_crop=crop_mask if keep_rgb else None,
         )
         bank.append(entry)
+        if track_bank is not None:
+            track_bank.append(entry)
 
         save_dir = str(self.args.memory_crop_save_dir or "").strip()
         if save_dir:
@@ -1965,7 +1844,7 @@ class FoundationPoseTrackerNode(Node):
                 self.get_logger().warn(f"memory-crop save_dir write failed: {e}")
 
         self.get_logger().info(
-            f"[memcrop] saved {object_id} from {cam_id} fit={fitness:.3f} "
+            f"[memcrop] saved {object_id}[{track_id}] from {cam_id} fit={fitness:.3f} "
             f"bank={len(bank)}/{bank.maxlen}"
         )
         return True
@@ -1973,6 +1852,8 @@ class FoundationPoseTrackerNode(Node):
     def _memory_similarity_by_object(
         self,
         query_embedding: np.ndarray,
+        matched_track_ids_by_object: Optional[dict[str, str]] = None,
+        ambiguous_objects: Optional[set[str]] = None,
         ) -> dict[str, float]:
         """Return max cosine similarity between the query embedding and each
         object's memory bank. Objects with empty banks are omitted. Assumes
@@ -1983,12 +1864,25 @@ class FoundationPoseTrackerNode(Node):
         q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
         if q.size == 0:
             return out
+        matched_track_ids_by_object = matched_track_ids_by_object or {}
+        ambiguous_objects = ambiguous_objects or set()
+        require_consistency = bool(
+            getattr(self.args, "memory_rerank_require_track_consistency", True)
+        )
         for obj_id, bank in self._memory_crops_by_object.items():
-            if not bank:
+            if obj_id in ambiguous_objects:
                 continue
-            mat = np.stack([e.embedding.reshape(-1) for e in bank], axis=0)
+            track_id = matched_track_ids_by_object.get(obj_id, "")
+            track_bank = self._memory_crops_by_track_id.get(track_id) if track_id else None
+            selected_bank = track_bank if track_bank else None
+            if selected_bank is None:
+                if require_consistency and not track_id:
+                    continue
+                selected_bank = bank
+            if not selected_bank:
+                continue
+            mat = np.stack([e.embedding.reshape(-1) for e in selected_bank], axis=0)
             if mat.shape[1] != q.shape[0]:
-                # Embedding dim mismatch (e.g., bank built with different mode)
                 continue
             sims = mat @ q
             out[obj_id] = float(np.max(sims))
@@ -1998,6 +1892,9 @@ class FoundationPoseTrackerNode(Node):
         self,
         rgb: np.ndarray,
         masks: list[SAMMaskCandidate],
+        cam_id: str = "",
+        depth: np.ndarray | None = None,
+        K: np.ndarray | None = None,
         ) -> list[CandidateSelection]:
         if not masks:
             return []
@@ -2012,8 +1909,7 @@ class FoundationPoseTrackerNode(Node):
             crop_rgb, crop_mask = bbox_crop_with_local_mask(rgb, cand.mask, cand.bbox_xyxy)
             if crop_rgb.size == 0 or int(crop_mask.sum()) == 0:
                 continue
-            # A8: upscale tiny crops so DINOv2's resize-to-input_size doesn't
-            # throw away detail on small objects (cooling_screw, cooling_f).
+            # upscale tiny crops so DINOv2's resize-to-input_size 
             crop_rgb, crop_mask = upscale_crop_if_small(crop_rgb, crop_mask, dino_min_crop)
             crops_rgb.append(crop_rgb)
             crops_mask.append(crop_mask)
@@ -2039,77 +1935,80 @@ class FoundationPoseTrackerNode(Node):
         mem_enabled = (
             bool(getattr(self.args, "memory_crop_enable", False))
             and mem_weight > 0.0
-            and any(len(b) > 0 for b in self._memory_crops_by_object.values())
+            and (
+                any(len(b) > 0 for b in self._memory_crops_by_object.values())
+                or any(len(b) > 0 for b in self._memory_crops_by_track_id.values())
+            )
         )
 
         for j, res in enumerate(dino_results):
             mask_idx = valid_indices[j]
             cand = masks[mask_idx]
 
-            raw_scores = {k: float(v) for k, v in res.scores_by_object.items()}
+            base_scores = {k: float(v) for k, v in res.scores_by_object.items()}
+            decision_scores = dict(base_scores)
+            score_source = "dino_base"
 
-            # Memory-crop re-ranking: blend raw cosine score against the max
-            # cosine similarity to past clean snapshots of each object class.
-            # Only kicks in once the bank has entries and weight > 0.
             mem_sims: dict[str, float] = {}
-            if mem_enabled and raw_scores:
-                raw_top = max(raw_scores.values())
-                if raw_top >= mem_floor:
-                    mem_sims = self._memory_similarity_by_object(res.embedding)
+            matched_tracks: dict[str, str] = {}
+            ambiguous_objects: set[str] = set()
+            nearest_dists: dict[str, float] = {}
+            if mem_enabled and base_scores:
+                base_top = max(base_scores.values())
+                if base_top >= mem_floor:
+                    cand_centroid = self._mask_base_centroid(cam_id, depth, K, cand.mask)
+                    matched_tracks, ambiguous_objects, nearest_dists = (
+                        self._track_matches_by_object(cand_centroid, base_scores.keys())
+                    )
+                    mem_sims = self._memory_similarity_by_object(
+                        res.embedding,
+                        matched_track_ids_by_object=matched_tracks,
+                        ambiguous_objects=ambiguous_objects,
+                    )
                     if mem_sims:
                         blended: dict[str, float] = {}
-                        for k, v in raw_scores.items():
+                        for k, v in base_scores.items():
                             if k in mem_sims:
                                 blended[k] = (1.0 - mem_weight) * v + mem_weight * mem_sims[k]
                             else:
                                 blended[k] = v
-                        # Log if the memory bank flips the top-1 pick.
-                        raw_top1 = max(raw_scores, key=raw_scores.get)
+                        base_top1 = max(base_scores, key=base_scores.get)
                         new_top1 = max(blended, key=blended.get)
-                        if new_top1 != raw_top1:
+                        if new_top1 != base_top1:
+                            tid = matched_tracks.get(new_top1, "")
+                            dist = nearest_dists.get(new_top1)
+                            dist_txt = f"{dist:.3f}m" if dist is not None else "unknown"
                             self.get_logger().info(
-                                f"[memcrop] cand {j} flipped top1 {raw_top1}->{new_top1} "
-                                f"(raw={raw_scores[raw_top1]:.3f}->{raw_scores.get(new_top1, 0.0):.3f}, "
-                                f"mem={mem_sims.get(raw_top1, 0.0):.3f}->{mem_sims.get(new_top1, 0.0):.3f})"
+                                f"[memcrop] cand {j} flipped top1 {base_top1}->{new_top1} "
+                                f"track={tid or 'none'} dist={dist_txt} "
+                                f"(base={base_scores[base_top1]:.3f}->{base_scores.get(new_top1, 0.0):.3f}, "
+                                f"mem={mem_sims.get(base_top1, 0.0):.3f}->{mem_sims.get(new_top1, 0.0):.3f})"
                             )
-                        raw_scores = blended
+                        decision_scores = blended
+                        score_source = "memory_blended"
+                    elif ambiguous_objects and bool(getattr(self.args, "debug_verbose_logs", False)):
+                        self.get_logger().info(
+                            f"[memcrop] cand {j} skipped: ambiguous nearby tracks "
+                            f"{sorted(ambiguous_objects)}"
+                        )
 
             sorted_scores = sorted(
-                raw_scores.items(), key=lambda kv: kv[1], reverse=True
+                decision_scores.items(), key=lambda kv: kv[1], reverse=True
             )
+            if not sorted_scores:
+                continue
 
             top1_name, top1_score = sorted_scores[0]
             top2_name, top2_score = sorted_scores[1] if len(sorted_scores) > 1 else ("", -1.0)
 
-            raw_best_score = float(top1_score)
+            decision_best_score = float(top1_score)
             object_id = top1_name
 
             top_dbg = ", ".join([f"{k}:{v:.3f}" for k, v in sorted_scores[:4]])
-            if object_id in {"cooling_f", "cooling_screw"} or raw_best_score < 0.80:
-                self.get_logger().info(f"DINO cand {j} | top scores: {top_dbg}")
-
-            pair_is_cf_cs = {top1_name, top2_name} == {"cooling_f", "cooling_screw"}
-            pair_gap = float(top1_score - top2_score)
-            geometric_resolved = False
-
-            # B2: hardcoded cooling_f vs cooling_screw aspect rule. Disable
-            # this when MUSE-style features are good enough to discriminate
-            # on their own (--dino-embedding-mode concat is the typical case
-            # where this rule becomes redundant or actively wrong on
-            # generalised objects).
-            if (
-                self.args.use_aspect_cf_cs_rule
-                and pair_is_cf_cs and pair_gap < 0.15
-            ):
-                bw_tmp, bh_tmp = bbox_size_xyxy(cand.bbox_xyxy)
-                aspect = max(bw_tmp, bh_tmp) / (min(bw_tmp, bh_tmp) + 1e-6)
-                if aspect > 2.2:
-                    object_id = "cooling_f"
-                    raw_best_score = float(res.scores_by_object["cooling_f"])
-                else:
-                    object_id = "cooling_screw"
-                    raw_best_score = float(res.scores_by_object["cooling_screw"])
-                geometric_resolved = True
+            if decision_best_score < 0.80:
+                self.get_logger().info(
+                    f"DINO cand {j} | source={score_source} top scores: {top_dbg}"
+                )
 
             second_score = float(top2_score)
             margin = float(top1_score - second_score)
@@ -2121,32 +2020,29 @@ class FoundationPoseTrackerNode(Node):
             if is_small_object:
                 min_score_for_small = 0.20
                 min_margin_for_small = 0.0
-                if raw_best_score < min_score_for_small:
+                if decision_best_score < min_score_for_small:
                     object_id = "unknown"
-                elif margin < min_margin_for_small and not geometric_resolved:
+                elif margin < min_margin_for_small:
                     object_id = "unknown"
 
                 if object_id != "unknown":
                     self.get_logger().info(
-                        f"DINO small obj ACCEPT: {object_id} score={raw_best_score:.3f} margin={margin:.3f} bbox={bw}x{bh}"
+                        f"DINO small obj ACCEPT: {object_id} score={decision_best_score:.3f} margin={margin:.3f} bbox={bw}x{bh}"
                     )
             else:
-                if raw_best_score < self.args.dino_min_score:
+                if decision_best_score < self.args.dino_min_score:
                     object_id = "unknown"
                 if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
                     object_id = "unknown"
 
-            # B4: softmax-entropy gate. Independent of raw cosine scale — flags
-            # cases where multiple classes look near-equally similar even if the
-            # raw score is high.
+            # softmax-entropy gate
             if (
                 self.args.dino_entropy_threshold > 0.0
                 and object_id != "unknown"
-                and not geometric_resolved
-                and len(res.scores_by_object) >= 2
+                and len(decision_scores) >= 2
             ):
                 tau = max(1e-3, float(self.args.dino_entropy_tau))
-                logits = np.array(list(res.scores_by_object.values()), dtype=np.float64) / tau
+                logits = np.array(list(decision_scores.values()), dtype=np.float64) / tau
                 logits -= logits.max()
                 probs = np.exp(logits)
                 probs /= probs.sum() + 1e-12
@@ -2158,10 +2054,6 @@ class FoundationPoseTrackerNode(Node):
                     )
                     object_id = "unknown"
 
-            bbox_max_side = max(bw, bh)
-            if object_id == "cooling_base" and bbox_max_side < self.args.cooling_base_min_bbox_side_px:
-                object_id = "unknown"
-
             area_ratio = float(cand.area) / img_area
             x0, y0, x1, y1 = cand.bbox_xyxy
             bbox_area = max(1, (x1 - x0) * (y1 - y0))
@@ -2169,11 +2061,11 @@ class FoundationPoseTrackerNode(Node):
 
             if object_id == "unknown":
                 self.get_logger().info(
-                    f"UNKNOWN: score={raw_best_score:.3f}, margin={margin:.3f}, bbox={bw}x{bh}"
+                    f"UNKNOWN: score={decision_best_score:.3f}, margin={margin:.3f}, bbox={bw}x{bh}"
                 )
 
             final_score = (
-                raw_best_score
+                decision_best_score
                 - self.args.area_penalty_weight * area_ratio
                 + self.args.fill_ratio_weight * fill_ratio
             )
@@ -2182,8 +2074,13 @@ class FoundationPoseTrackerNode(Node):
                 CandidateSelection(
                     object_id=object_id,
                     score=final_score,
-                    scores_by_object={k: float(v) for k, v in raw_scores.items()},
+                    scores_by_object={k: float(v) for k, v in decision_scores.items()},
                     candidate=cand,
+                    base_scores_by_object={k: float(v) for k, v in base_scores.items()},
+                    score_source=score_source,
+                    track_id_hint=matched_tracks.get(top1_name, ""),
+                    dino_class_score=decision_best_score,
+                    dino_margin=margin,
                 )
             )
 
@@ -2235,14 +2132,11 @@ class FoundationPoseTrackerNode(Node):
         if t_mag < 0.4 or t_mag > 1.5:
             return False, f"bad_distance mag={t_mag:.3f}"
 
-        # D2: table-plane physical check. Objects sit on a flat table near
-        # z_base ~= table_z. Reject anything outside [z_min, z_max]; defaults
-        # match the historical [0.0, 0.5] m gate but are now configurable.
         try:
             T_base = self._to_base_pose(cam_id, T_camera)
             z_base = float(T_base[2, 3])
             z_lo = float(getattr(self.args, "table_plane_z_min", 0.0))
-            z_hi = float(getattr(self.args, "table_plane_z_max", 0.5))
+            z_hi = float(getattr(self.args, "table_plane_z_max", 0.9))
             if z_base < z_lo or z_base > z_hi:
                 return False, f"bad_z_base z={z_base:.3f} (table window [{z_lo:.3f}, {z_hi:.3f}])"
         except Exception:
@@ -2252,10 +2146,10 @@ class FoundationPoseTrackerNode(Node):
     
     def _get_previous_object_base_pose(
         self,
-        obj_id: str,
+        track_id: str,
         per_object_entries: list[dict],
      ) -> Optional[np.ndarray]:
-        mem = self._fused_track_memory.get(obj_id, {})
+        mem = self._fused_track_memory.get(track_id, {})
         T_mem = mem.get("T_base")
         if T_mem is not None:
             return np.asarray(T_mem, dtype=np.float32).reshape(4, 4).copy()
@@ -2292,12 +2186,12 @@ class FoundationPoseTrackerNode(Node):
         except Exception:
             return None
 
-    def _compute_fused_motion_dt(self, obj_id: str, stamp) -> tuple[float, Optional[float]]:
+    def _compute_fused_motion_dt(self, track_id: str, stamp) -> tuple[float, Optional[float]]:
         nominal_dt = float(getattr(self.args, 'fused_track_nominal_dt_s', 0.15))
         dt_min = float(getattr(self.args, 'fused_track_min_dt_s', 0.10))
         dt_max = float(getattr(self.args, 'fused_track_max_dt_s', 0.30))
         t_now = self._stamp_to_seconds(stamp)
-        t_prev = self._fused_track_memory.get(obj_id, {}).get('stamp_s')
+        t_prev = self._fused_track_memory.get(track_id, {}).get('stamp_s')
         dt_raw: Optional[float] = None
         if t_now is not None and t_prev is not None:
             dt_raw = max(0.0, float(t_now) - float(t_prev))
@@ -2312,18 +2206,18 @@ class FoundationPoseTrackerNode(Node):
         min_rot = float(getattr(self.args, 'fused_track_min_rotation_jump_deg', 4.0))
         return max(min_trans, v_max * float(dt_eff)), max(min_rot, w_max * float(dt_eff))
 
-    def _get_or_create_fused_translation_kalman(self, obj_id: str) -> PoseKalmanFilter:
-        kf = self._fused_translation_kalman.get(obj_id)
+    def _get_or_create_fused_translation_kalman(self, track_id: str) -> PoseKalmanFilter:
+        kf = self._fused_translation_kalman.get(track_id)
         if kf is None:
             kf = PoseKalmanFilter()
-            self._fused_translation_kalman[obj_id] = kf
+            self._fused_translation_kalman[track_id] = kf
         return kf
 
-    def _get_fused_kalman_predicted_position(self, obj_id: str) -> Optional[np.ndarray]:
-        kf = self._fused_translation_kalman.get(obj_id)
+    def _get_fused_kalman_predicted_position(self, track_id: str) -> Optional[np.ndarray]:
+        kf = self._fused_translation_kalman.get(track_id)
         if kf is None or not kf.is_initialized:
             return None
-        return kf.get_predicted_position(1).astype(np.float32)
+        return kf.state[:3].astype(np.float32).copy()
 
 
     def _evaluate_fused_camera_candidate(
@@ -2333,7 +2227,7 @@ class FoundationPoseTrackerNode(Node):
         is_warmup: bool = False,
         ) -> dict:
         """
-        FIXED: During warmup (first N frames after init), override rt_invalid
+        During warmup (first N frames after init), override rt_invalid
         rejection and use relaxed gating thresholds. This lets the tracker
         stabilize after init without dropping into hold_previous immediately.
         """
@@ -2443,11 +2337,7 @@ class FoundationPoseTrackerNode(Node):
                     metrics["reason"] = f"centroid_far({centroid_dist:.3f}m)"
                     return metrics
     
-        # ── Per-cam ICP gates (skipped when per-cam ICP is disabled, or
-        # during warmup). With skip_per_cam_icp_tracking=True the per-cam
-        # fitness/rmse fields are zero by construction, so these gates would
-        # always reject; the fused-cloud ICP downstream is what gates pose
-        # quality instead.
+        # ── Per-cam ICP gates 
         per_cam_icp_disabled = bool(getattr(self.args, "skip_per_cam_icp_tracking", True))
         if not is_warmup and not per_cam_icp_disabled:
             if metrics["per_cam_icp_fitness"] < float(self.args.fused_gate_min_per_cam_icp_fitness):
@@ -2464,10 +2354,7 @@ class FoundationPoseTrackerNode(Node):
 
 
     def _track_multicam_fused(self, views: list, stamp) -> None:
-        """
-        Fused multi-camera tracking — FIXED version.
-        See docstring header for change list.
-        """
+        """Fused multi-camera tracking"""
         t_start = time.time()
     
         per_cam_results = {}
@@ -2491,13 +2378,12 @@ class FoundationPoseTrackerNode(Node):
             results = {}
     
             for idx, state in enumerate(states):
-                tracker_key = f"{cam_id}_{state.object_id}_{idx}"
+                # Tracker key is per-instance (track_id) so multi-instance
+                # same-class scenes get a distinct Cutie/SAM2 session each.
+                tracker_key = f"{cam_id}_{state.track_id}"
     
                 if tracker_key not in self.realtime_trackers:
                     try:
-                        from src.perception.tracking.realtime_tracker import RealtimeTracker, RealtimeTrackerConfig
-                        from src.perception.tracking.cutie_tracker import CutieConfig
-                        from src.perception.tracking.icp_refiner import ICPConfig, ICPVariant
                         from src.perception.tracking.sam2_video_tracker import SAM2VideoConfig
                         from src.perception.tracking.sam2_streaming_tracker import SAM2StreamingConfig
 
@@ -2585,48 +2471,67 @@ class FoundationPoseTrackerNode(Node):
             for view, states in camera_work:
                 per_cam_results.update(_run_one_camera(view, states))
     
+        # All currently-tracked track_ids across every cam. We process them
+        # via the pose_status state machine even if no camera produced a
+        # usable mask this tick
+        all_tracked_track_ids: set[str] = set()
+        track_id_to_object_id_local: dict[str, str] = {}
+        for states in self.track_states.values():
+            for s in states:
+                all_tracked_track_ids.add(s.track_id)
+                track_id_to_object_id_local[s.track_id] = s.object_id
+
         if not per_cam_results:
             self.get_logger().warn("Fused tracking: no camera produced a usable mask")
-            return
-    
-        # Group by object
-        by_object = {}
+
+        # Group by track_id (per-instance), not object_id (class). Without
+        # this, N same-class instances collapse into one fused decision.
+        by_track: dict[str, list[dict]] = {}
         for cr in per_cam_results.values():
-            obj_id = cr["state"].object_id
-            by_object.setdefault(obj_id, []).append(cr)
-    
-        object_decisions = {}
+            tid = cr["state"].track_id
+            by_track.setdefault(tid, []).append(cr)
+
+        object_decisions: dict[str, dict] = {}
         t_fuse = time.time()
-    
-        for obj_id, entries in by_object.items():
-            prev_base_pose = self._get_previous_object_base_pose(obj_id, entries)
-    
-            # ── FIX B: Warmup detection ──
-            warmup_count = self._fused_warmup_count.get(obj_id, 0)
+
+        for track_id, entries in by_track.items():
+            obj_id = entries[0]["state"].object_id
+            prev_base_pose = self._get_previous_object_base_pose(track_id, entries)
+            kf_obj = self._get_or_create_fused_translation_kalman(track_id)
+            if kf_obj.is_initialized:
+                kf_obj.predict()
+
+            # ── Warmup detection ──
+            warmup_count = self._fused_warmup_count.get(track_id, 0)
             warmup_frames = int(getattr(self.args, 'fused_track_warmup_frames', 5))
             is_warmup = warmup_count < warmup_frames
-    
+
             gate_metrics = [
                 self._evaluate_fused_camera_candidate(cr, prev_base_pose, is_warmup=is_warmup)
                 for cr in entries
             ]
             survivors = [m for m in gate_metrics if m["accepted"]]
             survived_cam_ids = [m["cam_id"] for m in survivors]
-    
+            survived_keys = [(m["cam_id"], m["state_idx"]) for m in survivors]
+
             decision = {
                 "object_id": obj_id,
+                "track_id": track_id,
                 "mode": "hold_previous",
+                "pose_mode": "hold_previous",
                 "accepted": False,
                 "reason": "no_survivors",
                 "T_base": None,
-                "fitness": 0.0,
-                "rmse_m": float("inf"),
+                "fitness": float("nan"),
+                "rmse_m": float("nan"),
                 "trans_jump_m": 0.0,
                 "rot_jump_deg": 0.0,
                 "survived_cam_ids": survived_cam_ids,
+                "survived_keys": survived_keys,
                 "gate_metrics": gate_metrics,
                 "used_tracker_key": None,
                 "used_bbox_xyxy": None,
+                "is_warmup": is_warmup,
             }
     
             warmup_tag = f" [WARMUP {warmup_count}/{warmup_frames}]" if is_warmup else ""
@@ -2642,42 +2547,105 @@ class FoundationPoseTrackerNode(Node):
                     for m in gate_metrics
                 )
                 self.get_logger().info(
-                    f"FUSED GATE {obj_id}{warmup_tag}: survivors={survived_cam_ids or 'none'} | {gate_log}"
+                    f"FUSED GATE {obj_id}[{track_id}]{warmup_tag}: survivors={survived_cam_ids or 'none'} | {gate_log}"
                 )
-    
+
             if not survivors:
-                object_decisions[obj_id] = decision
-                self._fused_icp_metrics[obj_id] = {
-                    "fitness": 0.0, "rmse_mm": 0.0,
-                    "mode": "hold_previous", "accepted": False,
+                object_decisions[track_id] = decision
+                self._fused_icp_metrics[track_id] = {
+                    "fitness": float("nan"), "rmse_mm": float("nan"),
+                    "mode": "hold_previous", "pose_mode": "hold_previous",
+                    "accepted": False,
                     "reason": "no_survivors",
                 }
                 # Still increment warmup counter even on failure
-                self._fused_warmup_count[obj_id] = warmup_count + 1
+                self._fused_warmup_count[track_id] = warmup_count + 1
                 continue
     
-            # ── Single-camera fallback ──
-            if len(survivors) == 1:
+            # ── Single-camera path ──
+            unique_survivor_cams = {m["cam_id"] for m in survivors}
+            if len(unique_survivor_cams) == 1:
                 m = survivors[0]
                 cr = next(cr for cr in entries if cr["cam_id"] == m["cam_id"] and cr["state_idx"] == m["state_idx"])
                 T_bc = self._resolve_T_base_cam(m["cam_id"])
-    
+
                 if cr.get("rt_result") is not None and hasattr(cr["rt_result"], "T_object_camera"):
-                    T_base_candidate = (T_bc @ cr["rt_result"].T_object_camera.astype(np.float64)).astype(np.float32)
+                    T_base_seed = (T_bc @ cr["rt_result"].T_object_camera.astype(np.float64)).astype(np.float32)
                 else:
                     # During warmup with rt_invalid, use last good pose
-                    T_base_candidate = (T_bc @ cr["state"].T_object_camera.astype(np.float64)).astype(np.float32)
-    
+                    T_base_seed = (T_bc @ cr["state"].T_object_camera.astype(np.float64)).astype(np.float32)
+
+                # Single-camera base-frame ICP
+                T_base_candidate = T_base_seed
+                single_cam_icp_fitness = float("nan")
+                single_cam_icp_rmse_m = float("nan")
+                single_cam_icp_ran = False
+                single_cam_icp_failed = False
+                pcd_ok = (
+                    m.get("pcd") is not None
+                    and len(m["pcd"].points) >= int(self.args.fused_gate_min_cloud_points)
+                )
+                if pcd_ok:
+                    state0_sc = cr["state"]
+                    track_num_points_sc = int(getattr(self.args, "track_icp_num_points", 2000))
+                    model_pcd_sc = mesh_to_pcd_cached(
+                        state0_sc.mesh_path, float(self.args.mesh_scale),
+                        num_points=track_num_points_sc,
+                    )
+                    T_init_sc = (
+                        prev_base_pose.astype(np.float32)
+                        if prev_base_pose is not None else T_base_seed
+                    )
+                    try:
+                        T_refined, fit_sc, rmse_sc = run_icp_in_base_frame(
+                            scene_pcd=m["pcd"],
+                            model_pcd=model_pcd_sc,
+                            T_base_object_init=T_init_sc,
+                            max_correspondence_dist=float(self.args.fused_track_icp_max_correspondence_dist_m),
+                            max_iteration=int(getattr(self.args, 'fused_track_icp_max_iteration', 30)),
+                            variant=self.args.icp_variant,
+                            relative_fitness=float(getattr(self.args, 'fused_track_icp_relative_fitness', 1e-4)),
+                            relative_rmse=float(getattr(self.args, 'fused_track_icp_relative_rmse', 1e-4)),
+                        )
+                        T_base_candidate = T_refined.astype(np.float32)
+                        single_cam_icp_fitness = float(fit_sc)
+                        single_cam_icp_rmse_m = float(rmse_sc)
+                        single_cam_icp_ran = True
+                    except Exception as e:
+                        # ICP exception against a real cloud
+                        single_cam_icp_failed = True
+                        self.get_logger().warn(
+                            f"single-cam ICP failed for {obj_id}[{track_id}]: {e} — holding previous"
+                        )
+
                 dt, drot = self._pose_delta_from_base(prev_base_pose, T_base_candidate)
-                motion_dt_s, motion_dt_raw_s = self._compute_fused_motion_dt(obj_id, stamp)
+                motion_dt_s, motion_dt_raw_s = self._compute_fused_motion_dt(track_id, stamp)
                 max_trans_jump_m, max_rot_jump_deg = self._compute_fused_motion_thresholds(motion_dt_s)
-    
-                kalman_pred_pos = self._get_fused_kalman_predicted_position(obj_id)
+
+                kalman_pred_pos = self._get_fused_kalman_predicted_position(track_id)
                 kalman_residual_m = (
                     float(np.linalg.norm(T_base_candidate[:3, 3] - kalman_pred_pos))
                     if kalman_pred_pos is not None else None
                 )
     
+                # Prefer single-cam base-frame ICP metrics when we ran it.
+                # Otherwise fall back to the per-cam ICP fitness/rmse 
+                if single_cam_icp_ran:
+                    fitness_val = single_cam_icp_fitness
+                    rmse_val = single_cam_icp_rmse_m
+                    single_cam_pose_mode = "single_cam_icp"
+                else:
+                    per_cam_icp_ran = not bool(getattr(self.args, "skip_per_cam_icp_tracking", True))
+                    fitness_val = float(m["per_cam_icp_fitness"]) if per_cam_icp_ran else float("nan")
+                    rmse_val = float(m["per_cam_icp_rmse_m"]) if per_cam_icp_ran else float("nan")
+                    single_cam_pose_mode = "single_cam_icp" if per_cam_icp_ran else "mask_only"
+
+                # Fitness/rmse used by kalman_soft_reject AND the quality
+                # gate below.
+                gate_fitness = single_cam_icp_fitness if single_cam_icp_ran else float(m["per_cam_icp_fitness"])
+                gate_rmse_m = single_cam_icp_rmse_m if single_cam_icp_ran else float(m["per_cam_icp_rmse_m"])
+
+                quality_reject_reason: Optional[str] = None
                 if is_warmup:
                     # During warmup: only reject truly insane results
                     WARMUP_MAX_TRANS_M = 0.20
@@ -2687,64 +2655,93 @@ class FoundationPoseTrackerNode(Node):
                         or (dt <= WARMUP_MAX_TRANS_M and drot <= WARMUP_MAX_ROT_DEG)
                     )
                     kalman_soft_reject = False
+                    fitness_ok_sc = True
+                    rmse_ok_sc = True
                 else:
                     motion_ok = dt <= max_trans_jump_m and drot <= max_rot_jump_deg
                     kalman_soft_reject = (
                         kalman_residual_m is not None
                         and kalman_residual_m > float(self.args.fused_track_kalman_soft_translation_residual_m)
-                        and float(m["per_cam_icp_fitness"]) < float(self.args.fused_track_kalman_soft_max_icp_fitness)
+                        and gate_fitness < float(self.args.fused_track_kalman_soft_max_icp_fitness)
                     )
-    
-                if motion_ok and not kalman_soft_reject:
+                    if single_cam_icp_ran:
+                        min_fit = float(self.args.fused_track_min_fused_icp_fitness)
+                        max_rmse = float(self.args.fused_track_max_fused_icp_rmse_m)
+                        fitness_ok_sc = single_cam_icp_fitness >= min_fit
+                        rmse_ok_sc = single_cam_icp_rmse_m <= max_rmse
+                        if not fitness_ok_sc:
+                            quality_reject_reason = f"single_cam_fitness_low({single_cam_icp_fitness:.3f})"
+                        elif not rmse_ok_sc:
+                            quality_reject_reason = f"single_cam_rmse_high({single_cam_icp_rmse_m*1000:.1f}mm)"
+                    else:
+                        # No base-frame ICP available
+                        fitness_ok_sc = True
+                        rmse_ok_sc = True
+
+                if motion_ok and not kalman_soft_reject and fitness_ok_sc and rmse_ok_sc and not single_cam_icp_failed:
                     T_base_publish = T_base_candidate
                     buf_size = int(getattr(self.args, 'median_pose_buffer_size', 3))
                     if buf_size > 0:
-                        buf = self._median_pose_buffers.setdefault(obj_id, MedianPoseBuffer(buf_size))
+                        buf = self._median_pose_buffers.setdefault(track_id, MedianPoseBuffer(buf_size))
                         buf.push(T_base_candidate)
                         if buf.is_ready():
                             T_base_publish = buf.get_median()
-    
+
                     x_bias = float(getattr(self.args, 'x_bias_correction_m', 0.0))
                     if abs(x_bias) > 1e-6:
                         T_base_publish = apply_x_bias_correction(T_base_publish, x_bias)
-    
+
                     decision.update({
                         "mode": "single_cam_fallback",
+                        "pose_mode": single_cam_pose_mode,
                         "accepted": True,
                         "reason": "single_cam_ok",
                         "T_base": T_base_publish,
-                        "fitness": float(m["per_cam_icp_fitness"]),
-                        "rmse_m": float(m["per_cam_icp_rmse_m"]),
+                        "fitness": fitness_val,
+                        "rmse_m": rmse_val,
                         "trans_jump_m": dt,
                         "rot_jump_deg": drot,
                     })
-                    self._fused_track_memory[obj_id] = {
+                    self._fused_track_memory[track_id] = {
                         "T_base": T_base_publish.copy(),
                         "mode": "single_cam_fallback",
                         "stamp_s": self._stamp_to_seconds(stamp),
                     }
+                    self._last_known_track_centroids[track_id] = (
+                        T_base_publish[:3, 3].astype(np.float64).copy()
+                    )
                 else:
+                    if single_cam_icp_failed:
+                        reject_reason = "single_cam_icp_exception"
+                    elif quality_reject_reason is not None:
+                        reject_reason = quality_reject_reason
+                    elif kalman_soft_reject:
+                        reject_reason = f"single_cam_kalman_soft(res={kalman_residual_m*1000:.1f}mm)"
+                    else:
+                        reject_reason = f"single_cam_motion_reject(dt={dt:.3f},rot={drot:.1f})"
                     decision.update({
                         "mode": "hold_previous",
+                        "pose_mode": "hold_previous",
                         "accepted": False,
-                        "reason": f"single_cam_motion_reject(dt={dt:.3f},rot={drot:.1f})",
+                        "reason": reject_reason,
+                        "fitness": fitness_val,
+                        "rmse_m": rmse_val,
                     })
-    
-                self._fused_icp_metrics[obj_id] = {
-                    "fitness": decision.get("fitness", 0.0),
-                    "rmse_mm": 0.0,
+
+                self._fused_icp_metrics[track_id] = {
+                    "fitness": fitness_val,
+                    "rmse_mm": rmse_val * 1000.0 if np.isfinite(rmse_val) else float("nan"),
                     "mode": decision["mode"],
+                    "pose_mode": decision["pose_mode"],
                     "accepted": decision["accepted"],
                     "reason": decision["reason"],
                 }
-                object_decisions[obj_id] = decision
-                self._fused_warmup_count[obj_id] = warmup_count + 1
+                object_decisions[track_id] = decision
+                self._fused_warmup_count[track_id] = warmup_count + 1
                 continue
-    
+
             # ── Multi-camera fusion path ──
             state0 = entries[0]["state"]
-            # Tracking uses a lighter model PCD than init — cache key includes
-            # num_points so init (5000) and tracking (e.g. 2000) coexist.
             track_num_points = int(getattr(self.args, "track_icp_num_points", 2000))
             model_pcd = mesh_to_pcd_cached(
                 state0.mesh_path, float(self.args.mesh_scale),
@@ -2759,28 +2756,25 @@ class FoundationPoseTrackerNode(Node):
                     self._resolve_T_base_cam(m["cam_id"])[:3, 3]
                     for m in survivors if m["pcd"] is not None
                 ]
-                # Weighted merge needs the voxel grid to do the weight-averaging,
-                # so we keep the voxel size here.
                 fused_cloud = merge_point_clouds_weighted(
                     survivor_pcds, cam_positions,
                     voxel_size=0.002,
                     distance_exponent=float(getattr(self.args, 'cloud_merge_distance_exponent', 2.0)),
                 )
             else:
-                # Each per-cam pcd was already voxel-downsampled at 2mm in
-                # lift_masked_depth_to_base. A second 2mm voxel pass only dedups
-                # boundary overlap and burns ~ms per tick; skip it.
                 fused_cloud = merge_point_clouds(survivor_pcds, voxel_size=0.0)
     
             if fused_cloud is None or len(fused_cloud.points) < int(self.args.fused_gate_min_cloud_points):
                 decision["reason"] = f"fused_cloud_too_small({0 if fused_cloud is None else len(fused_cloud.points)})"
-                self._fused_icp_metrics[obj_id] = {
-                    "fitness": 0.0, "rmse_mm": 0.0,
-                    "mode": "hold_previous", "accepted": False,
+                decision["pose_mode"] = "hold_previous"
+                self._fused_icp_metrics[track_id] = {
+                    "fitness": float("nan"), "rmse_mm": float("nan"),
+                    "mode": "hold_previous", "pose_mode": "hold_previous",
+                    "accepted": False,
                     "reason": decision["reason"],
                 }
-                object_decisions[obj_id] = decision
-                self._fused_warmup_count[obj_id] = warmup_count + 1
+                object_decisions[track_id] = decision
+                self._fused_warmup_count[track_id] = warmup_count + 1
                 continue
     
             if prev_base_pose is not None:
@@ -2791,11 +2785,7 @@ class FoundationPoseTrackerNode(Node):
                 T_bc_0 = self._resolve_T_base_cam(first_survivor["cam_id"])
                 T_base_init = (T_bc_0 @ first_cr["state"].T_object_camera.astype(np.float64)).astype(np.float32)
     
-            # ── FIX G: Reduced ICP iterations ──
-            # Adaptive early-stop: pass looser relative_fitness/relative_rmse
-            # tolerances than Open3D's 1e-6 default so ICP bails as soon as
-            # improvements plateau. On healthy frames the pose is already good
-            # after the previous frame, so further iters waste compute.
+            # Adaptive early-stop
             icp_iters = int(getattr(self.args, 'fused_track_icp_max_iteration', 30))
             T_base_fused, fitness, rmse = run_icp_in_base_frame(
                 scene_pcd=fused_cloud,
@@ -2809,21 +2799,16 @@ class FoundationPoseTrackerNode(Node):
             )
     
             dt, drot = self._pose_delta_from_base(prev_base_pose, T_base_fused)
-            motion_dt_s, motion_dt_raw_s = self._compute_fused_motion_dt(obj_id, stamp)
+            motion_dt_s, motion_dt_raw_s = self._compute_fused_motion_dt(track_id, stamp)
             max_trans_jump_m, max_rot_jump_deg = self._compute_fused_motion_thresholds(motion_dt_s)
-    
-            kalman_pred_pos = self._get_fused_kalman_predicted_position(obj_id)
+
+            kalman_pred_pos = self._get_fused_kalman_predicted_position(track_id)
             kalman_residual_m = (
                 float(np.linalg.norm(T_base_fused[:3, 3] - kalman_pred_pos))
                 if kalman_pred_pos is not None else None
             )
     
-            # ── FIX D: Chamfer distance gate (lazy) ──
-            # Chamfer is the most expensive metric (NN search model↔fused
-            # cloud). Compute it only when we actually need it: during
-            # non-warmup frames where fitness/rmse/motion are all clean we
-            # can skip the call entirely. The gate logic below uses
-            # `chamfer is None` to mean "not computed → not used to reject".
+    
             chamfer_skip_fitness_min = float(getattr(self.args, "chamfer_skip_fitness_min", 0.30))
             chamfer_skip_rmse_max = float(getattr(self.args, "chamfer_skip_rmse_max_m", 0.005))
             chamfer_skip_motion_max = float(getattr(self.args, "chamfer_skip_motion_max_m", 0.010))
@@ -2843,12 +2828,9 @@ class FoundationPoseTrackerNode(Node):
 
             if is_warmup:
                 # ── WARMUP: skip ALL tight checks. Only reject truly insane results. ──
-                # The tracker is still settling from init — rotation/translation jumps,
-                # low fitness, high RMSE are all expected in the first few frames.
-                # We only reject if the pose is completely nonsensical.
-                WARMUP_MAX_TRANS_M = 0.20      # 200mm — way beyond normal motion
-                WARMUP_MAX_ROT_DEG = 90.0      # quarter turn — clearly wrong
-                WARMUP_MIN_FITNESS = 0.03      # basically "did ICP find anything at all"
+                WARMUP_MAX_TRANS_M = 0.20      # 200mm 
+                WARMUP_MAX_ROT_DEG = 90.0      # quarter turn 
+                WARMUP_MIN_FITNESS = 0.03 
     
                 if fitness < WARMUP_MIN_FITNESS:
                     accept = False
@@ -2860,7 +2842,6 @@ class FoundationPoseTrackerNode(Node):
                     accept = False
                     reject_reasons.append(f"warmup_spin({drot:.0f}deg)")
             else:
-                # ── NORMAL: full gating ──
                 # Track which gates failed and WHY, so we can rescue jump-only rejects
                 fitness_ok = fitness >= float(self.args.fused_track_min_fused_icp_fitness)
                 rmse_ok = rmse <= float(self.args.fused_track_max_fused_icp_rmse_m)
@@ -2888,7 +2869,7 @@ class FoundationPoseTrackerNode(Node):
                     accept = False
                     reject_reasons.append(f"chamfer({chamfer*1000:.1f}mm>{max_chamfer*1000:.0f}mm)")
 
-                # Axis-dominant jump check (from original)
+                # Axis-dominant jump check
                 axis_jump = np.abs(T_base_fused[:3, 3] - prev_base_pose[:3, 3]) if prev_base_pose is not None else np.zeros(3)
                 dominant_frac = float(axis_jump.max() / (np.linalg.norm(axis_jump) + 1e-9)) if np.linalg.norm(axis_jump) > 1e-9 else 0.0
                 weak_icp = fitness < float(self.args.fused_track_weak_icp_fitness)
@@ -2911,8 +2892,7 @@ class FoundationPoseTrackerNode(Node):
                     accept = False
                     reject_reasons.append(f"kalman_soft(res={kalman_residual_m*1000:.1f}mm)")
 
-                # ── CHAMFER RESCUE: if rejected ONLY because of jump limits,
-                # but the new pose actually aligns well with the cloud, accept it.
+                
                 # This handles: real fast motion, or tracker snapping back to
                 # correct pose after brief drift.
                 if not accept:
@@ -2922,9 +2902,7 @@ class FoundationPoseTrackerNode(Node):
 
                     if quality_ok and jump_rejected:
                         # The pose FITS the cloud well (good fitness, rmse, chamfer)
-                        # but moved too fast. This might be real motion or drift recovery.
-                        # Use a tighter chamfer threshold as extra validation.
-                        # Compute chamfer on demand if it was skipped above.
+                        # but moved too fast.
                         if chamfer is None:
                             chamfer = chamfer_distance_one_way(
                                 model_pcd, fused_cloud, T_base_fused,
@@ -2938,7 +2916,7 @@ class FoundationPoseTrackerNode(Node):
                                 f"chamfer={chamfer*1000:.1f}mm<={rescue_chamfer_thresh*1000:.1f}mm"
                             )
                             self.get_logger().warn(
-                                f"  ⚠ JUMP RESCUED {obj_id}: large motion "
+                                f"  ⚠ JUMP RESCUED {obj_id}[{track_id}]: large motion "
                                 f"dt={dt*1000:.1f}mm drot={drot:.1f}deg "
                                 f"but chamfer={chamfer*1000:.1f}mm is good — accepting with flag"
                             )
@@ -2948,7 +2926,7 @@ class FoundationPoseTrackerNode(Node):
                 T_base_publish = T_base_fused
                 buf_size = int(getattr(self.args, 'median_pose_buffer_size', 3))
                 if buf_size > 0:
-                    buf = self._median_pose_buffers.setdefault(obj_id, MedianPoseBuffer(buf_size))
+                    buf = self._median_pose_buffers.setdefault(track_id, MedianPoseBuffer(buf_size))
                     buf.push(T_base_fused)
                     if buf.is_ready():
                         T_base_publish = buf.get_median()
@@ -2960,15 +2938,17 @@ class FoundationPoseTrackerNode(Node):
 
                 # Determine mode — flag rescued jumps distinctly
                 was_rescued = any("RESCUED" in r for r in reject_reasons)
+                unique_cams_used = len({m["cam_id"] for m in survivors})
                 if was_rescued:
                     mode_str = "fusion_rescued"
-                elif len(survivors) >= 2:
+                elif unique_cams_used >= 2:
                     mode_str = "fusion_2cam"
                 else:
                     mode_str = "fusion"
 
                 decision.update({
                     "mode": mode_str,
+                    "pose_mode": "fused_icp",
                     "accepted": True,
                     "reason": reject_reasons[0] if reject_reasons else "ok",
                     "T_base": T_base_publish,
@@ -2978,14 +2958,18 @@ class FoundationPoseTrackerNode(Node):
                     "rot_jump_deg": drot,
                     "chamfer_m": float(chamfer) if chamfer is not None else -1.0,
                 })
-                self._fused_track_memory[obj_id] = {
+                self._fused_track_memory[track_id] = {
                     "T_base": T_base_publish.copy(),
                     "mode": decision["mode"],
                     "stamp_s": self._stamp_to_seconds(stamp),
                 }
+                self._last_known_track_centroids[track_id] = (
+                    T_base_publish[:3, 3].astype(np.float64).copy()
+                )
             else:
                 decision.update({
                     "mode": "hold_previous",
+                    "pose_mode": "hold_previous",
                     "accepted": False,
                     "reason": ",".join(reject_reasons),
                     "fitness": float(fitness),
@@ -2995,10 +2979,11 @@ class FoundationPoseTrackerNode(Node):
                     "chamfer_m": float(chamfer) if chamfer is not None else -1.0,
                 })
     
-            self._fused_icp_metrics[obj_id] = {
+            self._fused_icp_metrics[track_id] = {
                 "fitness": float(fitness),
                 "rmse_mm": float(rmse) * 1000.0,
                 "mode": decision["mode"],
+                "pose_mode": decision["pose_mode"],
                 "accepted": decision["accepted"],
                 "reason": decision["reason"],
             }
@@ -3008,41 +2993,105 @@ class FoundationPoseTrackerNode(Node):
                     f"{chamfer*1000:.1f}mm" if chamfer is not None else "skipped"
                 )
                 self.get_logger().info(
-                    f"FUSED DECISION {obj_id}{warmup_tag}: mode={decision['mode']} accepted={decision['accepted']} "
+                    f"FUSED DECISION {obj_id}[{track_id}]{warmup_tag}: mode={decision['mode']} accepted={decision['accepted']} "
                     f"cams={survived_cam_ids} fitness={fitness:.3f} rmse={rmse*1000:.1f}mm "
                     f"chamfer={chamfer_str} dt={dt*1000:.1f}mm drot={drot:.1f}deg "
                     f"reason={decision['reason']}"
                 )
-            object_decisions[obj_id] = decision
-            self._fused_warmup_count[obj_id] = warmup_count + 1
-    
+            object_decisions[track_id] = decision
+            self._fused_warmup_count[track_id] = warmup_count + 1
+
         if getattr(self.args, "debug_verbose_logs", False):
             print(f"[TIMING] Fused ICP all objects: {(time.time()-t_fuse)*1000:.0f}ms")
-    
-        # ── Kalman update (same as original) ──
-        for obj_id, decision in object_decisions.items():
+
+        # ── Kalman update ──
+        for tid, decision in object_decisions.items():
             T_base_acc = decision.get("T_base")
             if not (bool(decision.get("accepted", False)) and T_base_acc is not None):
                 continue
-            kf = self._get_or_create_fused_translation_kalman(obj_id)
+            kf = self._get_or_create_fused_translation_kalman(tid)
             pos = np.asarray(T_base_acc[:3, 3], dtype=np.float64).reshape(3)
             if not kf.is_initialized:
                 kf.initialize(pos)
             else:
                 kf.update(pos)
+
+        # Fill in synthetic no_survivors decisions for any tracked track_id
+        # that produced no per-cam results at all (instance fully dropped out
+        # of every camera this tick).
+        warmup_frames_default = int(getattr(self.args, 'fused_track_warmup_frames', 5))
+        for tid in all_tracked_track_ids:
+            if tid in object_decisions:
+                continue
+            warmup_count_missing = self._fused_warmup_count.get(tid, 0)
+            object_decisions[tid] = {
+                "object_id": track_id_to_object_id_local.get(tid, self._track_id_to_object_id.get(tid, "")),
+                "track_id": tid,
+                "mode": "hold_previous",
+                "pose_mode": "hold_previous",
+                "accepted": False,
+                "reason": "no_per_cam_results",
+                "T_base": None,
+                "fitness": float("nan"),
+                "rmse_m": float("nan"),
+                "trans_jump_m": 0.0,
+                "rot_jump_deg": 0.0,
+                "survived_cam_ids": [],
+                "survived_keys": [],
+                "gate_metrics": [],
+                "used_tracker_key": None,
+                "used_bbox_xyxy": None,
+                "is_warmup": warmup_count_missing < warmup_frames_default,
+            }
+            self._fused_icp_metrics[tid] = {
+                "fitness": float("nan"), "rmse_mm": float("nan"),
+                "mode": "hold_previous", "pose_mode": "hold_previous",
+                "accepted": False,
+                "reason": "no_per_cam_results",
+            }
+            self._fused_warmup_count[tid] = warmup_count_missing + 1
+
+        # ── Per-track hold/lost state machine ──
+        hold_window = int(getattr(self.args, "fused_track_hold_window_frames", 5))
+        max_lost = int(getattr(self.args, "fused_track_max_lost_frames", 20))
+        for tid, decision in object_decisions.items():
+            accepted = bool(decision.get("accepted", False)) and decision.get("T_base") is not None
+            if accepted:
+                self._fused_lost_count[tid] = 0
+                status = "fresh"
+            else:
+                prev = self._fused_lost_count.get(tid, 0)
+                lost = prev + 1
+                self._fused_lost_count[tid] = lost
+                if lost <= hold_window:
+                    status = "held"
+                elif lost <= max_lost:
+                    status = "stale"
+                else:
+                    status = "lost"
+                    self._force_reinit_tracks.add(tid)
+            self._fused_pose_status[tid] = status
+            decision["pose_status"] = status
+            decision["lost_count"] = int(self._fused_lost_count.get(tid, 0))
+            if tid in self._fused_icp_metrics:
+                self._fused_icp_metrics[tid]["pose_status"] = status
+                self._fused_icp_metrics[tid]["lost_count"] = decision["lost_count"]
     
         # ── Back-project and publish (same structure as original) ──
         track_debug_by_cam = {}
-    
-        for obj_id, entries in by_object.items():
-            decision = object_decisions.get(obj_id, {
+
+        for track_id, entries in by_track.items():
+            decision = object_decisions.get(track_id, {
                 "mode": "hold_previous", "accepted": False,
                 "reason": "missing", "T_base": None,
                 "used_tracker_key": None, "used_bbox_xyxy": None,
             })
+            obj_id = entries[0]["state"].object_id
             T_base = decision.get("T_base")
             accepted = bool(decision.get("accepted", False)) and T_base is not None
-    
+
+            survived_keys_set = set(decision.get("survived_keys", []))
+
             for cr in entries:
                 cam_id = cr["cam_id"]
                 state = cr["state"]
@@ -3050,7 +3099,9 @@ class FoundationPoseTrackerNode(Node):
                 rt_result = cr["rt_result"]
                 current_mask = np.asarray(cr["mask"]).astype(bool)
 
-                if accepted:
+                is_survivor = accepted and (cam_id, idx) in survived_keys_set
+
+                if is_survivor:
                     T_cam_base = self._resolve_T_cam_base(cam_id)
                     T_local = (T_cam_base @ T_base).astype(np.float32)
                     state.T_object_camera = T_local
@@ -3061,55 +3112,75 @@ class FoundationPoseTrackerNode(Node):
                     state.mode = "track"
                     if state.kalman is not None:
                         state.kalman.update(T_local[:3, 3])
-                    # Bundle 11: remember healthy tracker masks so the next
+
+                    # Push fused pose back into the per-cam RealtimeTracker so
+                    # its internal pose stays in sync with the fused result.
+                    tracker_key = cr.get("tracker_key")
+                    rt = self.realtime_trackers.get(tracker_key) if tracker_key else None
+                    if rt is not None:
+                        try:
+                            rt.force_pose_update(T_local)
+                        except Exception:
+                            pass
+
+                    # remember healthy tracker masks so the next
                     # init (if it fires) can skip DINO for these objects.
                     occ = float(getattr(rt_result, "occlusion_score", 0.0)) if rt_result is not None else 0.0
-                    self._recent_tracker_health[(cam_id, state.object_id)] = {
+                    self._recent_tracker_health[(cam_id, state.track_id)] = {
+                        "object_id": state.object_id,
                         "frame_idx": self.frame_counter,
                         "mask": current_mask.copy(),
                         "occlusion_score": occ,
                         "T_object_camera": T_local.copy(),
+                        "centroid_base": np.asarray(T_base_acc[:3, 3], dtype=np.float64).copy(),
                     }
                     # Per-object appearance memory: stash a clean RGB crop
                     # while ICP fitness is high so the next reinit can
                     # disambiguate the instance from look-alikes.
                     cr_view = cr.get("view")
-                    if cr_view is not None and getattr(cr_view, "rgb", None) is not None:
-                        fused_metrics_for_save = self._fused_icp_metrics.get(obj_id, {})
+                    is_warmup_obj = bool(decision.get("is_warmup", False))
+                    if (
+                        not is_warmup_obj
+                        and cr_view is not None
+                        and getattr(cr_view, "rgb", None) is not None
+                    ):
+                        fused_metrics_for_save = self._fused_icp_metrics.get(track_id, {})
                         fitness_for_save = float(fused_metrics_for_save.get("fitness", 0.0))
                         self._maybe_save_memory_crop(
                             object_id=state.object_id,
+                            track_id=track_id,
                             cam_id=cam_id,
                             rgb_full=cr_view.rgb,
                             mask_full=current_mask,
                             bbox_xyxy=cr.get("bbox_xyxy"),
                             fitness=fitness_for_save,
                         )
+
+                    # recovery_mask seeds the next reinit's RealtimeTracker.
+                    state.recovery_mask = current_mask
                 else:
                     if state.last_good_T is not None:
                         state.T_object_camera = state.last_good_T.copy()
                     state.degraded_count += 1
                     state.mode = "degraded"
 
-                state.recovery_mask = current_mask
                 state.last_mask_area = int(current_mask.sum())
 
-                # Per-cam debug publish (off by default — fused canonical is the
-                # production output). Single publish per object per cam.
+                # Per-cam debug publish
                 if getattr(self.args, "debug_per_cam_pose_publish", False):
                     if accepted:
                         pose_msg = T_to_pose_stamped(T_base, frame_id="base", stamp=stamp)
                         self._get_or_create_pose_base_pub(
-                            cam_id, state.object_id, idx
+                            cam_id, state.track_id
                         ).publish(pose_msg)
                     else:
                         self._publish_pose_base(
-                            cam_id, state.object_id, idx,
+                            cam_id, state.track_id,
                             state.T_object_camera, stamp,
                         )
-    
+
                 if cam_id not in track_debug_by_cam:
-                    fused_metrics = self._fused_icp_metrics.get(obj_id, {})
+                    fused_metrics = self._fused_icp_metrics.get(track_id, {})
                     track_debug_by_cam[cam_id] = {
                         "mask": current_mask,
                         "bbox_xyxy": cr["bbox_xyxy"],
@@ -3136,19 +3207,25 @@ class FoundationPoseTrackerNode(Node):
                 self.pub_debug_frame[cam_id].publish(frame)
     
         # ── Publish fused canonical poses ──
-        # Cache the publisher reference on the decision dict so subsequent
-        # frames skip the dict lookup. The publisher dict is keyed per object.
         if not hasattr(self, "_pub_fused_pose"):
             self._pub_fused_pose = {}
         if not hasattr(self, "_fused_pose_pub_by_obj"):
             self._fused_pose_pub_by_obj: dict[str, Any] = {}
 
-        for obj_id, decision in object_decisions.items():
-            if not decision.get("accepted") or decision.get("T_base") is None:
+        for tid, decision in object_decisions.items():
+            accepted_pub = decision.get("accepted") and decision.get("T_base") is not None
+            if accepted_pub:
+                T_pub = decision["T_base"]
+            elif decision.get("pose_status") == "held":
+                mem = self._fused_track_memory.get(tid)
+                T_pub = mem["T_base"] if mem is not None else None
+            else:
+                T_pub = None
+            if T_pub is None:
                 continue
-            pub = self._fused_pose_pub_by_obj.get(obj_id)
+            pub = self._fused_pose_pub_by_obj.get(tid)
             if pub is None:
-                fused_key = f"fused/{obj_id}_0"
+                fused_key = f"fused/{tid}"
                 pub = self._pub_fused_pose.get(fused_key)
                 if pub is None:
                     pub = self.create_publisher(
@@ -3156,9 +3233,9 @@ class FoundationPoseTrackerNode(Node):
                         FAST_QOS,
                     )
                     self._pub_fused_pose[fused_key] = pub
-                self._fused_pose_pub_by_obj[obj_id] = pub
+                self._fused_pose_pub_by_obj[tid] = pub
             pub.publish(
-                T_to_pose_stamped(decision["T_base"], frame_id="base", stamp=stamp)
+                T_to_pose_stamped(T_pub, frame_id="base", stamp=stamp)
             )
 
         if getattr(self.args, "debug_verbose_logs", False):
@@ -3172,8 +3249,6 @@ class FoundationPoseTrackerNode(Node):
     def _check_chamfer_drift(self) -> None:
         """
         Compare mean Chamfer across cameras over recent inits.
-        If one camera is consistently 2x+ worse than the other,
-        warn about likely extrinsic drift.
         Requires at least 3 samples per camera to trigger.
         """
         cam_ids = list(self._init_chamfer_history.keys())
@@ -3211,22 +3286,15 @@ class FoundationPoseTrackerNode(Node):
     def _process_multicam_init(self, views: list, stamp) -> None:
         """
         Multi-camera fusion init with single-FP + symmetry-grid refinement.
-
-        Flow for each fused detection:
-        1. Run FP estimate_pose ONCE on each contributing camera
-        2. Convert each FP result to base frame
-        3. Lift all masked depths to base frame (1mm voxels), merge into fused cloud
-        4. ICP-refine each base-frame pose against the fused cloud
-        5. If chamfer > 8mm, run 24-seed symmetry grid (absolute orientations)
-        6. Hard-reject cameras with chamfer > 2x best camera's chamfer
-        7. Weighted average by ICP fitness → single canonical base-frame pose
-        8. Polishing ICP of canonical pose against fused cloud
-        9. Back-project to all contributing cameras
         """
         t_start = time.time()
         print(f"\n[TIMING] ========== MULTICAM INIT START ==========")
 
-        # ── Phase 1: SAM + DINO per camera (unchanged) ──
+        # Reset the per-init-pass claim set so each fused detection picks
+        # an unused (or newly allocated) track_id.
+        self._claimed_track_ids_this_init = set()
+
+        # ── Phase 1: SAM + DINO per camera ──
         selections_by_cam: dict[str, list[CandidateSelection]] = {}
         views_by_cam: dict[str, Any] = {}
 
@@ -3254,19 +3322,23 @@ class FoundationPoseTrackerNode(Node):
                     self.pub_debug_frame[cam_id].publish(frame)
                 continue
 
-            # Bundle 11: skip DINO for masks that match a recently-healthy
-            # tracker mask via IoU. Inherit the tracker's object_id directly.
             inherited: list[CandidateSelection] = []
             remaining_masks = masks
             if bool(getattr(self.args, "skip_dino_when_tracker_healthy", False)):
                 inherited, remaining_masks = self._inherit_from_tracker_health(
-                    cam_id=cam_id, masks=masks,
+                    cam_id=cam_id, masks=masks, depth=view.depth, K=view.K,
                 )
                 if inherited:
                     print(f"[TIMING] DINO-skip {cam_id}: inherited {len(inherited)} masks from tracker (skipped DINO)")
 
             t_dino = time.time()
-            ranked = self._classify_masks_batched(view.rgb, remaining_masks) if remaining_masks else []
+            ranked = (
+                self._classify_masks_batched(
+                    view.rgb, remaining_masks,
+                    cam_id=cam_id, depth=view.depth, K=view.K,
+                )
+                if remaining_masks else []
+            )
             selected = self._select_top_candidates(inherited + ranked, view.depth)
             print(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
             selections_by_cam[cam_id] = selected
@@ -3287,7 +3359,7 @@ class FoundationPoseTrackerNode(Node):
             print(f"[TIMING] MULTICAM INIT: no detections")
             return
 
-        # ── Phase 2: Fusion matching (unchanged) ──
+        # ── Phase 2: Fusion matching ──
         t_fusion = time.time()
         fusion_cfg = FusionConfig(
             debug_enabled=False,
@@ -3316,8 +3388,6 @@ class FoundationPoseTrackerNode(Node):
                 continue
 
             # ─── Step 3a: Lift all masked depths to base frame, merge ───
-            # [CHANGE] 1mm voxels for init (was 2mm) — denser cloud gives
-            # ICP more surface detail to lock onto, especially for small parts.
             INIT_VOXEL_SIZE = 0.001
 
             t_lift = time.time()
@@ -3330,9 +3400,6 @@ class FoundationPoseTrackerNode(Node):
                 T_bc = self._resolve_T_base_cam(cam_id)
                 K_cam = np.asarray(views_by_cam[cam_id].K, dtype=np.float32).reshape(3, 3)
 
-                # C5: optionally fill ZED depth holes inside the mask before
-                # lifting. Off by default (kernel=0). Costs one medianBlur per
-                # camera per init.
                 depth_for_lift = views_by_cam[cam_id].depth
                 hole_k = int(getattr(self.args, "depth_fill_holes_kernel", 0))
                 if hole_k > 0:
@@ -3354,9 +3421,6 @@ class FoundationPoseTrackerNode(Node):
                     print(f"  [{cam_id}] Lifted {len(pcd.points)} pts for {fused.object_id}")
 
             # ─── Cloud overlap diagnostic ───
-            # Two NN-distance passes over the full per-cam clouds — pure
-            # diagnostic for extrinsic drift. Gate behind verbose-logs since
-            # extrinsics rarely shift between init runs.
             if len(per_cam_clouds) >= 2 and getattr(self.args, "debug_verbose_logs", False):
                 d01 = per_cam_clouds[0].compute_point_cloud_distance(per_cam_clouds[1])
                 d10 = per_cam_clouds[1].compute_point_cloud_distance(per_cam_clouds[0])
@@ -3386,15 +3450,12 @@ class FoundationPoseTrackerNode(Node):
             model_pcd = mesh_to_pcd_cached(mesh_path, float(self.args.mesh_scale), num_points=5000)
 
             # ─── Step 3b: Run FP ONCE on each contributing camera ───
-            # C7: grid-skip threshold is configurable; 0.008m kept the historical
-            # default. Below this, FP+ICP is already in the good regime so the
-            # rotation-grid sweep is skipped — saves ~100ms when init is clean.
             SYMMETRY_GRID_CHAMFER_M = float(getattr(self.args, "icp_grid_skip_chamfer_m", 0.008))
             CHAMFER_REJECT_M = 0.012 if len(fused.detections) == 1 else 0.015
 
             candidate_poses: list[np.ndarray] = []
             candidate_weights: list[float] = []
-            candidate_chamfers: list[float] = []   # [CHANGE] store for hard-reject gate
+            candidate_chamfers: list[float] = []
             candidate_cam_ids: list[str] = []
             candidate_det_indices: list[int] = []
 
@@ -3491,9 +3552,7 @@ class FoundationPoseTrackerNode(Node):
                         )
                         best_T = grid_T
                         best_chamfer = grid_chamfer
-                        # Recompute fitness/rmse against the new pose so the
-                        # downstream FINAL log and fusion weight don't mix
-                        # new chamfer with stale ICP metrics.
+                        # Recompute fitness/rmse against the new pose
                         best_fitness, best_rmse = evaluate_icp_in_base_frame(
                             scene_pcd=fused_cloud,
                             model_pcd=model_pcd,
@@ -3502,61 +3561,6 @@ class FoundationPoseTrackerNode(Node):
                     else:
                         print(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
 
-                # ─── C8: optional FP refiner pass after the grid ───
-                # Lock in the grid-chosen rotation with FP's learned refiner.
-                # Off by default. Only fires when the grid actually ran (the
-                # whole point is to clean up after a rotation flip), and only
-                # if the grid produced a usable pose.
-                if (grid_ran
-                        and bool(getattr(self.args, "fp_refine_after_grid", False))
-                        and best_T is not None):
-                    try:
-                        t_fpref = time.time()
-                        T_bc = self._resolve_T_base_cam(cam_id)
-                        T_cb = np.linalg.inv(T_bc)
-                        T_cam_obj = (T_cb @ best_T.astype(np.float64)).astype(np.float32)
-                        n_iter = int(getattr(self.args, "fp_refine_iterations", 1))
-                        ref_res = tracker.refine_pose(
-                            object_id=fused.object_id,
-                            mesh_path=mesh_path,
-                            rgb=view.rgb,
-                            depth=view.depth,
-                            K=K_cam,
-                            T_object_camera_init=T_cam_obj,
-                            iterations=n_iter,
-                        )
-                        T_cam_ref = np.asarray(
-                            ref_res.T_object_camera, dtype=np.float32
-                        ).reshape(4, 4)
-                        T_base_ref = (T_bc @ T_cam_ref.astype(np.float64)).astype(np.float32)
-                        ref_chamfer = chamfer_distance_one_way(
-                            model_pcd, fused_cloud, T_base_ref
-                        )
-                        fpref_ms = (time.time() - t_fpref) * 1000
-                        if ref_chamfer < best_chamfer:
-                            print(
-                                f"    FP-refine improved [{cam_id}]: "
-                                f"{best_chamfer*1000:.2f}mm → {ref_chamfer*1000:.2f}mm "
-                                f"({fpref_ms:.0f}ms)"
-                            )
-                            best_T = T_base_ref
-                            best_chamfer = ref_chamfer
-                            best_fitness, best_rmse = evaluate_icp_in_base_frame(
-                                scene_pcd=fused_cloud,
-                                model_pcd=model_pcd,
-                                T_base_object=best_T,
-                            )
-                        else:
-                            print(
-                                f"    FP-refine no improvement [{cam_id}] "
-                                f"({fpref_ms:.0f}ms, chamfer {ref_chamfer*1000:.2f}mm)"
-                            )
-                    except Exception as e:
-                        self.get_logger().warn(
-                            f"  FP-refine after grid failed [{cam_id}]: {e}"
-                        )
-
-                # ─── Optional CSV + PNG logging ───
                 if getattr(self.args, 'log_init_poses', False):
                     accepted_attempt = (best_chamfer <= CHAMFER_REJECT_M)
                     try:
@@ -3593,7 +3597,7 @@ class FoundationPoseTrackerNode(Node):
                     f"chamfer={best_chamfer*1000:.2f}mm"
                 )
 
-                # ─── [CHANGE] Per-camera Chamfer history tracking ───
+                # ─── Per-camera Chamfer history tracking ───
                 self._init_chamfer_history[cam_id].append(best_chamfer)
 
                 # ─── Chamfer reject handling (unchanged logic) ───
@@ -3640,7 +3644,7 @@ class FoundationPoseTrackerNode(Node):
                 self.get_logger().info(f"  No valid FP results for {fused.object_id}")
                 continue
 
-            # ─── [CHANGE] Hard-reject cameras with chamfer > 2x best ───
+            # ─── Hard-reject cameras with chamfer > 2x best ───
             if len(candidate_poses) >= 2:
                 best_chamfer_val = min(candidate_chamfers)
                 rejection_threshold = best_chamfer_val * 2.0
@@ -3674,7 +3678,7 @@ class FoundationPoseTrackerNode(Node):
             # ─── Step 3d: Weighted average → canonical base-frame pose ───
             T_base_canonical = weighted_average_poses(candidate_poses, candidate_weights)
 
-            # ─── [CHANGE] Polishing ICP: snap the averaged pose back onto the cloud ───
+            # ─── Polishing ICP: snap the averaged pose back onto the cloud ───
             t_polish = time.time()
             T_base_canonical, polish_fitness, polish_rmse = run_icp_in_base_frame(
                 scene_pcd=fused_cloud,
@@ -3721,6 +3725,14 @@ class FoundationPoseTrackerNode(Node):
                         f"dist={dist_m:.2f}m min_mask_area={min_mask_area}"
                     )
 
+            # Allocate (or reuse) one track_id per fused detection so all
+            # per-cam ObjectTrackStates from this fused detection share
+            # identity.
+            base_centroid = np.asarray(T_publish[:3, 3], dtype=np.float64).reshape(3)
+            track_id_for_fused = self._resolve_track_id_for_new_detection(
+                fused.object_id, base_centroid,
+            )
+
             # ─── Step 3e: Back-project to all contributing cameras ───
             for det_idx, det in enumerate(fused.detections):
                 cam_id = det.cam_id
@@ -3740,6 +3752,7 @@ class FoundationPoseTrackerNode(Node):
 
                 state = ObjectTrackState(
                     object_id=fused.object_id,
+                    track_id=track_id_for_fused,
                     mesh_path=mesh_path,
                     mode="track",
                     T_object_camera=T_local.copy(),
@@ -3755,12 +3768,14 @@ class FoundationPoseTrackerNode(Node):
                 new_states_by_cam[cam_id].append(state)
 
                 self._log_base_pose(
-                    f"INIT", cam_id, fused.object_id, i, T_local,
+                    f"INIT", cam_id, track_id_for_fused, T_local,
                     extra=f"dino={det.dino_score:.3f} cams={len(candidate_poses)}",
                 )
 
-            # Publish canonical fused pose
-            fused_key = f"fused/{fused.object_id}_{i}"
+            # Publish canonical fused pose under the track_id key so multi-
+            # instance same-class scenes get distinct topics.
+            self._last_known_track_centroids[track_id_for_fused] = base_centroid.copy()
+            fused_key = f"fused/{track_id_for_fused}"
             if fused_key not in self._pub_fused_pose:
                 self._pub_fused_pose[fused_key] = self.create_publisher(
                     PoseStamped, f"/perception/fp/pose_base/{fused_key}", FAST_QOS,
@@ -3771,7 +3786,7 @@ class FoundationPoseTrackerNode(Node):
 
         print(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms")
 
-        # ─── [CHANGE] Per-camera Chamfer drift detection ───
+        # ─── Per-camera Chamfer drift detection ───
         self._check_chamfer_drift()
 
         # ── Publish debug frames ──
@@ -3805,25 +3820,37 @@ class FoundationPoseTrackerNode(Node):
 
     def _reset_tracking_state_for_reinit(self, fused_detections):
         """
-        Call this in _process_multicam_init after creating new states.
-        Resets warmup counters, median buffers, and Kalman filters for
-        all re-initialized objects.
+        Resets warmup counters, median buffers, Kalman filters, and
+        per-camera RealtimeTracker instances so the next tick rebuilds
+        them against the freshly initialised poses instead of reusing
+        Cutie/SAM2 memory tied to the previous instance.
         """
-        for fused in fused_detections:
-            obj_id = fused.object_id
-            self._fused_warmup_count[obj_id] = 0
-            if obj_id in self._median_pose_buffers:
-                self._median_pose_buffers[obj_id].reset()
-            if obj_id in self._fused_translation_kalman:
-                self._fused_translation_kalman[obj_id].reset()
-            if obj_id in self._fused_track_memory:
-                del self._fused_track_memory[obj_id]
+        fresh_track_ids: set[str] = set()
+        for states in self.track_states.values():
+            for s in states:
+                if getattr(s, "track_id", ""):
+                    fresh_track_ids.add(s.track_id)
+
+        for tid in fresh_track_ids:
+            self._fused_warmup_count[tid] = 0
+            if tid in self._median_pose_buffers:
+                self._median_pose_buffers[tid].reset()
+            if tid in self._fused_translation_kalman:
+                self._fused_translation_kalman[tid].reset()
+            if tid in self._fused_track_memory:
+                del self._fused_track_memory[tid]
+            self._fused_lost_count[tid] = 0
+            self._fused_pose_status[tid] = "fresh"
+            self._force_reinit_tracks.discard(tid)
+
+        for key, rt in list(self.realtime_trackers.items()):
+            try:
+                rt.reset()
+            except Exception:
+                pass
+            del self.realtime_trackers[key]
 
     def _tick(self) -> None:
-        """
-        FIXED: If ANY camera has tracked objects, run fused tracking.
-        Only fall to init if NO camera has states at all.
-        """
         if self.busy:
             return
         views = self.grabber.get_latest_views()
@@ -3837,6 +3864,25 @@ class FoundationPoseTrackerNode(Node):
             self.frame_counter += 1
             stamp = self.get_clock().now().to_msg()
     
+            if self._force_reinit_tracks:
+                lost_track_ids = set(self._force_reinit_tracks)
+                self.get_logger().warn(
+                    f"FORCE REINIT: pose_status=lost for {sorted(lost_track_ids)} "
+                    f"— dropping their states, re-detecting on this tick"
+                )
+                for cid in list(self.track_states.keys()):
+                    self.track_states[cid] = [
+                        s for s in self.track_states[cid]
+                        if s.track_id not in lost_track_ids
+                    ]
+                for tid in lost_track_ids:
+                    self._fused_lost_count[tid] = 0
+                    self._fused_pose_status[tid] = "fresh"
+                self._force_reinit_tracks.clear()
+                force_init_this_tick = True
+            else:
+                force_init_this_tick = False
+
             # Check which cameras have active tracking
             any_tracking = any(
                 bool(self.track_states.get(v.cam_id))
@@ -3846,15 +3892,14 @@ class FoundationPoseTrackerNode(Node):
                 )
                 for v in views
             )
-    
+
             no_states = all(
                 not bool(self.track_states.get(v.cam_id))
                 for v in views
             )
-    
-            if any_tracking and not no_states:
+
+            if any_tracking and not no_states and not force_init_this_tick:
                 # ─── FUSED TRACKING ───
-                # Cameras without states simply don't contribute to fusion
                 self._track_multicam_fused(views, stamp)
             else:
                 # ─── MULTICAM INIT ───
@@ -3876,10 +3921,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--mask-source",
-                   choices=["sam", "projected", "gdino_sam", "yolo_sam"],
+                   choices=["sam", "projected", "gdino_sam"],
                    default="sam")
-    # B7/B8/A9: Grounding DINO + SAM (MUSE-style) proposal stage. Only used
-    # when --mask-source gdino_sam.
+    # Grounding DINO + SAM (MUSE-style) proposal stage
     p.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base")
     p.add_argument("--gdino-box-threshold", type=float, default=0.20)
     p.add_argument("--gdino-text-threshold", type=float, default=0.25)
@@ -3890,22 +3934,8 @@ def parse_args() -> argparse.Namespace:
     # override via --gdino-text-prompts "a,b,c" to extend.
     p.add_argument(
         "--gdino-text-prompts",
-        default="cooling base,cooling f,cooling screw,blue cube,green cube,red cube,screwdriver,pb base,pb pipe,pb screw,pb top",
+        default="cooling base,cooling f,cooling screw,pb base,pb pipe,pb screw,pb top",
     )
-    # YOLO + SAM proposal stage (class-agnostic counterpart to gdino_sam).
-    # Only used when --mask-source yolo_sam.
-    p.add_argument("--yolo-model", default="yolov8x.pt")
-    p.add_argument("--yolo-conf-threshold", type=float, default=0.10)
-    p.add_argument("--yolo-iou-threshold", type=float, default=0.45)
-    p.add_argument("--yolo-image-size", type=int, default=640)
-    p.add_argument("--yolo-max-boxes", type=int, default=50)
-    p.add_argument("--yolo-device", choices=["", "cpu", "cuda"], default="",
-                   help="Device for YOLO proposal model. Empty reuses --device.")
-    # Optional comma-separated class whitelist. Empty = fully class-agnostic.
-    p.add_argument("--yolo-class-filter", default="")
-    # When True, downstream sees label "object" instead of YOLO's class name,
-    # so the DINO classifier owns the labeling decision.
-    p.add_argument("--yolo-class-agnostic", action="store_true", default=True)
     p.add_argument("--target-object", default=None)
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
 
@@ -3913,32 +3943,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cad-dir", default="Data/CAD_Models_centered")
     p.add_argument("--output-root", default="outputs/foundationpose")
 
-    # B6: synthetic-render reference bank. Generated by
-    # tools/generate_dino_reference_renders.py. Selects which sources
-    # contribute to the DINO reference bank.
+    # synthetic-render reference bank
     p.add_argument("--reference-source", choices=["real", "renders", "both"],
                    default="real")
     p.add_argument("--reference-renders-dir", default="Data/reference_renders")
 
-    # DINO backbone. dinov2_vitb14 = current default (faster). Pass
-    # dinov2_vitl14 for higher fidelity per DINOv2 paper Fig. 2/5.
     p.add_argument("--dino-model-name", default="dinov2_vitl14")
     p.add_argument("--dino-min-score", type=float, default=0.45)
     p.add_argument("--dino-min-margin", type=float, default=0.0)
-    # B4: softmax-entropy gate over per-object scores. Higher = less confident.
-    # Disabled at 0.0 (default); typical effective range ~0.6-0.9 with tau=0.05.
+    # softmax-entropy gate over per-object scores.
     p.add_argument("--dino-entropy-threshold", type=float, default=0.0)
     p.add_argument("--dino-entropy-tau", type=float, default=0.05)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
-    p.add_argument("--cooling-base-min-bbox-side-px", type=int, default=100)
-    p.add_argument("--cooling-screw-max-bbox-side-px", type=int, default=90)
-    p.add_argument("--cooling-f-min-bbox-side-px", type=int, default=60)
-
     # Per-object appearance memory: snapshot a clean RGB crop whenever the
-    # fused ICP fitness is good, and at reinit re-rank SAM/DINO candidates by
-    # cosine similarity to those snapshots. This kills disambiguation
-    # ambiguity when two look-alike instances are on the table.
+    # fused ICP fitness is good
     p.add_argument("--memory-crop-enable", action="store_true", default=True,
                    help="Save high-fitness crops and use them at reinit.")
     p.add_argument("--no-memory-crop", dest="memory_crop_enable",
@@ -3986,39 +4005,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cam2-roi-polygon", type=str,
         default="530,610,1350,260,1920,500,1700,1080,914,1080")
 
-    p.add_argument("--tiny-objects-enabled", action="store_true")
-    # Bundle 11: per-cam tiny ROIs. Empty string disables the tiny pass on
-    # that cam. cam1 default is empty so the runner stays backwards
-    # compatible — pass an explicit ROI to enable cam1's tiny pass.
-    p.add_argument("--cam1-tiny-roi", type=str, default="")
-    p.add_argument("--cam2-tiny-roi", type=str, default="700,500,1350,1080")
-    p.add_argument("--tiny-sam-max-image-side", type=int, default=1920)
-    p.add_argument("--tiny-sam-min-mask-area", type=int, default=8)
-    p.add_argument("--tiny-sam-min-bbox-side-px", type=int, default=2)
-    p.add_argument("--tiny-max-mask-area-ratio", type=float, default=0.01)
-    p.add_argument("--tiny-max-bbox-area-ratio", type=float, default=0.02)
-
-    # A3/A4/A7: lighter tiny-pass SAM config. Empty checkpoint => fall back to
-    # main checkpoint. Pass e.g.
-    #   --tiny-sam-checkpoint external/sam2/checkpoints/sam2.1_hiera_small.pt
-    #   --tiny-sam-model-cfg configs/sam2.1/sam2.1_hiera_s.yaml
-    # to use Hiera Small once the checkpoint is downloaded.
-    p.add_argument("--tiny-sam-checkpoint", type=str, default="")
-    p.add_argument("--tiny-sam-model-cfg", type=str, default="")
-    p.add_argument("--tiny-sam-points-per-side", type=int, default=32)
-    p.add_argument("--tiny-sam-pred-iou-thresh", type=float, default=0.55)
-    p.add_argument("--tiny-sam-stability-score-thresh", type=float, default=0.55)
-    p.add_argument("--tiny-sam-max-aspect-ratio", type=float, default=4.5)
-
-    p.add_argument("--blue-blob-proposals-enabled", action="store_true")
-    p.add_argument("--blue-blob-min-area", type=int, default=20)
-    p.add_argument("--blue-blob-max-area", type=int, default=3000)
     p.add_argument("--mask-dedup-iou", type=float, default=0.6)
 
     p.add_argument("--fp-repo-root", default="external/FoundationPose")
     p.add_argument("--fp-weights-dir", default="external/FoundationPose/weights")
     p.add_argument("--fp-debug", type=int, default=0)
-    p.add_argument("--est-refine-iter", type=int, default=0)
     p.add_argument("--mesh-scale", type=float, default=0.01)
 
     p.add_argument("--timer-period-s", type=float, default=0.25)
@@ -4056,19 +4047,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fused-track-max-rotation-speed-degps", type=float, default=66.66666666666667)
     p.add_argument("--fused-track-min-translation-jump-m", type=float, default=0.008)
     p.add_argument("--fused-track-min-rotation-jump-deg", type=float, default=4.0)
-    p.add_argument("--fused-track-kalman-soft-translation-residual-m", type=float, default=0.025)
+    p.add_argument("--fused-track-kalman-soft-translation-residual-m", type=float, default=0.05)
     p.add_argument("--fused-track-kalman-soft-max-icp-fitness", type=float, default=0.22)
     p.add_argument("--fused-track-weak-icp-fitness", type=float, default=0.18)
     p.add_argument("--fused-track-axis-dominant-fraction", type=float, default=0.80)
     p.add_argument("--fused-track-axis-dominant-min-translation-m", type=float, default=0.012)
     p.add_argument("--fused-track-icp-max-correspondence-dist-m", type=float, default=0.05)
-    # Tracking uses a tight init from the previous frame, so 30 iters is overkill;
-    # 15 lands within ~0.5mm of the converged pose for our object scale.
+    # Tracking uses a tight init from the previous frame
     p.add_argument("--fused-track-icp-max-iteration", type=int, default=15)
-    # Adaptive early-stop tolerances for tracking ICP. Open3D's default is 1e-6
-    # (effectively never triggers — runs all max_iteration). 1e-4 lets it bail
-    # as soon as fitness/rmse improvement plateaus, which is the common case
-    # when the previous-frame init is already very close.
+    # Adaptive early-stop tolerances for tracking ICP
     p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
     p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
 
@@ -4081,11 +4068,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-weighted-cloud-merge", action="store_true")
     p.add_argument("--cloud-merge-distance-exponent", type=float, default=2.0)
  
-    # X-axis bias correction (if x consistently underestimated, set > 0)
     p.add_argument("--x-bias-correction-m", type=float, default=0.0)
  
-    # Warmup frames after init (relaxed gating to let tracker stabilize)
+    # Warmup frames after init 
     p.add_argument("--fused-track-warmup-frames", type=int, default=5)
+
+    # Hold/lost windows
+    p.add_argument("--fused-track-hold-window-frames", type=int, default=5)
+    p.add_argument("--fused-track-max-lost-frames", type=int, default=20)
  
     # Chamfer distance gate for outlier rejection during tracking
     p.add_argument("--fused-track-max-chamfer-m", type=float, default=0.015)
@@ -4093,13 +4083,10 @@ def parse_args() -> argparse.Namespace:
     # Median pose buffer (temporal outlier filter, 0 to disable)
     p.add_argument("--median-pose-buffer-size", type=int, default=3)
 
-    # [POST-RUN3 Item 4] Init rotation logging + 3D PNG render (off by default)
     p.add_argument("--log-init-poses", action="store_true",
                    help="Log CSV of init pose RPY + render 3D PNGs per attempt")
 
     # ── Latency / debug flags ──
-    # When true, also publish one pose-per-cam topic for debug viz; otherwise
-    # only the fused canonical pose is published.
     p.add_argument("--debug-per-cam-pose-publish", action="store_true")
     # When true, emit per-frame INFO logs and [TIMING] prints. Off by default.
     p.add_argument("--debug-verbose-logs", action="store_true")
@@ -4109,7 +4096,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-per-cam-icp-tracking", action="store_true", default=True)
 
     # Tracking-time model PCD point count (init keeps the original 5000 via a
-    # separate cache entry). For iter count see --fused-track-icp-max-iteration.
+    # separate cache entry).
     p.add_argument("--track-icp-num-points", type=int, default=2000)
 
     # Conditional chamfer thresholds. Skip chamfer when both fitness/rmse are
@@ -4118,26 +4105,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.005)
     p.add_argument("--chamfer-skip-motion-max-m", type=float, default=0.010)
 
-    # C1: ICP variant for run_icp_in_base_frame. point_to_plane penalises
-    # normal-direction error and converges better on flat faces / cylinders;
-    # point_to_point is the historical default and our current behaviour.
+    # ICP variant for run_icp_in_base_frame.
     p.add_argument("--icp-variant", choices=["point_to_point", "point_to_plane"],
                    default="point_to_point")
 
-    # C9: warn-tag poses that are likely lower confidence (far away / tiny mask).
-    # Default off so behaviour matches current logs.
+    # warn-tag poses that are likely lower confidence (far away / tiny mask).
     p.add_argument("--distance-confidence-warn", action="store_true")
     p.add_argument("--distance-confidence-max-m", type=float, default=1.5)
     p.add_argument("--distance-confidence-min-mask-area", type=int, default=2000)
 
-    # C2/C3/C4/C6: rotation-grid search overhaul. All defaults preserve the
-    # current 24-element octahedral grid behaviour. Enable individually:
-    #   --icp-grid-fibonacci          : sample N uniform SO(3) seeds instead of 24 cube seeds
+   
+    #   --icp-grid-n-rot              : number of uniform SO(3) seed rotations
     #   --icp-grid-prescreen          : skip ICP for seeds whose raw-Chamfer > tau (cheap)
     #   --icp-grid-second-pass        : refine top-K winners with small angular jitter
     #   --icp-grid-cross-cam-chamfer  : score by mean Chamfer across per-cam clouds
     #   --icp-grid-tie-by-inliers     : break Chamfer ties by ICP fitness (≈ inlier count)
-    p.add_argument("--icp-grid-fibonacci", action="store_true")
     p.add_argument("--icp-grid-n-rot", type=int, default=100)
     p.add_argument("--icp-grid-prescreen", action="store_true")
     p.add_argument("--icp-grid-prescreen-tau", type=float, default=0.04)
@@ -4149,27 +4131,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--icp-grid-tie-by-inliers", action="store_true")
     p.add_argument("--icp-grid-tie-chamfer-eps-m", type=float, default=0.0005)
 
-    # C5: fill ZED depth holes inside the mask before lifting to a cloud.
-    # 0 = off (current behaviour). 3 or 5 = cv2.medianBlur kernel.
+
     p.add_argument("--depth-fill-holes-kernel", type=int, default=0)
 
-    # C7: threshold above which the rotation grid runs. Below this, FP+ICP
-    # is already in the good regime and the grid sweep is skipped.
+    # threshold above which the rotation grid runs. 
     p.add_argument("--icp-grid-skip-chamfer-m", type=float, default=0.004)
 
-    # C8: run FP's neural refiner after the rotation grid to lock in the
-    # geometry-best seed. Off by default — only useful when the grid runs.
-    p.add_argument("--fp-refine-after-grid", action="store_true")
-    p.add_argument("--fp-refine-iterations", type=int, default=1)
-
-    # B2 / Bundle 5 / MUSE: DINO upgrades. Defaults preserve original
-    # CLS-token + cosine behaviour. See MUSE.pdf §3.
-    #   --dino-embedding-mode concat       — CLS ++ GeM-patch
-    #   --dino-embedding-mode two_stream   — separate S_cls / S_patch blended by
-    #                                        --dino-stream-alpha (paper Eq.4)
-    #   --dino-similarity tanimoto         — paper §3.2
-    #   --dino-joint-score-alpha > 0       — paper Eq.6 "beta": blend absolute
-    #                                        and relative scores
     p.add_argument("--dino-embedding-mode",
                    choices=["cls", "patch_gem", "concat", "two_stream", "patch_match"],
                    default="cls")
@@ -4179,29 +4146,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dino-joint-score-alpha", type=float, default=0.0,
                    help="MUSE Eq.6 beta. 0=raw absolute score only; 1=pure relative.")
 
-    # M-new1 / B2 / M1: weight blending S_cls (CLS only) and S_patch (GeM only)
+    # weight blending S_cls (CLS only) and S_patch (GeM only)
     # when embedding_mode=two_stream. Paper Eq.4 uses alpha=0.5.
     p.add_argument("--dino-stream-alpha", type=float, default=0.5,
                    help="two_stream: S_int = alpha*S_cls + (1-alpha)*S_patch.")
 
-    # M3: how the relative score is derived from class scores. MUSE Eq.5
-    # uses softmax(S_abs/tau); legacy implementation used mean-subtraction.
+    # how the relative score is derived from class scores.
     p.add_argument("--dino-relative-score-mode",
                    choices=["mean_sub", "softmax_tau"],
                    default="mean_sub")
     p.add_argument("--dino-tau", type=float, default=0.02,
                    help="Temperature for the softmax-tau relative score.")
 
-    # M4: per-proposal objectness prior. MUSE Eq.8 uses P(O|p)^gamma.
-    # 0 disables the prior entirely (default). Paper uses 0.1.
+    # per-proposal objectness prior. MUSE Eq.8 uses P(O|p)^gamma.
     p.add_argument("--dino-objectness-prior-gamma", type=float, default=0.0,
                    help="Power exponent on per-proposal box-objectness prior.")
 
-    # M-new5: PCA-whiten the reference bank. 0 disables.
+    # PCA-whiten the reference bank. 0 disables.
     p.add_argument("--dino-bank-pca-dim", type=int, default=0,
                    help="Project bank+queries to this many PCA-whitened dims.")
 
-    # B2 / M1: true per-patch token matching for disambiguation.
+    # true per-patch token matching for disambiguation.
     # Active only when --dino-embedding-mode patch_match.
     p.add_argument("--dino-patch-match-lowe-ratio", type=float, default=1.05,
                    help="Lowe ratio (best/second-best) for patch_match. "
@@ -4216,52 +4181,40 @@ def parse_args() -> argparse.Namespace:
                    help="Pixel-sum threshold for deriving the foreground patch "
                         "mask from a pre-masked reference image.")
 
-    # M-new6: convenience preset — once set, every --dino-* / --gdino-* flag
+    # convenience preset — once set, every --dino-* / --gdino-* flag
     # left at its default is overridden with MUSE paper values. Explicit flags
     # always win. Implemented in parse_args() post-processing.
     p.add_argument("--muse-preset", action="store_true",
                    help="Apply MUSE-paper defaults for the unset DINO/GDINO flags.")
 
-    # M-new3: convenience — replace --gdino-text-prompts with the generic
-    # MUSE-style "items" prompt at runtime. Detection becomes class-agnostic;
-    # DINO then names everything.
+  
     p.add_argument("--gdino-use-items-prompt", action="store_true",
                    help="Override --gdino-text-prompts with the literal 'items'.")
-    # B2: hardcoded cooling_f vs cooling_screw aspect rule. On for back-compat;
-    # disable once MUSE features make the rule redundant (and dangerous if
-    # extended to new objects).
-    p.add_argument("--use-aspect-cf-cs-rule", action="store_true", default=True)
-    p.add_argument("--no-aspect-cf-cs-rule", dest="use_aspect_cf_cs_rule",
-                   action="store_false")
 
-    # A8: bicubic-upscale DINO crops whose short side is below this many
-    # pixels (after the bbox+mask crop). 0 = off (current behaviour).
-    # 224 is a safe default since DINOv2 ultimately resizes to 518.
+    # bicubic-upscale DINO crops whose short side is below this many pixels
     p.add_argument("--dino-min-crop-side", type=int, default=0)
 
-    # D1: CLAHE preprocessing on the L channel of LAB before SAM. Off by
-    # default. Helps on low-contrast matte parts under flat lighting.
+    # CLAHE
     p.add_argument("--clahe-enabled", action="store_true")
     p.add_argument("--clahe-clip-limit", type=float, default=2.0)
     p.add_argument("--clahe-grid-size", type=int, default=8)
 
-    # D2: table-plane physical check. _pose_reason rejects poses with
-    # z_base outside this window. Defaults preserve current [0, 0.5] gate.
+
     p.add_argument("--table-plane-z-min", type=float, default=0.0)
     p.add_argument("--table-plane-z-max", type=float, default=0.5)
 
-    # Bundle 11: skip DINO classification for masks that match a recently
-    # healthy tracker mask (by IoU). Off by default — flip on when the
-    # video tracker is reliable enough to authoritatively name objects.
+
     p.add_argument("--skip-dino-when-tracker-healthy", action="store_true")
     p.add_argument("--tracker-health-iou-threshold", type=float, default=0.5)
     p.add_argument("--tracker-health-stale-frames", type=int, default=5)
     p.add_argument("--tracker-health-max-occlusion", type=float, default=0.4)
+    p.add_argument("--identity-shortcut-max-centroid-dist-m", type=float, default=0.05)
+    p.add_argument("--identity-shortcut-ambiguity-radius-m", type=float, default=0.05)
+    p.add_argument("--memory-rerank-require-track-consistency", action="store_true", default=True)
+    p.add_argument("--no-memory-rerank-require-track-consistency",
+                   dest="memory_rerank_require_track_consistency",
+                   action="store_false")
 
-    # Bundle 11: mask preprocessing before depth lift / ICP. Both 0 by
-    # default to preserve current behaviour. Sane starting values would be
-    # close-kernel=5 (fills 5px specular holes) and erosion=3 (drops
-    # boundary pixels with the noisiest ZED depth).
     p.add_argument("--icp-mask-close-kernel", type=int, default=0)
     p.add_argument("--icp-mask-interior-erosion", type=int, default=0)
 
@@ -4285,9 +4238,7 @@ def parse_args() -> argparse.Namespace:
 
     args = p.parse_args()
 
-    # M-new6: --muse-preset — apply MUSE paper defaults to any DINO/GDINO
-    # flag the user did NOT explicitly set on the command line. Explicit
-    # flags always win.
+    # --muse-preset — apply MUSE paper defaults to any DINO/GDINO
     if bool(getattr(args, "muse_preset", False)):
         import sys as _sys
         cli_tokens = {tok.split("=", 1)[0] for tok in _sys.argv[1:] if tok.startswith("--")}
@@ -4297,10 +4248,6 @@ def parse_args() -> argparse.Namespace:
                 setattr(args, attr, value)
 
         # Paper defaults (Section 4.1): alpha=0.5, beta=0.8, tau=0.02, gamma=0.1.
-        # We map: stream_alpha=alpha, joint_score_alpha=beta, tau=tau,
-        # objectness_prior_gamma=gamma. We also flip on tanimoto and the
-        # softmax-tau relative score, switch to two_stream embeddings, and use
-        # the MUSE GeM exponent e=1.5.
         _maybe_set("--dino-embedding-mode", "dino_embedding_mode", "two_stream")
         _maybe_set("--dino-similarity",     "dino_similarity",     "tanimoto")
         _maybe_set("--dino-stream-alpha",   "dino_stream_alpha",   0.5)
@@ -4311,10 +4258,7 @@ def parse_args() -> argparse.Namespace:
         _maybe_set("--dino-gem-p",          "dino_gem_p",          1.5)
         # Paper prompts GDINO with the generic 'items' token.
         _maybe_set("--gdino-use-items-prompt", "gdino_use_items_prompt", True)
-        # B2 / M1 patch_match defaults are tuned for cosine on DINOv2
-        # patch tokens; users can opt in by passing --dino-embedding-mode
-        # patch_match. The preset itself stays on two_stream so the existing
-        # MUSE-paper pipeline reproduces without changes.
+    
 
     return args
 

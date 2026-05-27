@@ -4,12 +4,6 @@ fused_multicam_helpers.py
 Helper functions for multi-camera fused pose estimation.
 Used by both init (dual-FP + ICP refinement + weighted average)
 and tracking (Cutie per-cam + fused ICP).
-
-Changes from original:
-  - lift_masked_depth_to_base: added depth_bias_m param for per-camera depth correction
-  - merge_point_clouds_weighted: new function for distance-weighted cloud merging
-  - MedianPoseBuffer: new class for temporal outlier filtering at zero compute cost
-  - apply_x_bias_correction: utility for systematic x-axis correction
 """
 from __future__ import annotations
 
@@ -58,15 +52,6 @@ def fill_depth_holes_in_mask(
     median blur, leaving outside-mask pixels untouched. Cheap (a single
     cv2.medianBlur on uint16) and good enough for the small holes ZED
     leaves on shiny / black surfaces.
-
-    Args:
-        depth: (H, W) float depth in metres.
-        mask:  (H, W) bool mask where holes should be filled.
-        kernel: 3 or 5 (cv2.medianBlur on uint16 only supports these).
-
-    Returns:
-        New depth array with holes inside `mask` replaced by the local
-        median of valid neighbours. Out-of-mask pixels are unchanged.
     """
     import cv2
 
@@ -108,17 +93,6 @@ def lift_masked_depth_to_base(
     """
     Unproject masked depth pixels into 3D, transform to base frame.
     Returns an Open3D PointCloud (voxel-downsampled) or None if too few points.
-
-    Args:
-        depth_bias_m: per-camera depth offset correction (added to raw depth).
-                      Positive = sensor reads too short, negative = too long.
-                      Calibrate by comparing known-distance measurements.
-        mask_morph_close_kernel: optional cv2 close-kernel size to fill
-                      pinholes in the mask (specular speckles, partial
-                      occluders) before sampling. 0 disables.
-        mask_interior_erosion: optional erosion radius in px applied after
-                      close. Drops boundary pixels (noisiest depth).
-                      0 disables.
     """
     mask_bool = np.asarray(mask).astype(bool)
     if mask_bool.sum() < 10:
@@ -205,18 +179,6 @@ def merge_point_clouds_weighted(
     """
     Merge point clouds with distance-based weighting.
 
-    Points from closer cameras are weighted higher because:
-    1. Depth sensors are more accurate at shorter range
-    2. Calibration errors scale with distance from origin
-
-    Instead of naive concatenation + voxel downsample (which averages equally),
-    this creates a weighted voxel grid where closer-camera points dominate.
-
-    Args:
-        clouds: list of per-camera point clouds in base frame
-        cam_positions_base: list of camera origin positions in base frame
-        voxel_size: voxel downsample size
-        distance_exponent: higher = more aggressive close-camera preference
     """
     if not clouds:
         return None
@@ -292,15 +254,6 @@ def run_icp_in_base_frame(
     source = model points (object-local frame, transformed by T_init)
     target = scene points (already in base frame)
 
-    Args:
-        variant: "point_to_point" (default, geometry-only) or "point_to_plane"
-                 (penalises normal-direction error; better on flat faces / cylinders).
-                 If "point_to_plane" is requested, scene normals are estimated
-                 if absent (model normals are not needed since model is the source).
-        normal_radius: search radius for normal estimation when variant requires it.
-
-    Returns:
-        T_base_object_refined (4x4 float32), fitness, rmse
     """
     T_init = np.asarray(T_base_object_init, dtype=np.float64).reshape(4, 4)
 

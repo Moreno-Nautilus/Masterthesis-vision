@@ -1,13 +1,6 @@
 """
 ICP-based pose refinement for 6DoF tracking.
 
-Given a tracked mask and depth image, refines the object pose using
-point cloud registration.
-
-Primary: Colored ICP (uses both geometry and color)
-Fallback: FilterReg, TEASER++ (if accuracy needs improvement)
-
-Install: pip install open3d
 """
 
 from __future__ import annotations
@@ -18,14 +11,11 @@ from enum import Enum
 from typing import Optional
 
 import numpy as np
-import copy
 
 
 class ICPVariant(Enum):
     POINT_TO_POINT = "point_to_point"
     POINT_TO_PLANE = "point_to_plane"
-    COLORED = "colored"
-    GENERALIZED = "generalized"  # GICP
 
 
 @dataclass
@@ -33,21 +23,15 @@ class ICPConfig:
     """Configuration for ICP pose refinement."""
     
     # ICP variant
-    variant: ICPVariant = ICPVariant.COLORED
+    variant: ICPVariant = ICPVariant.POINT_TO_POINT
     
     # Convergence criteria
     max_iterations: int = 30
     relative_fitness: float = 1e-6
     relative_rmse: float = 1e-6
-    
-    # Max correspondence distance (meters)
-    # Larger = more robust to initial misalignment, but slower
+
     max_correspondence_distance: float = 0.02  # 2cm
-    
-    # For colored ICP: weight of color vs geometry [0, 1]
-    # 0 = geometry only, 1 = color only
-    lambda_geometric: float = 0.968  # Default from Open3D
-    
+
     # Voxel downsampling for speed (meters, None = no downsampling)
     voxel_size: Optional[float] = 0.002  # 2mm
     
@@ -84,7 +68,7 @@ class ICPRefiner:
     
     Usage:
         refiner = ICPRefiner(ICPConfig())
-        refiner.set_model_cloud(mesh_vertices, mesh_colors)  # Once per object
+        refiner.set_model_cloud(mesh_vertices)  # Once per object
         
         for frame in video:
             result = refiner.refine(
@@ -115,7 +99,6 @@ class ICPRefiner:
     def set_model_cloud(
         self,
         vertices: np.ndarray,
-        colors: Optional[np.ndarray] = None,
         normals: Optional[np.ndarray] = None,
     ) -> None:
         """
@@ -123,7 +106,6 @@ class ICPRefiner:
         
         Args:
             vertices: (N, 3) float32 points in object frame
-            colors: (N, 3) float32 RGB colors [0, 1], optional
             normals: (N, 3) float32 normals, optional (computed if not given)
         """
         self._lazy_import()
@@ -131,10 +113,7 @@ class ICPRefiner:
         
         self._model_cloud = o3d.geometry.PointCloud()
         self._model_cloud.points = o3d.utility.Vector3dVector(vertices.astype(np.float64))
-        
-        if colors is not None:
-            self._model_cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-            
+
         if normals is not None:
             self._model_cloud.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
         else:
@@ -177,9 +156,8 @@ class ICPRefiner:
         
         vertices = np.asarray(cloud.points, dtype=np.float32)
         normals = np.asarray(cloud.normals, dtype=np.float32)
-        colors = np.asarray(cloud.colors, dtype=np.float32) if cloud.has_colors() else None
         
-        self.set_model_cloud(vertices, colors, normals)
+        self.set_model_cloud(vertices, normals=normals)
 
     def _depth_to_cloud(self, depth, rgb, mask, K):
         o3d = self._o3d
@@ -244,13 +222,6 @@ class ICPRefiner:
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(points)
 
-        # Only add colors if needed (colored ICP)
-        need_colors = self.cfg.variant == ICPVariant.COLORED
-        if need_colors:
-            rgb_c = rgb[y0:y1, x0:x1]
-            rgb_masked = rgb_c[mask_c][valid]
-            cloud.colors = o3d.utility.Vector3dVector(rgb_masked.astype(np.float64) / 255.0)
-
         # Skip outlier removal during tracking (Cutie mask is clean)
         if self.cfg.remove_statistical_outliers:
             cloud, _ = cloud.remove_statistical_outlier(
@@ -261,7 +232,7 @@ class ICPRefiner:
             cloud = cloud.voxel_down_sample(self.cfg.voxel_size)
 
         # Only estimate normals if ICP variant needs them
-        need_normals = self.cfg.variant in (ICPVariant.POINT_TO_PLANE, ICPVariant.COLORED, ICPVariant.GENERALIZED)
+        need_normals = self.cfg.variant == ICPVariant.POINT_TO_PLANE
         if need_normals and len(cloud.points) >= 10:
             normal_radius = max(0.01, 3.0 * (self.cfg.voxel_size or 0.002))
             cloud.estimate_normals(
@@ -333,26 +304,6 @@ class ICPRefiner:
                     criteria=criteria,
                 )
 
-            elif self.cfg.variant == ICPVariant.COLORED:
-                result = o3d.pipelines.registration.registration_colored_icp(
-                    source=source_model,
-                    target=observed_cloud,
-                    max_correspondence_distance=self.cfg.max_correspondence_distance,
-                    init=T_init64,
-                    estimation_method=o3d.pipelines.registration.TransformationEstimationForColoredICP(
-                        lambda_geometric=self.cfg.lambda_geometric,
-                    ),
-                    criteria=criteria,
-                )
-
-            elif self.cfg.variant == ICPVariant.GENERALIZED:
-                result = o3d.pipelines.registration.registration_generalized_icp(
-                    source=source_model,
-                    target=observed_cloud,
-                    max_correspondence_distance=self.cfg.max_correspondence_distance,
-                    init=T_init64,
-                    criteria=criteria,
-                )
             else:
                 raise ValueError(f"Unknown ICP variant: {self.cfg.variant}")
 
