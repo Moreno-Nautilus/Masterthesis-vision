@@ -18,3 +18,17 @@ init_renders/
 install/
 Legacy/
 *.pt
+
+# Local editor/assistant config
+.claude/
+.codex
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated outputs / build artifacts
+init_renders/
+install/
+plots/
