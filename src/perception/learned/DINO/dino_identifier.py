@@ -31,8 +31,6 @@ class DINOIdentifierConfig:
 
     # MUSE two-stream patch pooling exponent.
     gem_p: float = 1.5
-    # PCA-whiten reference bank before matching. 0 disables.
-    bank_pca_dim: int = 0
     # When False, suppresses all status/info prints from this module.
     verbose: bool = False
 
@@ -64,8 +62,6 @@ class DINOIdentifier:
         self.reference_bank: list[ReferenceEmbedding] = []
         self.reference_matrix: np.ndarray | None = None
         self.reference_object_ids: list[str] = []
-        self._pca_mean: np.ndarray | None = None  # (D,)
-        self._pca_components: np.ndarray | None = None  # (k, D)
 
     def _build_model(self) -> torch.nn.Module:
         model = torch.hub.load("facebookresearch/dinov2", self.cfg.model_name)
@@ -177,6 +173,12 @@ class DINOIdentifier:
                 cached_paths = list(cached["image_paths"])
                 cached_object_ids = list(cached["object_ids"])
                 cached_embeddings = cached["embeddings"]
+                expected_dim = int(getattr(self.model, "embed_dim", cached_embeddings.shape[-1]))
+                cache_shape_ok = (
+                    cached_embeddings.ndim == 3
+                    and cached_embeddings.shape[1] == 2
+                    and cached_embeddings.shape[2] == expected_dim
+                )
 
                 # Verify cache matches current folder structure (across all roots).
                 current_paths = []
@@ -186,7 +188,7 @@ class DINOIdentifier:
                             if img_path.suffix.lower() in self.cfg.allowed_exts:
                                 current_paths.append(str(img_path))
 
-                if cached_paths == current_paths:
+                if cached_paths == current_paths and cache_shape_ok:
                     # Cache is valid, use it
                     bank = []
                     for i, (obj_id, img_path, emb) in enumerate(
@@ -202,10 +204,14 @@ class DINOIdentifier:
                     self.reference_bank = bank
                     self.reference_matrix = cached_embeddings
                     self.reference_object_ids = cached_object_ids
-                    self._maybe_fit_bank_pca()
                     if self.cfg.verbose:
                         print(f"[DINO] Loaded {len(bank)} embeddings from cache")
                     return
+                if self.cfg.verbose and cached_paths == current_paths and not cache_shape_ok:
+                    print(
+                        f"[DINO] Cache shape mismatch, rebuilding: "
+                        f"{cached_embeddings.shape} expected (*, 2, {expected_dim})"
+                    )
             except Exception as e:
                 if self.cfg.verbose:
                     print(f"[DINO] Cache load failed, rebuilding: {e}")
@@ -242,7 +248,6 @@ class DINOIdentifier:
         self.reference_bank = bank
         self.reference_matrix = np.stack([r.embedding for r in bank], axis=0)
         self.reference_object_ids = [r.object_id for r in bank]
-        self._maybe_fit_bank_pca()
 
         # Save cache
         try:
@@ -269,83 +274,6 @@ class DINOIdentifier:
         rr = np.sum(bank * bank, axis=1)
         denom = qq + rr - qr
         return qr / np.maximum(denom, 1e-12)
-
-    # ── PCA / whitening on the reference bank ──────────────────────────────
-    def _maybe_fit_bank_pca(self) -> None:
-        """Fit a PCA-whitening projection on the current reference matrix.
-        """
-        k = int(self.cfg.bank_pca_dim)
-        if k <= 0 or self.reference_matrix is None:
-            self._pca_mean = None
-            self._pca_components = None
-            return
-        mat = self.reference_matrix
-        if mat.ndim == 2:
-            self._pca_mean, self._pca_components = self._fit_one_pca(mat, k)
-            self.reference_matrix = self._apply_pca(mat, self._pca_mean, self._pca_components)
-        elif mat.ndim == 3 and mat.shape[1] == 2:
-            mean_a, comp_a = self._fit_one_pca(mat[:, 0, :], k)
-            mean_b, comp_b = self._fit_one_pca(mat[:, 1, :], k)
-            self._pca_mean = np.stack([mean_a, mean_b], axis=0)        # (2, D)
-            self._pca_components = np.stack([comp_a, comp_b], axis=0)  # (2, k, D)
-            proj_a = self._apply_pca(mat[:, 0, :], mean_a, comp_a)
-            proj_b = self._apply_pca(mat[:, 1, :], mean_b, comp_b)
-            self.reference_matrix = np.stack([proj_a, proj_b], axis=1)  # (N, 2, k)
-        else:
-            if self.cfg.verbose:
-                print(f"[DINO] PCA skipped: unsupported bank shape {mat.shape}")
-            self._pca_mean = None
-            self._pca_components = None
-
-    @staticmethod
-    def _fit_one_pca(mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """Return (mean (D,), whitened_components (k, D)).
-        """
-        mat = np.asarray(mat, dtype=np.float32)
-        mean = mat.mean(axis=0)
-        centred = mat - mean
-        _, s, vt = np.linalg.svd(centred, full_matrices=False)
-        k_eff = max(1, min(k, vt.shape[0]))
-        vt_k = vt[:k_eff]
-        s_k = s[:k_eff]
-        eps = 1e-6 * (float(s.max()) if s.size > 0 else 1.0)
-        scale = 1.0 / (s_k + eps)  # (k,)
-        comp = vt_k * scale[:, None]  # (k, D), whitened
-        return mean.astype(np.float32), comp.astype(np.float32)
-
-    @staticmethod
-    def _apply_pca(
-        mat: np.ndarray,
-        mean: np.ndarray,
-        components: np.ndarray,
-    ) -> np.ndarray:
-        centred = mat - mean
-        proj = centred @ components.T  # (N, k)
-        # L2-renormalise projected vectors before matching.
-        n = np.linalg.norm(proj, axis=1, keepdims=True) + 1e-12
-        return (proj / n).astype(np.float32)
-
-    def _maybe_project_query(self, query: np.ndarray) -> np.ndarray:
-        """Apply the fitted PCA projection (if any) to a query embedding."""
-        if self._pca_mean is None or self._pca_components is None:
-            return query
-        if query.ndim == 1 and self._pca_components.ndim == 2:
-            return self._apply_pca(query.reshape(1, -1), self._pca_mean, self._pca_components).squeeze(0)
-        if query.ndim == 2 and self._pca_components.ndim == 3:
-            # two_stream: query (2, D), components (2, k, D), mean (2, D)
-            out = np.stack(
-                [
-                    self._apply_pca(
-                        query[i].reshape(1, -1),
-                        self._pca_mean[i],
-                        self._pca_components[i],
-                    ).squeeze(0)
-                    for i in range(query.shape[0])
-                ],
-                axis=0,
-            )
-            return out
-        return query
 
     # ── per-class score aggregation helpers ────────────────────────────────
     def _aggregate_per_class(
@@ -383,8 +311,6 @@ class DINOIdentifier:
                 "MUSE DINO classification expects query shape (2, D) and "
                 "reference bank shape (N, 2, D)."
             )
-
-        embedding = self._maybe_project_query(embedding)
 
         # Compute S_cls and S_patch independently and blend (MUSE Eq.4).
         q_cls = embedding[0:1, :]

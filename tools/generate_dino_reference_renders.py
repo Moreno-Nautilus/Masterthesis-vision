@@ -37,6 +37,20 @@ import numpy as np
 import open3d as o3d
 
 
+# 3D-printed plastic parts: cooling pieces are blue, pb pieces are brown.
+COOLING_COLOR = [0.06, 0.18, 0.55]
+PB_COLOR = [0.11, 0.07, 0.04]
+DEFAULT_COLOR = [0.65, 0.65, 0.7]
+
+
+def pick_color(obj_id: str) -> list[float]:
+    if obj_id.startswith("cooling"):
+        return COOLING_COLOR
+    if obj_id.startswith("pb"):
+        return PB_COLOR
+    return DEFAULT_COLOR
+
+
 def fibonacci_sphere(n: int) -> np.ndarray:
     """n unit vectors approximately uniform on the sphere."""
     if n <= 0:
@@ -80,6 +94,7 @@ def render_object_views(
     mesh_scale: float,
     distance_scale: float = 3.0,
     pad_px: int = 8,
+    color: list[float] | None = None,
 ) -> int:
     """Render `n_views` viewpoints of the mesh; returns count written."""
     mesh = o3d.io.read_triangle_mesh(str(mesh_path))
@@ -92,10 +107,10 @@ def render_object_views(
     mesh.scale(mesh_scale, center=(0.0, 0.0, 0.0))
     mesh.translate(-mesh.get_center())
 
-    # Apply a default colour if the mesh has no per-vertex colour, so DINO
-    # gets a non-flat appearance even on plain meshes.
-    if not mesh.has_vertex_colors():
-        mesh.paint_uniform_color([0.65, 0.65, 0.7])
+    # Paint the mesh to roughly match the real part's appearance. We always
+    # override vertex colors here because CAD meshes either lack them or
+    # carry colors that don't reflect the printed plastic.
+    mesh.paint_uniform_color(color if color is not None else DEFAULT_COLOR)
 
     aabb = mesh.get_axis_aligned_bounding_box()
     extent = float(np.linalg.norm(aabb.get_extent()))
@@ -110,6 +125,8 @@ def render_object_views(
 
     mat = o3d.visualization.rendering.MaterialRecord()
     mat.shader = "defaultLit"
+    mat.base_roughness = 1.0
+    mat.base_reflectance = 0.2
     scene.add_geometry("mesh", mesh, mat)
 
     fov_deg = 60.0
@@ -128,8 +145,10 @@ def render_object_views(
         img = renderer.render_to_image()
         rgb = np.asarray(img)  # (H, W, 3) uint8
 
-        # Crop to silhouette using non-black pixels.
-        non_bg = rgb.sum(axis=2) > 0
+        # Crop to silhouette using non-black pixels. Threshold above the
+        # faint ambient scatter on the background (defaultLit + matte
+        # material spills a little light across the scene).
+        non_bg = rgb.max(axis=2) > 15
         if not non_bg.any():
             continue
         ys, xs = np.where(non_bg)
@@ -195,6 +214,7 @@ def main() -> None:
             mesh_scale=args.mesh_scale,
             distance_scale=args.distance_scale,
             pad_px=args.pad_px,
+            color=pick_color(obj_id),
         )
         print(f"[render] {obj_id}: {n} views -> {obj_out}")
         total += n

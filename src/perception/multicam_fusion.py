@@ -126,7 +126,7 @@ def compute_cloud_centroid(pts: np.ndarray) -> np.ndarray:
 def _arbitrate_label(
     group: list[PerCamDetection],
     min_margin: float = 0.10,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, float, str, float, float]:
     """Pick the class label for a matched group by summed raw-DINO voting.
 
     Each member contributes its *raw per-class* DINO score (from
@@ -142,13 +142,14 @@ def _arbitrate_label(
     when `scores_by_object` is empty.
 
     Returns:
-        (winner_label, ambiguous_flag). When `ambiguous_flag` is True, the
+        (winner_label, ambiguous_flag, winner_score, runner_label,
+        runner_score, margin). When `ambiguous_flag` is True, the
         top-1 and top-2 summed scores are within `min_margin` of each
         other — the caller should drop the cluster rather than commit to a
         coin-flip class assignment.
     """
     if not group:
-        return "", False
+        return "", False, 0.0, "", 0.0, 0.0
 
     candidate_labels: set[str] = set()
     for d in group:
@@ -157,7 +158,7 @@ def _arbitrate_label(
         if d.object_id:
             candidate_labels.add(d.object_id)
     if not candidate_labels:
-        return group[0].object_id, False
+        return group[0].object_id, False, float(group[0].dino_score), "", 0.0, float(group[0].dino_score)
 
     sums: dict[str, float] = {lbl: 0.0 for lbl in candidate_labels}
     for d in group:
@@ -171,17 +172,22 @@ def _arbitrate_label(
     ranked = sorted(sums.items(), key=lambda kv: (-kv[1], kv[0]))
     winner_lbl, winner_score = ranked[0]
     if len(ranked) > 1:
-        runner_score = ranked[1][1]
-        ambiguous = (winner_score - runner_score) < float(min_margin)
+        runner_lbl, runner_score = ranked[1]
+        margin = float(winner_score - runner_score)
+        ambiguous = margin < float(min_margin)
     else:
+        runner_lbl = ""
+        runner_score = 0.0
+        margin = float(winner_score)
         ambiguous = False
-    return winner_lbl, ambiguous
+    return winner_lbl, ambiguous, float(winner_score), runner_lbl, float(runner_score), margin
 
 
 def match_detections_across_cameras(
     detections_by_cam: dict[str, list[PerCamDetection]],
     max_centroid_distance: float = 0.08,
-    label_arbitration_min_margin: float = 0.10,
+    label_arbitration_min_margin: float = 0.05,
+    label_arbitration_singleton_margin: float = 0.01,
 ) -> list[list[PerCamDetection]]:
     """
     Cluster detections across cameras by 3D centroid proximity (geometry-first),
@@ -254,16 +260,43 @@ def match_detections_across_cameras(
             cost[ia_best, ib_best] = np.inf
             continue
         group = [dets_a[ia_best], dets_b[ib_best]]
-        winner, ambiguous = _arbitrate_label(
+        winner, ambiguous, winner_score, runner, runner_score, margin = _arbitrate_label(
             group, min_margin=label_arbitration_min_margin,
         )
         if ambiguous:
+            if margin >= float(label_arbitration_singleton_margin):
+                winner_members = [d for d in group if d.object_id == winner]
+                keep = max(
+                    winner_members or group,
+                    key=lambda d: float(d.dino_score),
+                )
+                drop_labels = [
+                    f"{d.cam_id}={d.object_id}({d.dino_score:.2f})"
+                    for d in group if d is not keep
+                ]
+                print(
+                    f"[FUSION] LABEL WEAK at "
+                    f"{tuple(np.round(dets_a[ia_best].centroid_base, 3))}: "
+                    f"{cam_a}={dets_a[ia_best].object_id}({dets_a[ia_best].dino_score:.2f}) "
+                    f"+ {cam_b}={dets_b[ib_best].object_id}({dets_b[ib_best].dino_score:.2f}) "
+                    f"votes {winner}={winner_score:.2f} {runner}={runner_score:.2f} "
+                    f"margin={margin:.2f} -> KEEP {keep.cam_id}={keep.object_id} "
+                    f"as single-cam, DROP {', '.join(drop_labels)}"
+                )
+                matched_groups.append([keep])
+                matched_a.add(ia_best)
+                matched_b.add(ib_best)
+                cost[ia_best, :] = np.inf
+                cost[:, ib_best] = np.inf
+                continue
             print(
                 f"[FUSION] LABEL AMBIGUOUS at "
                 f"{tuple(np.round(dets_a[ia_best].centroid_base, 3))}: "
                 f"{cam_a}={dets_a[ia_best].object_id}({dets_a[ia_best].dino_score:.2f}) "
                 f"+ {cam_b}={dets_b[ib_best].object_id}({dets_b[ib_best].dino_score:.2f}) "
-                f"-> DROP cluster (top-2 margin < {label_arbitration_min_margin:.2f})"
+                f"votes {winner}={winner_score:.2f} {runner}={runner_score:.2f} "
+                f"margin={margin:.2f} -> DROP cluster "
+                f"(margin < {label_arbitration_singleton_margin:.2f})"
             )
             dropped_a.add(ia_best)
             dropped_b.add(ib_best)
@@ -280,7 +313,8 @@ def match_detections_across_cameras(
                 f"{tuple(np.round(dets_a[ia_best].centroid_base, 3))}: "
                 f"{cam_a}={dets_a[ia_best].object_id}({dets_a[ia_best].dino_score:.2f}) "
                 f"+ {cam_b}={dets_b[ib_best].object_id}({dets_b[ib_best].dino_score:.2f}) "
-                f"-> {winner}"
+                f"votes {winner}={winner_score:.2f} {runner}={runner_score:.2f} "
+                f"margin={margin:.2f} -> {winner}"
             )
         for d in group:
             d.object_id = winner
@@ -512,12 +546,14 @@ class FusionConfig:
     icp_min_fitness: float = 0.10           # below this, skip ICP correction
     min_depth: float = 0.05
     max_depth: float = 3.0
-    # Cross-camera label arbitration: when summed per-class DINO votes for
-    # the top-1 and top-2 labels in a cluster differ by less than this, the
-    # cluster is declared ambiguous and dropped entirely (no group, no
-    # singleton fallback). Prevents confidently-wrong class assignments
-    # that would feed the wrong mesh into FoundationPose.
-    label_arbitration_min_margin: float = 0.10
+    # Cross-camera label arbitration is tiered by summed per-class DINO
+    # vote margin:
+    #   margin >= label_arbitration_min_margin: fuse under the winner label
+    #   singleton_margin <= margin < min_margin: keep the winner-side detection
+    #       as single-cam and consume the loser to avoid duplicate phantoms
+    #   margin < singleton_margin: drop both as a true coin flip
+    label_arbitration_min_margin: float = 0.05
+    label_arbitration_singleton_margin: float = 0.01
     debug_dir: str = ""                     # set to a path to dump debug PLY/PNG
     debug_enabled: bool = False
 
@@ -852,6 +888,7 @@ def run_multicam_fusion(
         dets_by_cam,
         max_centroid_distance=cfg.max_centroid_distance,
         label_arbitration_min_margin=cfg.label_arbitration_min_margin,
+        label_arbitration_singleton_margin=cfg.label_arbitration_singleton_margin,
     )
 
     results = []

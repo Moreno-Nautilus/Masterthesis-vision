@@ -69,9 +69,12 @@ class CutieTracker:
         
         self._orig_h, self._orig_w = rgb.shape[:2]
         
-        # Resize for memory efficiency
-        max_side = 480
-        scale = max_side / max(self._orig_h, self._orig_w)
+        # Resize for memory efficiency.
+        max_side = self.cfg.max_internal_size
+        scale = (
+            float(max_side) / float(max(self._orig_h, self._orig_w))
+            if max_side is not None and max_side > 0 else 1.0
+        )
         if scale < 1.0:
             self._new_h, self._new_w = int(self._orig_h * scale), int(self._orig_w * scale)
             rgb_small = cv2.resize(rgb, (self._new_w, self._new_h), interpolation=cv2.INTER_LINEAR)
@@ -167,4 +170,3 @@ class CutieTracker:
     @property
     def frame_count(self) -> int:
         return self._frame_count
-

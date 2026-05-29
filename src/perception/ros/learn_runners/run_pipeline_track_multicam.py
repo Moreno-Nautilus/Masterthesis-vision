@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import csv
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -72,6 +73,118 @@ from src.perception.fused_multicam_helpers import (
 _DEBUG_LOGGING = False
 
 
+FAST_CUTIE_PROFILE_OVERRIDES = {
+    "tracking_backend": "cutie",
+    "track_require_pose_origin_in_mask": True,
+    "track_pose_mask_margin_px": 8,
+    "track_icp_num_points": 800,
+    "fused_track_icp_max_iteration": 6,
+    "fused_track_icp_relative_fitness": 1e-3,
+    "fused_track_icp_relative_rmse": 1e-3,
+    "median_pose_buffer_size": 1,
+    "fused_track_max_chamfer_m": 0.018,
+    "fused_track_max_translation_speed_mps": 0.25,
+    "fused_track_max_rotation_speed_degps": 180.0,
+    "fused_track_min_translation_jump_m": 0.02,
+    "fused_track_min_rotation_jump_deg": 10.0,
+    "memory_crop_enable": False,
+    "skip_per_cam_icp_tracking": True,
+    "debug_frame_publish": False,
+    "debug_per_cam_pose_publish": False,
+    "debug_verbose_logs": False,
+    "debug_logging": False,
+    "disable_fused_kalman": True,
+    "disable_axis_jump_gate": True,
+    "chamfer_every_n_frames": 3,
+}
+
+
+ULTRAFAST_PROJECTED_ICP_PROFILE_OVERRIDES = {
+    "tracking_backend": "projected_icp",
+    "track_icp_num_points": 500,
+    "fused_track_icp_max_iteration": 4,
+    "fused_track_icp_relative_fitness": 1e-3,
+    "fused_track_icp_relative_rmse": 1e-3,
+    "median_pose_buffer_size": 1,
+    "fused_track_max_chamfer_m": 0.020,
+    "fused_track_max_translation_speed_mps": 0.35,
+    "fused_track_max_rotation_speed_degps": 240.0,
+    "fused_track_min_translation_jump_m": 0.025,
+    "fused_track_min_rotation_jump_deg": 12.0,
+    "memory_crop_enable": False,
+    "debug_frame_publish": False,
+    "debug_per_cam_pose_publish": False,
+    "debug_verbose_logs": False,
+    "debug_logging": False,
+    "disable_fused_kalman": True,
+    "disable_axis_jump_gate": True,
+    "chamfer_every_n_frames": 5,
+    "projected_icp_mask_dilate_px": 8,
+    "projected_icp_depth_margin_m": 0.060,
+    "projected_icp_min_depth_coverage": 0.08,
+    "projected_icp_min_cloud_points": 40,
+    "projected_icp_max_centroid_dist_m": 0.10,
+    "projected_icp_min_fitness": 0.08,
+    "projected_icp_max_rmse_m": 0.014,
+    "projected_icp_min_depth_overlap_ratio": 0.35,
+    "projected_icp_projection_points": 800,
+    "projected_icp_voxel_size_m": 0.003,
+    "projected_icp_max_correspondence_dist_m": 0.035,
+}
+
+
+def _apply_fast_cutie_profile(namespace: argparse.Namespace) -> None:
+    for key, value in FAST_CUTIE_PROFILE_OVERRIDES.items():
+        setattr(namespace, key, value)
+    setattr(namespace, "fast_cutie", True)
+    setattr(namespace, "tracking_profile", "fast_cutie")
+
+
+def _apply_ultrafast_projected_icp_profile(namespace: argparse.Namespace) -> None:
+    for key, value in ULTRAFAST_PROJECTED_ICP_PROFILE_OVERRIDES.items():
+        setattr(namespace, key, value)
+    setattr(namespace, "fast_cutie", False)
+    setattr(namespace, "ultrafast_projected_icp", True)
+    setattr(namespace, "tracking_profile", "ultrafast_projected_icp")
+
+
+def _apply_default_tracking_profile(
+    parser: argparse.ArgumentParser,
+    namespace: argparse.Namespace,
+) -> None:
+    for key in set(FAST_CUTIE_PROFILE_OVERRIDES) | set(ULTRAFAST_PROJECTED_ICP_PROFILE_OVERRIDES):
+        setattr(namespace, key, parser.get_default(key))
+    setattr(namespace, "fast_cutie", False)
+    setattr(namespace, "ultrafast_projected_icp", False)
+    setattr(namespace, "tracking_profile", "default")
+
+
+class _FastCutieAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _apply_fast_cutie_profile(namespace)
+
+
+class _UltrafastProjectedICPAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _apply_ultrafast_projected_icp_profile(namespace)
+
+
+class _TrackingProfileAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values == "fast_cutie":
+            _apply_fast_cutie_profile(namespace)
+        elif values == "ultrafast_projected_icp":
+            _apply_ultrafast_projected_icp_profile(namespace)
+        else:
+            _apply_default_tracking_profile(parser, namespace)
+
+
 def _dprint(*args, **kwargs) -> None:
     if _DEBUG_LOGGING:
         print(*args, **kwargs)
@@ -120,7 +233,7 @@ class PoseKalmanFilter:
     Simple Kalman filter for 6DoF pose prediction.
     Tracks position and velocity, predicts next position.
     """
-    
+
     def __init__(self, process_noise: float = 0.01, measurement_noise: float = 0.002):
         """
         Args:
@@ -842,7 +955,6 @@ class FoundationPoseTrackerNode(Node):
                 reference_dir=primary_ref,
                 use_masked_background=False,
                 gem_p=float(args.dino_gem_p),
-                bank_pca_dim=int(args.dino_bank_pca_dim),
                 verbose=bool(getattr(args, "debug_logging", False)),
             )
         )
@@ -854,8 +966,7 @@ class FoundationPoseTrackerNode(Node):
             f"DINO cfg | mode={MUSE_EMBEDDING_MODE} sim={MUSE_SIMILARITY} "
             f"gem_p={args.dino_gem_p} stream_alpha={MUSE_STREAM_ALPHA} "
             f"beta(joint)={MUSE_JOINT_SCORE_ALPHA} rel={MUSE_RELATIVE_SCORE_MODE} "
-            f"tau={MUSE_TAU} gamma(prior)={MUSE_OBJECTNESS_PRIOR_GAMMA} "
-            f"pca_dim={args.dino_bank_pca_dim}"
+            f"tau={MUSE_TAU} gamma(prior)={MUSE_OBJECTNESS_PRIOR_GAMMA}"
         )
         self.dino.build_reference_bank_from_folder(extra_dirs=extra_refs)
         self.get_logger().info(
@@ -943,24 +1054,27 @@ class FoundationPoseTrackerNode(Node):
         self.pub_debug_frame: dict[str, Any] = {}
 
 
-        # Pre-warm Cutie to avoid 2.5s delay on first track.
-        if str(getattr(args, "video_tracker", "cutie")).lower() == "sam2":
-            self.get_logger().info("Skipping Cutie pre-warm (video_tracker=sam2)")
+        self._cutie_prewarmer = None
+        if str(getattr(args, "tracking_backend", "cutie")).lower() == "projected_icp":
+            self.get_logger().info("Skipping Cutie pre-warm (tracking_backend=projected_icp)")
         else:
             self.get_logger().info("Pre-warming Cutie model...")
             self._cutie_prewarmer = CutieTracker(CutieConfig())
             self._cutie_prewarmer._lazy_load()
             self.get_logger().info("Cutie pre-warmed")
 
-        for c in CAMERAS:
-            cid = c.cam_id
-            self.pub_debug_frame[cid] = self.create_publisher(
-                DebugFrame, f"/perception/fp/debug_frame/{cid}", FAST_QOS
-            )
+        if self._debug_frame_publish_enabled():
+            for c in CAMERAS:
+                cid = c.cam_id
+                self.pub_debug_frame[cid] = self.create_publisher(
+                    DebugFrame, f"/perception/fp/debug_frame/{cid}", FAST_QOS
+                )
 
         self.timer = self.create_timer(args.timer_period_s, self._tick)
         self.get_logger().info(
-            f"FoundationPoseTrackerNode started | run_mode={self.args.run_mode}"
+            f"FoundationPoseTrackerNode started | run_mode={self.args.run_mode} "
+            f"tracking_backend={getattr(self.args, 'tracking_backend', 'cutie')} "
+            f"profile={getattr(self.args, 'tracking_profile', 'default')}"
         )
         self._depth_bias_by_cam = {
             "zed2i_1": float(self.args.cam1_depth_bias_m),
@@ -985,6 +1099,35 @@ class FoundationPoseTrackerNode(Node):
         self._track_id_to_object_id: dict[str, str] = {}
         self._claimed_track_ids_this_init: set[str] = set()
 
+        self._track_pose_log_path: Optional[Path] = None
+        if bool(getattr(args, "log_track_poses", False)):
+            self._track_pose_log_path = Path(str(args.track_pose_log_path))
+            self._track_pose_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._track_pose_log_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "stamp_s",
+                    "frame",
+                    "object_id",
+                    "track_id",
+                    "pose_source",
+                    "accepted",
+                    "pose_status",
+                    "lost_count",
+                    "mode",
+                    "pose_mode",
+                    "cams",
+                    "tx",
+                    "ty",
+                    "tz",
+                    "fitness",
+                    "rmse_mm",
+                    "chamfer_mm",
+                    "projected_overlap",
+                    "dt_mm",
+                    "drot_deg",
+                    "reason",
+                ])
 
         self._consecutive_chamfer_fails: dict[str, int] = {}
         self._last_reinit_time: dict[str, float] = {}
@@ -1235,6 +1378,9 @@ class FoundationPoseTrackerNode(Node):
                 PoseStamped, f"/perception/fp/pose_base_track/{key}", FAST_QOS
             )
         return self.pub_pose_base_track[key]
+
+    def _debug_frame_publish_enabled(self) -> bool:
+        return bool(getattr(self.args, "debug_frame_publish", True))
 
     def _publish_pose_base(
         self,
@@ -2000,25 +2146,6 @@ class FoundationPoseTrackerNode(Node):
                 if self.args.dino_min_margin > 0.0 and margin < self.args.dino_min_margin:
                     object_id = "unknown"
 
-            # softmax-entropy gate
-            if (
-                self.args.dino_entropy_threshold > 0.0
-                and object_id != "unknown"
-                and len(decision_scores) >= 2
-            ):
-                tau = max(1e-3, float(self.args.dino_entropy_tau))
-                logits = np.array(list(decision_scores.values()), dtype=np.float64) / tau
-                logits -= logits.max()
-                probs = np.exp(logits)
-                probs /= probs.sum() + 1e-12
-                entropy = float(-(probs * np.log(probs + 1e-12)).sum())
-                if entropy > self.args.dino_entropy_threshold:
-                    self.get_logger().info(
-                        f"DINO entropy reject {object_id}: H={entropy:.3f} > "
-                        f"{self.args.dino_entropy_threshold:.3f}"
-                    )
-                    object_id = "unknown"
-
             area_ratio = float(cand.area) / img_area
             x0, y0, x1, y1 = cand.bbox_xyxy
             bbox_area = max(1, (x1 - x0) * (y1 - y0))
@@ -2151,6 +2278,78 @@ class FoundationPoseTrackerNode(Node):
         except Exception:
             return None
 
+    @staticmethod
+    def _csv_float(value: Any, digits: int = 6) -> str:
+        try:
+            value_f = float(value)
+        except Exception:
+            return ""
+        if not np.isfinite(value_f):
+            return ""
+        return f"{value_f:.{digits}f}"
+
+    def _log_track_pose_csv(self, object_decisions: dict[str, dict], stamp) -> None:
+        if self._track_pose_log_path is None:
+            return
+
+        stamp_s = self._stamp_to_seconds(stamp)
+        rows: list[list[Any]] = []
+        for track_id, decision in sorted(object_decisions.items()):
+            pose_source = "decision"
+            T_base = decision.get("T_base")
+            pose_status = str(decision.get("pose_status", ""))
+            if T_base is None and pose_status == "held":
+                mem = self._fused_track_memory.get(track_id)
+                if mem is not None:
+                    T_base = mem.get("T_base")
+                    pose_source = "held_memory"
+
+            if T_base is not None:
+                t = np.asarray(T_base[:3, 3], dtype=np.float64).reshape(3)
+                tx, ty, tz = (self._csv_float(v) for v in t)
+            else:
+                pose_source = "none"
+                tx = ty = tz = ""
+
+            chamfer_m = decision.get("chamfer_m", float("nan"))
+            chamfer_mm = (
+                ""
+                if not np.isfinite(float(chamfer_m))
+                or float(chamfer_m) < 0.0
+                else self._csv_float(float(chamfer_m) * 1000.0, digits=3)
+            )
+            cams = "|".join(str(c) for c in decision.get("survived_cam_ids", []))
+            rows.append([
+                self._csv_float(stamp_s),
+                int(self.frame_counter),
+                decision.get("object_id", ""),
+                track_id,
+                pose_source,
+                bool(decision.get("accepted", False)),
+                pose_status,
+                int(decision.get("lost_count", 0)),
+                decision.get("mode", ""),
+                decision.get("pose_mode", ""),
+                cams,
+                tx,
+                ty,
+                tz,
+                self._csv_float(decision.get("fitness", float("nan")), digits=4),
+                self._csv_float(float(decision.get("rmse_m", float("nan"))) * 1000.0, digits=3),
+                chamfer_mm,
+                self._csv_float(decision.get("projected_overlap", float("nan")), digits=4),
+                self._csv_float(float(decision.get("trans_jump_m", 0.0)) * 1000.0, digits=3),
+                self._csv_float(decision.get("rot_jump_deg", 0.0), digits=3),
+                decision.get("reason", ""),
+            ])
+
+        try:
+            with self._track_pose_log_path.open("a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+        except Exception as e:
+            self.get_logger().warn(f"track pose CSV log failed: {e}")
+
     def _compute_fused_motion_dt(self, track_id: str, stamp) -> tuple[float, Optional[float]]:
         nominal_dt = float(getattr(self.args, 'fused_track_nominal_dt_s', 0.15))
         dt_min = float(getattr(self.args, 'fused_track_min_dt_s', 0.10))
@@ -2183,6 +2382,737 @@ class FoundationPoseTrackerNode(Node):
         if kf is None or not kf.is_initialized:
             return None
         return kf.state[:3].astype(np.float32).copy()
+
+    def _pose_origin_inside_tracker_masks(
+        self,
+        T_base_object: np.ndarray,
+        mask_entries: list[dict],
+    ) -> tuple[bool, str]:
+        """Check whether the projected object-frame origin lands inside tracker masks."""
+        if not bool(getattr(self.args, "track_require_pose_origin_in_mask", False)):
+            return True, "disabled"
+        margin_px = max(0, int(getattr(self.args, "track_pose_mask_margin_px", 8)))
+        if not mask_entries:
+            return False, "pose_origin_no_masks"
+
+        p_base = np.asarray(T_base_object[:3, 3], dtype=np.float64).reshape(3)
+        p_h = np.array([p_base[0], p_base[1], p_base[2], 1.0], dtype=np.float64)
+        failures = []
+
+        for entry in mask_entries:
+            cam_id = entry["cam_id"]
+            mask = np.asarray(entry["mask"], dtype=bool)
+            K = np.asarray(entry["K"], dtype=np.float64).reshape(3, 3)
+            h, w = mask.shape[:2]
+            T_cam_base = self._resolve_T_cam_base(cam_id)
+            p_cam = (T_cam_base @ p_h)[:3]
+            z = float(p_cam[2])
+            if z <= 1e-6:
+                failures.append(f"{cam_id}:behind")
+                continue
+            u = int(round(float(K[0, 0] * p_cam[0] / z + K[0, 2])))
+            v = int(round(float(K[1, 1] * p_cam[1] / z + K[1, 2])))
+            if u < 0 or u >= w or v < 0 or v >= h:
+                failures.append(f"{cam_id}:outside_image({u},{v})")
+                continue
+
+            if margin_px > 0:
+                x0 = max(0, u - margin_px)
+                x1 = min(w, u + margin_px + 1)
+                y0 = max(0, v - margin_px)
+                y1 = min(h, v + margin_px + 1)
+                inside = bool(mask[y0:y1, x0:x1].any())
+            else:
+                inside = bool(mask[v, u])
+            if not inside:
+                failures.append(f"{cam_id}:outside_mask({u},{v})")
+
+        if failures:
+            return False, "pose_origin_outside_mask[" + ";".join(failures) + "]"
+        return True, "pose_origin_inside_mask"
+
+    def _project_model_mask_for_camera(
+        self,
+        T_base_object: np.ndarray,
+        model_points_object: np.ndarray,
+        cam_id: str,
+        K: np.ndarray,
+        image_shape: tuple[int, int],
+        dilate_px: int,
+        min_projected_points: int,
+    ) -> Optional[dict[str, Any]]:
+        h, w = int(image_shape[0]), int(image_shape[1])
+        if h <= 0 or w <= 0:
+            return None
+
+        T_base_object = np.asarray(T_base_object, dtype=np.float64).reshape(4, 4)
+        pts_obj = np.asarray(model_points_object, dtype=np.float64).reshape(-1, 3)
+        if pts_obj.shape[0] == 0:
+            return None
+
+        pts_base = (T_base_object[:3, :3] @ pts_obj.T).T + T_base_object[:3, 3]
+        T_cam_base = self._resolve_T_cam_base(cam_id)
+        pts_cam = (T_cam_base[:3, :3] @ pts_base.T).T + T_cam_base[:3, 3]
+        z = pts_cam[:, 2]
+        valid_z = np.isfinite(z) & (z > float(getattr(self.args, "min_valid_z_m", 0.05)))
+        if int(valid_z.sum()) < min_projected_points:
+            return None
+
+        pts_cam = pts_cam[valid_z]
+        z = z[valid_z]
+        K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        u = K[0, 0] * pts_cam[:, 0] / z + K[0, 2]
+        v = K[1, 1] * pts_cam[:, 1] / z + K[1, 2]
+        in_img = (
+            np.isfinite(u) & np.isfinite(v)
+            & (u >= 0.0) & (u < float(w))
+            & (v >= 0.0) & (v < float(h))
+        )
+        if int(in_img.sum()) < min_projected_points:
+            return None
+
+        uv = np.stack([u[in_img], v[in_img]], axis=1)
+        uv_i = np.round(uv).astype(np.int32)
+        uv_i[:, 0] = np.clip(uv_i[:, 0], 0, w - 1)
+        uv_i[:, 1] = np.clip(uv_i[:, 1], 0, h - 1)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if uv_i.shape[0] >= 3:
+            hull = cv2.convexHull(uv_i.reshape(-1, 1, 2))
+            cv2.fillConvexPoly(mask, hull, 1)
+        else:
+            mask[uv_i[:, 1], uv_i[:, 0]] = 1
+
+        if dilate_px > 0:
+            k = 2 * int(dilate_px) + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0:
+            return None
+
+        z_img = z[in_img]
+        return {
+            "mask": mask.astype(bool),
+            "bbox_xyxy": (
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max()) + 1,
+                int(ys.max()) + 1,
+            ),
+            "projected_points": int(uv_i.shape[0]),
+            "z_min": float(np.min(z_img)),
+            "z_max": float(np.max(z_img)),
+        }
+
+    def _build_projected_icp_camera_candidate(
+        self,
+        entry: dict,
+        T_base_seed: np.ndarray,
+        model_points_object: np.ndarray,
+    ) -> dict[str, Any]:
+        cam_id = entry["cam_id"]
+        view = entry["view"]
+        K = entry["K"]
+        state = entry["state"]
+        depth = np.asarray(view.depth, dtype=np.float32)
+        h, w = depth.shape[:2]
+
+        metrics: dict[str, Any] = {
+            "cam_id": cam_id,
+            "state": state,
+            "state_idx": entry.get("state_idx", -1),
+            "view": view,
+            "K": K,
+            "accepted": False,
+            "reason": "unknown",
+            "mask": None,
+            "depth_mask": None,
+            "bbox_xyxy": (0, 0, 0, 0),
+            "mask_area": 0,
+            "depth_coverage": 0.0,
+            "cloud_points": 0,
+            "cloud_centroid_dist_m": None,
+            "pcd": None,
+        }
+
+        projection = self._project_model_mask_for_camera(
+            T_base_seed,
+            model_points_object,
+            cam_id=cam_id,
+            K=K,
+            image_shape=(h, w),
+            dilate_px=int(getattr(self.args, "projected_icp_mask_dilate_px", 8)),
+            min_projected_points=int(getattr(self.args, "projected_icp_min_projected_points", 20)),
+        )
+        if projection is None:
+            metrics["reason"] = "projection_empty"
+            return metrics
+
+        roi_mask = np.asarray(projection["mask"], dtype=bool)
+        roi_area = int(roi_mask.sum())
+        metrics["mask"] = roi_mask
+        metrics["bbox_xyxy"] = projection["bbox_xyxy"]
+        metrics["mask_area"] = roi_area
+        if roi_area < int(getattr(self.args, "fused_gate_min_mask_area", 50)):
+            metrics["reason"] = f"projection_too_small({roi_area})"
+            return metrics
+
+        margin_m = float(getattr(self.args, "projected_icp_depth_margin_m", 0.06))
+        depth_valid = (
+            np.isfinite(depth)
+            & (depth > float(getattr(self.args, "min_valid_z_m", 0.05)))
+            & (depth < float(getattr(self.args, "max_valid_z_m", 3.0)))
+            & (depth >= float(projection["z_min"]) - margin_m)
+            & (depth <= float(projection["z_max"]) + margin_m)
+        )
+        depth_mask = roi_mask & depth_valid
+        depth_coverage = float(depth_mask.sum()) / float(max(1, roi_area))
+        metrics["depth_mask"] = depth_mask
+        metrics["depth_coverage"] = depth_coverage
+        if depth_coverage < float(getattr(self.args, "projected_icp_min_depth_coverage", 0.08)):
+            metrics["reason"] = f"depth_coverage_low({depth_coverage:.2f})"
+            return metrics
+
+        depth_for_lift = depth
+        hole_k = int(getattr(self.args, "depth_fill_holes_kernel", 0))
+        if hole_k > 0:
+            depth_for_lift = fill_depth_holes_in_mask(depth_for_lift, depth_mask, kernel=hole_k)
+
+        pcd = lift_masked_depth_to_base(
+            depth=depth_for_lift,
+            mask=depth_mask,
+            K=K,
+            T_base_cam=self._resolve_T_base_cam(cam_id),
+            z_min=float(getattr(self.args, "min_valid_z_m", 0.05)),
+            z_max=float(getattr(self.args, "max_valid_z_m", 3.0)),
+            voxel_size=float(getattr(self.args, "projected_icp_voxel_size_m", 0.003)),
+            depth_bias_m=self._depth_bias_by_cam.get(cam_id, 0.0),
+            mask_morph_close_kernel=int(getattr(self.args, "icp_mask_close_kernel", 0)),
+            mask_interior_erosion=int(getattr(self.args, "icp_mask_interior_erosion", 0)),
+        )
+        metrics["pcd"] = pcd
+        metrics["cloud_points"] = int(len(pcd.points)) if pcd is not None else 0
+        if pcd is None or metrics["cloud_points"] < int(getattr(self.args, "projected_icp_min_cloud_points", 40)):
+            metrics["reason"] = f"cloud_too_small({metrics['cloud_points']})"
+            return metrics
+
+        pts = np.asarray(pcd.points, dtype=np.float64)
+        centroid_dist = float(np.linalg.norm(pts.mean(axis=0) - T_base_seed[:3, 3]))
+        metrics["cloud_centroid_dist_m"] = centroid_dist
+        if centroid_dist > float(getattr(self.args, "projected_icp_max_centroid_dist_m", 0.10)):
+            metrics["reason"] = f"centroid_far({centroid_dist:.3f}m)"
+            return metrics
+
+        metrics["accepted"] = True
+        metrics["reason"] = "ok"
+        return metrics
+
+    def _projected_depth_overlap_ratio(
+        self,
+        T_base_object: np.ndarray,
+        model_points_object: np.ndarray,
+        survivors: list[dict[str, Any]],
+    ) -> tuple[float, list[str]]:
+        ratios: list[float] = []
+        failures: list[str] = []
+        for m in survivors:
+            depth_mask = m.get("depth_mask")
+            if depth_mask is None:
+                continue
+            depth_mask = np.asarray(depth_mask, dtype=bool)
+            projection = self._project_model_mask_for_camera(
+                T_base_object,
+                model_points_object,
+                cam_id=m["cam_id"],
+                K=m["K"],
+                image_shape=depth_mask.shape[:2],
+                dilate_px=int(getattr(self.args, "projected_icp_mask_dilate_px", 8)),
+                min_projected_points=int(getattr(self.args, "projected_icp_min_projected_points", 20)),
+            )
+            if projection is None:
+                failures.append(f"{m['cam_id']}:projection_empty")
+                continue
+            proj_mask = np.asarray(projection["mask"], dtype=bool)
+            denom = int(depth_mask.sum())
+            if denom <= 0:
+                failures.append(f"{m['cam_id']}:no_depth_mask")
+                continue
+            ratio = float(np.logical_and(proj_mask, depth_mask).sum()) / float(denom)
+            ratios.append(ratio)
+        if not ratios:
+            return 0.0, failures or ["no_overlap_inputs"]
+        return float(min(ratios)), failures
+
+    def _track_multicam_projected_icp(self, views: list, stamp) -> None:
+        """Projected-CAD ROI tracking without Cutie in the hot loop."""
+        t_start = time.time()
+        views_by_cam = {
+            v.cam_id: v for v in views
+            if getattr(v, "rgb", None) is not None and getattr(v, "depth", None) is not None
+        }
+
+        entries_by_track: dict[str, list[dict[str, Any]]] = {}
+        all_tracked_track_ids: set[str] = set()
+        track_id_to_object_id_local: dict[str, str] = {}
+
+        for cam_id, states in self.track_states.items():
+            view = views_by_cam.get(cam_id)
+            for idx, state in enumerate(states):
+                track_id = getattr(state, "track_id", "")
+                if not track_id:
+                    continue
+                all_tracked_track_ids.add(track_id)
+                track_id_to_object_id_local[track_id] = state.object_id
+                if view is None:
+                    continue
+                if view.rgb.shape[:2] != view.depth.shape[:2]:
+                    continue
+                entries_by_track.setdefault(track_id, []).append({
+                    "cam_id": cam_id,
+                    "state": state,
+                    "state_idx": idx,
+                    "view": view,
+                    "K": np.asarray(view.K, dtype=np.float32).reshape(3, 3),
+                })
+
+        if not entries_by_track:
+            self.get_logger().warn("Projected ICP tracking: no camera states with current views")
+
+        object_decisions: dict[str, dict[str, Any]] = {}
+        projection_points = int(getattr(self.args, "projected_icp_projection_points", 800))
+
+        for track_id, entries in entries_by_track.items():
+            obj_id = entries[0]["state"].object_id
+            state0 = entries[0]["state"]
+            prev_base_pose = self._get_previous_object_base_pose(track_id, entries)
+            decision: dict[str, Any] = {
+                "object_id": obj_id,
+                "track_id": track_id,
+                "mode": "hold_previous",
+                "pose_mode": "hold_previous",
+                "accepted": False,
+                "reason": "unknown",
+                "T_base": None,
+                "fitness": float("nan"),
+                "rmse_m": float("nan"),
+                "chamfer_m": -1.0,
+                "projected_overlap": 0.0,
+                "trans_jump_m": 0.0,
+                "rot_jump_deg": 0.0,
+                "survived_cam_ids": [],
+                "survived_keys": [],
+                "gate_metrics": [],
+                "is_warmup": False,
+            }
+
+            if prev_base_pose is None:
+                decision["reason"] = "no_previous_pose"
+                object_decisions[track_id] = decision
+                self._fused_icp_metrics[track_id] = {
+                    "fitness": float("nan"),
+                    "rmse_mm": float("nan"),
+                    "mode": "hold_previous",
+                    "pose_mode": "hold_previous",
+                    "accepted": False,
+                    "reason": decision["reason"],
+                }
+                continue
+
+            model_pcd = mesh_to_pcd_cached(
+                state0.mesh_path,
+                float(self.args.mesh_scale),
+                num_points=int(getattr(self.args, "track_icp_num_points", 500)),
+            )
+            projection_pcd = mesh_to_pcd_cached(
+                state0.mesh_path,
+                float(self.args.mesh_scale),
+                num_points=max(50, projection_points),
+            )
+            model_points_project = np.asarray(projection_pcd.points, dtype=np.float64)
+
+            gate_metrics = [
+                self._build_projected_icp_camera_candidate(
+                    entry,
+                    prev_base_pose,
+                    model_points_project,
+                )
+                for entry in entries
+            ]
+            survivors = [m for m in gate_metrics if bool(m.get("accepted", False))]
+            survived_cam_ids = [m["cam_id"] for m in survivors]
+            survived_keys = [(m["cam_id"], m["state_idx"]) for m in survivors]
+            decision["gate_metrics"] = gate_metrics
+            decision["survived_cam_ids"] = survived_cam_ids
+            decision["survived_keys"] = survived_keys
+
+            if getattr(self.args, "debug_verbose_logs", False):
+                gate_log = " | ".join(
+                    (
+                        f"{m['cam_id']}:roi={m['mask_area']},"
+                        f"cov={m['depth_coverage']:.2f},"
+                        f"pts={m['cloud_points']},"
+                        f"reason={m['reason']}"
+                    )
+                    for m in gate_metrics
+                )
+                self.get_logger().info(
+                    f"PROJECTED GATE {obj_id}[{track_id}]: survivors={survived_cam_ids or 'none'} | {gate_log}"
+                )
+
+            if not survivors:
+                decision["reason"] = "no_projected_survivors"
+                object_decisions[track_id] = decision
+                self._fused_icp_metrics[track_id] = {
+                    "fitness": float("nan"),
+                    "rmse_mm": float("nan"),
+                    "mode": "hold_previous",
+                    "pose_mode": "hold_previous",
+                    "accepted": False,
+                    "reason": decision["reason"],
+                }
+                continue
+
+            survivor_pcds = [m["pcd"] for m in survivors if m.get("pcd") is not None]
+            use_weighted = bool(getattr(self.args, "use_weighted_cloud_merge", False))
+            if use_weighted and len(survivor_pcds) >= 2:
+                cam_positions = [
+                    self._resolve_T_base_cam(m["cam_id"])[:3, 3]
+                    for m in survivors if m.get("pcd") is not None
+                ]
+                fused_cloud = merge_point_clouds_weighted(
+                    survivor_pcds,
+                    cam_positions,
+                    voxel_size=float(getattr(self.args, "projected_icp_voxel_size_m", 0.003)),
+                    distance_exponent=float(getattr(self.args, "cloud_merge_distance_exponent", 2.0)),
+                )
+            else:
+                fused_cloud = merge_point_clouds(
+                    survivor_pcds,
+                    voxel_size=float(getattr(self.args, "projected_icp_voxel_size_m", 0.003)),
+                )
+
+            min_cloud_points = int(getattr(self.args, "projected_icp_min_cloud_points", 40))
+            if fused_cloud is None or len(fused_cloud.points) < min_cloud_points:
+                decision["reason"] = f"fused_cloud_too_small({0 if fused_cloud is None else len(fused_cloud.points)})"
+                object_decisions[track_id] = decision
+                self._fused_icp_metrics[track_id] = {
+                    "fitness": float("nan"),
+                    "rmse_mm": float("nan"),
+                    "mode": "hold_previous",
+                    "pose_mode": "hold_previous",
+                    "accepted": False,
+                    "reason": decision["reason"],
+                }
+                continue
+
+            T_base_refined, fitness, rmse = run_icp_in_base_frame(
+                scene_pcd=fused_cloud,
+                model_pcd=model_pcd,
+                T_base_object_init=prev_base_pose,
+                max_correspondence_dist=float(getattr(self.args, "projected_icp_max_correspondence_dist_m", 0.035)),
+                max_iteration=int(getattr(self.args, "fused_track_icp_max_iteration", 4)),
+                variant=self.args.icp_variant,
+                relative_fitness=float(getattr(self.args, "fused_track_icp_relative_fitness", 1e-3)),
+                relative_rmse=float(getattr(self.args, "fused_track_icp_relative_rmse", 1e-3)),
+            )
+            T_base_refined = T_base_refined.astype(np.float32)
+
+            dt, drot = self._pose_delta_from_base(prev_base_pose, T_base_refined)
+            motion_dt_s, _ = self._compute_fused_motion_dt(track_id, stamp)
+            max_trans_jump_m, max_rot_jump_deg = self._compute_fused_motion_thresholds(motion_dt_s)
+            chamfer_every_n = max(1, int(getattr(self.args, "chamfer_every_n_frames", 1)))
+            chamfer_due = chamfer_every_n <= 1 or (self.frame_counter % chamfer_every_n == 0)
+            chamfer: Optional[float] = (
+                chamfer_distance_one_way(model_pcd, fused_cloud, T_base_refined)
+                if chamfer_due else None
+            )
+            overlap_ratio, overlap_failures = self._projected_depth_overlap_ratio(
+                T_base_refined,
+                model_points_project,
+                survivors,
+            )
+
+            accept = True
+            reject_reasons: list[str] = []
+            min_fitness = float(getattr(self.args, "projected_icp_min_fitness", 0.08))
+            max_rmse = float(getattr(self.args, "projected_icp_max_rmse_m", 0.014))
+            max_chamfer = float(getattr(self.args, "fused_track_max_chamfer_m", 0.020))
+            min_overlap = float(getattr(self.args, "projected_icp_min_depth_overlap_ratio", 0.35))
+
+            if fitness < min_fitness:
+                accept = False
+                reject_reasons.append(f"fitness_low({fitness:.3f})")
+            if rmse > max_rmse:
+                accept = False
+                reject_reasons.append(f"rmse_high({rmse*1000:.1f}mm)")
+            if dt > max_trans_jump_m:
+                accept = False
+                reject_reasons.append(f"jump_t({dt*1000:.1f}mm>{max_trans_jump_m*1000:.1f}mm)")
+            if drot > max_rot_jump_deg:
+                accept = False
+                reject_reasons.append(f"jump_r({drot:.1f}>{max_rot_jump_deg:.1f})")
+            if chamfer is not None and chamfer > max_chamfer:
+                accept = False
+                reject_reasons.append(f"chamfer({chamfer*1000:.1f}mm>{max_chamfer*1000:.0f}mm)")
+            if overlap_ratio < min_overlap:
+                accept = False
+                suffix = f";{','.join(overlap_failures)}" if overlap_failures else ""
+                reject_reasons.append(f"projected_overlap_low({overlap_ratio:.2f}<{min_overlap:.2f}{suffix})")
+
+            if accept:
+                T_base_publish = T_base_refined
+                buf_size = int(getattr(self.args, "median_pose_buffer_size", 1))
+                if buf_size > 0:
+                    buf = self._median_pose_buffers.setdefault(track_id, MedianPoseBuffer(buf_size))
+                    buf.push(T_base_refined)
+                    if buf.is_ready():
+                        T_base_publish = buf.get_median()
+
+                x_bias = float(getattr(self.args, "x_bias_correction_m", 0.0))
+                if abs(x_bias) > 1e-6:
+                    T_base_publish = apply_x_bias_correction(T_base_publish, x_bias)
+
+                decision.update({
+                    "mode": "projected_icp",
+                    "pose_mode": "projected_icp",
+                    "accepted": True,
+                    "reason": "ok",
+                    "T_base": T_base_publish,
+                    "fitness": float(fitness),
+                    "rmse_m": float(rmse),
+                    "chamfer_m": float(chamfer) if chamfer is not None else -1.0,
+                    "projected_overlap": float(overlap_ratio),
+                    "trans_jump_m": dt,
+                    "rot_jump_deg": drot,
+                })
+                self._fused_track_memory[track_id] = {
+                    "T_base": T_base_publish.copy(),
+                    "mode": "projected_icp",
+                    "stamp_s": self._stamp_to_seconds(stamp),
+                }
+                self._last_known_track_centroids[track_id] = (
+                    T_base_publish[:3, 3].astype(np.float64).copy()
+                )
+            else:
+                decision.update({
+                    "mode": "hold_previous",
+                    "pose_mode": "hold_previous",
+                    "accepted": False,
+                    "reason": ",".join(reject_reasons),
+                    "fitness": float(fitness),
+                    "rmse_m": float(rmse),
+                    "chamfer_m": float(chamfer) if chamfer is not None else -1.0,
+                    "projected_overlap": float(overlap_ratio),
+                    "trans_jump_m": dt,
+                    "rot_jump_deg": drot,
+                })
+
+            self._fused_icp_metrics[track_id] = {
+                "fitness": float(fitness),
+                "rmse_mm": float(rmse) * 1000.0,
+                "mode": decision["mode"],
+                "pose_mode": decision["pose_mode"],
+                "accepted": decision["accepted"],
+                "reason": decision["reason"],
+                "projected_overlap": float(overlap_ratio),
+            }
+
+            if getattr(self.args, "debug_verbose_logs", False):
+                chamfer_str = f"{chamfer*1000:.1f}mm" if chamfer is not None else "skipped"
+                self.get_logger().info(
+                    f"PROJECTED DECISION {obj_id}[{track_id}]: accepted={decision['accepted']} "
+                    f"cams={survived_cam_ids} fitness={fitness:.3f} rmse={rmse*1000:.1f}mm "
+                    f"chamfer={chamfer_str} overlap={overlap_ratio:.2f} "
+                    f"dt={dt*1000:.1f}mm drot={drot:.1f}deg reason={decision['reason']}"
+                )
+
+            object_decisions[track_id] = decision
+
+        for tid in all_tracked_track_ids:
+            if tid in object_decisions:
+                continue
+            object_decisions[tid] = {
+                "object_id": track_id_to_object_id_local.get(tid, self._track_id_to_object_id.get(tid, "")),
+                "track_id": tid,
+                "mode": "hold_previous",
+                "pose_mode": "hold_previous",
+                "accepted": False,
+                "reason": "no_projected_entries",
+                "T_base": None,
+                "fitness": float("nan"),
+                "rmse_m": float("nan"),
+                "chamfer_m": -1.0,
+                "projected_overlap": 0.0,
+                "trans_jump_m": 0.0,
+                "rot_jump_deg": 0.0,
+                "survived_cam_ids": [],
+                "survived_keys": [],
+                "gate_metrics": [],
+                "is_warmup": False,
+            }
+            self._fused_icp_metrics[tid] = {
+                "fitness": float("nan"),
+                "rmse_mm": float("nan"),
+                "mode": "hold_previous",
+                "pose_mode": "hold_previous",
+                "accepted": False,
+                "reason": "no_projected_entries",
+            }
+
+        hold_window = int(getattr(self.args, "fused_track_hold_window_frames", 5))
+        max_lost = int(getattr(self.args, "fused_track_max_lost_frames", 20))
+        for tid, decision in object_decisions.items():
+            accepted = bool(decision.get("accepted", False)) and decision.get("T_base") is not None
+            if accepted:
+                self._fused_lost_count[tid] = 0
+                status = "fresh"
+            else:
+                lost = self._fused_lost_count.get(tid, 0) + 1
+                self._fused_lost_count[tid] = lost
+                if lost <= hold_window:
+                    status = "held"
+                elif lost <= max_lost:
+                    status = "stale"
+                else:
+                    status = "lost"
+                    self._force_reinit_tracks.add(tid)
+            self._fused_pose_status[tid] = status
+            decision["pose_status"] = status
+            decision["lost_count"] = int(self._fused_lost_count.get(tid, 0))
+            if tid in self._fused_icp_metrics:
+                self._fused_icp_metrics[tid]["pose_status"] = status
+                self._fused_icp_metrics[tid]["lost_count"] = decision["lost_count"]
+
+        self._log_track_pose_csv(object_decisions, stamp)
+
+        track_debug_by_cam: dict[str, dict[str, Any]] = {}
+        for track_id, entries in entries_by_track.items():
+            decision = object_decisions.get(track_id, {})
+            T_base = decision.get("T_base")
+            accepted = bool(decision.get("accepted", False)) and T_base is not None
+            model_points_project = None
+            if accepted:
+                projection_pcd = mesh_to_pcd_cached(
+                    entries[0]["state"].mesh_path,
+                    float(self.args.mesh_scale),
+                    num_points=max(50, projection_points),
+                )
+                model_points_project = np.asarray(projection_pcd.points, dtype=np.float64)
+
+            for entry in entries:
+                cam_id = entry["cam_id"]
+                state = entry["state"]
+                projection_mask = None
+                bbox_xyxy = (0, 0, 0, 0)
+                if accepted:
+                    T_cam_base = self._resolve_T_cam_base(cam_id)
+                    T_local = (T_cam_base @ T_base).astype(np.float32)
+                    state.T_object_camera = T_local
+                    state.last_good_T = T_local.copy()
+                    state.lost_count = 0
+                    state.degraded_count = 0
+                    state.mode = "track/projected_icp"
+                    if state.kalman is not None:
+                        state.kalman.update(T_local[:3, 3])
+                    projection = self._project_model_mask_for_camera(
+                        T_base,
+                        model_points_project,
+                        cam_id=cam_id,
+                        K=entry["K"],
+                        image_shape=entry["view"].depth.shape[:2],
+                        dilate_px=int(getattr(self.args, "projected_icp_mask_dilate_px", 8)),
+                        min_projected_points=int(getattr(self.args, "projected_icp_min_projected_points", 20)),
+                    ) if model_points_project is not None else None
+                    if projection is not None:
+                        projection_mask = np.asarray(projection["mask"], dtype=bool)
+                        bbox_xyxy = projection["bbox_xyxy"]
+                        state.last_good_mask = projection_mask.copy()
+                        state.recovery_mask = projection_mask.copy()
+                        state.last_mask_area = int(projection_mask.sum())
+                else:
+                    if state.last_good_T is not None:
+                        state.T_object_camera = state.last_good_T.copy()
+                    state.degraded_count += 1
+                    state.mode = "degraded"
+                    if state.last_good_mask is not None:
+                        projection_mask = np.asarray(state.last_good_mask, dtype=bool)
+                        ys, xs = np.where(projection_mask)
+                        if xs.size > 0:
+                            bbox_xyxy = (
+                                int(xs.min()), int(ys.min()),
+                                int(xs.max()) + 1, int(ys.max()) + 1,
+                            )
+                    state.last_mask_area = int(projection_mask.sum()) if projection_mask is not None else 0
+
+                if projection_mask is not None and cam_id not in track_debug_by_cam:
+                    fused_metrics = self._fused_icp_metrics.get(track_id, {})
+                    track_debug_by_cam[cam_id] = {
+                        "mask": projection_mask,
+                        "bbox_xyxy": bbox_xyxy,
+                        "object_id": state.object_id,
+                        "icp_fitness": fused_metrics.get("fitness", 0.0),
+                        "icp_rmse_mm": fused_metrics.get("rmse_mm", 0.0),
+                    }
+
+        if self._debug_frame_publish_enabled():
+            for view in views:
+                cam_id = view.cam_id
+                states = self.track_states.get(cam_id, [])
+                if not states:
+                    continue
+                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
+                track_debug = track_debug_by_cam.get(cam_id)
+                frame = self._build_debug_frame(
+                    cam_id=cam_id,
+                    stamp=stamp,
+                    update_sam=False,
+                    update_dino=False,
+                    sam_candidates=[],
+                    dino_candidates=[],
+                    pose_items=pose_items,
+                    track_debug=track_debug,
+                )
+                if cam_id in self.pub_debug_frame:
+                    self.pub_debug_frame[cam_id].publish(frame)
+
+        if not hasattr(self, "_pub_fused_pose"):
+            self._pub_fused_pose = {}
+        if not hasattr(self, "_fused_pose_pub_by_obj"):
+            self._fused_pose_pub_by_obj: dict[str, Any] = {}
+
+        for tid, decision in object_decisions.items():
+            accepted_pub = decision.get("accepted") and decision.get("T_base") is not None
+            if accepted_pub:
+                T_pub = decision["T_base"]
+            elif decision.get("pose_status") == "held":
+                mem = self._fused_track_memory.get(tid)
+                T_pub = mem["T_base"] if mem is not None else None
+            else:
+                T_pub = None
+            if T_pub is None:
+                continue
+            pub = self._fused_pose_pub_by_obj.get(tid)
+            if pub is None:
+                fused_key = f"fused/{tid}"
+                pub = self._pub_fused_pose.get(fused_key)
+                if pub is None:
+                    pub = self.create_publisher(
+                        PoseStamped,
+                        f"/perception/fp/pose_base/{fused_key}",
+                        FAST_QOS,
+                    )
+                    self._pub_fused_pose[fused_key] = pub
+                self._fused_pose_pub_by_obj[tid] = pub
+            pub.publish(T_to_pose_stamped(T_pub, frame_id="base", stamp=stamp))
+
+        if getattr(self.args, "debug_verbose_logs", False):
+            t_total = (time.time() - t_start) * 1000
+            accepted_count = sum(1 for d in object_decisions.values() if d.get("accepted"))
+            self.get_logger().info(
+                f"PROJECTED TRACK total: {t_total:.0f}ms | {accepted_count} objects updated"
+            )
 
 
     def _evaluate_fused_camera_candidate(
@@ -2344,25 +3274,15 @@ class FoundationPoseTrackerNode(Node):
     
             for idx, state in enumerate(states):
                 # Tracker key is per-instance (track_id) so multi-instance
-                # same-class scenes get a distinct Cutie/SAM2 session each.
+                # same-class scenes get a distinct Cutie session each.
                 tracker_key = f"{cam_id}_{state.track_id}"
     
                 if tracker_key not in self.realtime_trackers:
                     try:
-                        from src.perception.tracking.sam2_video_tracker import SAM2VideoConfig
-                        from src.perception.tracking.sam2_streaming_tracker import SAM2StreamingConfig
-
-                        video_kind = str(getattr(self.args, "video_tracker", "cutie")).lower()
-                        use_video_pred = bool(getattr(self.args, "sam2_use_video_predictor", False))
-                        sam2_cfg = SAM2VideoConfig(
-                            max_internal_size=480,
-                            memory_crop_padding_px=int(getattr(self.args, "track_memory_crop_padding", 0)),
-                        )
-                        sam2_streaming_cfg = SAM2StreamingConfig(
-                            max_memory_frames=int(getattr(self.args, "sam2_max_memory_frames", 16)),
-                        )
                         cfg = RealtimeTrackerConfig(
-                            cutie_cfg=CutieConfig(max_internal_size=480),
+                            cutie_cfg=CutieConfig(
+                                max_internal_size=int(getattr(self.args, "cutie_max_internal_size", 480)),
+                            ),
                             icp_cfg=ICPConfig(
                                 variant=ICPVariant.POINT_TO_POINT,
                                 max_correspondence_distance=0.05,
@@ -2374,10 +3294,6 @@ class FoundationPoseTrackerNode(Node):
                             max_translation_per_frame=0.08,
                             lost_frames_before_reinit=999,
                             verbose=False,
-                            video_tracker_kind=video_kind,
-                            sam2_cfg=sam2_cfg,
-                            sam2_use_video_predictor=use_video_pred,
-                            sam2_streaming_cfg=sam2_streaming_cfg,
                         )
                         rt = RealtimeTracker(cfg)
                         init_mask = state.recovery_mask
@@ -2458,12 +3374,14 @@ class FoundationPoseTrackerNode(Node):
 
         object_decisions: dict[str, dict] = {}
         t_fuse = time.time()
+        fused_kalman_disabled = bool(getattr(self.args, "disable_fused_kalman", False))
+        axis_jump_gate_disabled = bool(getattr(self.args, "disable_axis_jump_gate", False))
 
         for track_id, entries in by_track.items():
             obj_id = entries[0]["state"].object_id
             prev_base_pose = self._get_previous_object_base_pose(track_id, entries)
-            kf_obj = self._get_or_create_fused_translation_kalman(track_id)
-            if kf_obj.is_initialized:
+            kf_obj = None if fused_kalman_disabled else self._get_or_create_fused_translation_kalman(track_id)
+            if kf_obj is not None and kf_obj.is_initialized:
                 kf_obj.predict()
 
             # ── Warmup detection ──
@@ -2587,7 +3505,10 @@ class FoundationPoseTrackerNode(Node):
                 motion_dt_s, motion_dt_raw_s = self._compute_fused_motion_dt(track_id, stamp)
                 max_trans_jump_m, max_rot_jump_deg = self._compute_fused_motion_thresholds(motion_dt_s)
 
-                kalman_pred_pos = self._get_fused_kalman_predicted_position(track_id)
+                kalman_pred_pos = (
+                    None if fused_kalman_disabled
+                    else self._get_fused_kalman_predicted_position(track_id)
+                )
                 kalman_residual_m = (
                     float(np.linalg.norm(T_base_candidate[:3, 3] - kalman_pred_pos))
                     if kalman_pred_pos is not None else None
@@ -2611,6 +3532,14 @@ class FoundationPoseTrackerNode(Node):
                 gate_rmse_m = single_cam_icp_rmse_m if single_cam_icp_ran else float(m["per_cam_icp_rmse_m"])
 
                 quality_reject_reason: Optional[str] = None
+                pose_mask_ok, pose_mask_reason = self._pose_origin_inside_tracker_masks(
+                    T_base_candidate,
+                    [{
+                        "cam_id": m["cam_id"],
+                        "mask": m["mask"],
+                        "K": cr["K"],
+                    }],
+                )
                 if is_warmup:
                     # During warmup: only reject truly insane results
                     WARMUP_MAX_TRANS_M = 0.20
@@ -2625,7 +3554,8 @@ class FoundationPoseTrackerNode(Node):
                 else:
                     motion_ok = dt <= max_trans_jump_m and drot <= max_rot_jump_deg
                     kalman_soft_reject = (
-                        kalman_residual_m is not None
+                        not fused_kalman_disabled
+                        and kalman_residual_m is not None
                         and kalman_residual_m > float(self.args.fused_track_kalman_soft_translation_residual_m)
                         and gate_fitness < float(self.args.fused_track_kalman_soft_max_icp_fitness)
                     )
@@ -2643,7 +3573,10 @@ class FoundationPoseTrackerNode(Node):
                         fitness_ok_sc = True
                         rmse_ok_sc = True
 
-                if motion_ok and not kalman_soft_reject and fitness_ok_sc and rmse_ok_sc and not single_cam_icp_failed:
+                if (
+                    motion_ok and not kalman_soft_reject and fitness_ok_sc and rmse_ok_sc
+                    and pose_mask_ok and not single_cam_icp_failed
+                ):
                     T_base_publish = T_base_candidate
                     buf_size = int(getattr(self.args, 'median_pose_buffer_size', 3))
                     if buf_size > 0:
@@ -2680,6 +3613,8 @@ class FoundationPoseTrackerNode(Node):
                         reject_reason = "single_cam_icp_exception"
                     elif quality_reject_reason is not None:
                         reject_reason = quality_reject_reason
+                    elif not pose_mask_ok:
+                        reject_reason = pose_mask_reason
                     elif kalman_soft_reject:
                         reject_reason = f"single_cam_kalman_soft(res={kalman_residual_m*1000:.1f}mm)"
                     else:
@@ -2762,12 +3697,31 @@ class FoundationPoseTrackerNode(Node):
                 relative_fitness=float(getattr(self.args, 'fused_track_icp_relative_fitness', 1e-4)),
                 relative_rmse=float(getattr(self.args, 'fused_track_icp_relative_rmse', 1e-4)),
             )
+
+            pose_mask_entries = []
+            for m in survivors:
+                cr_match = next(
+                    cr for cr in entries
+                    if cr["cam_id"] == m["cam_id"] and cr["state_idx"] == m["state_idx"]
+                )
+                pose_mask_entries.append({
+                    "cam_id": m["cam_id"],
+                    "mask": m["mask"],
+                    "K": cr_match["K"],
+                })
+            pose_mask_ok, pose_mask_reason = self._pose_origin_inside_tracker_masks(
+                T_base_fused,
+                pose_mask_entries,
+            )
     
             dt, drot = self._pose_delta_from_base(prev_base_pose, T_base_fused)
             motion_dt_s, motion_dt_raw_s = self._compute_fused_motion_dt(track_id, stamp)
             max_trans_jump_m, max_rot_jump_deg = self._compute_fused_motion_thresholds(motion_dt_s)
 
-            kalman_pred_pos = self._get_fused_kalman_predicted_position(track_id)
+            kalman_pred_pos = (
+                None if fused_kalman_disabled
+                else self._get_fused_kalman_predicted_position(track_id)
+            )
             kalman_residual_m = (
                 float(np.linalg.norm(T_base_fused[:3, 3] - kalman_pred_pos))
                 if kalman_pred_pos is not None else None
@@ -2782,7 +3736,9 @@ class FoundationPoseTrackerNode(Node):
                 and rmse <= chamfer_skip_rmse_max
                 and (prev_base_pose is None or dt <= chamfer_skip_motion_max)
             )
-            need_chamfer = (not is_warmup) and (not quality_clean)
+            chamfer_every_n = max(1, int(getattr(self.args, "chamfer_every_n_frames", 1)))
+            chamfer_due = chamfer_every_n <= 1 or (self.frame_counter % chamfer_every_n == 0)
+            need_chamfer = (not is_warmup) and (not quality_clean) and chamfer_due
             chamfer: Optional[float] = (
                 chamfer_distance_one_way(model_pcd, fused_cloud, T_base_fused)
                 if need_chamfer else None
@@ -2806,6 +3762,9 @@ class FoundationPoseTrackerNode(Node):
                 if prev_base_pose is not None and drot > WARMUP_MAX_ROT_DEG:
                     accept = False
                     reject_reasons.append(f"warmup_spin({drot:.0f}deg)")
+                if not pose_mask_ok:
+                    accept = False
+                    reject_reasons.append(pose_mask_reason)
             else:
                 # Track which gates failed and WHY, so we can rescue jump-only rejects
                 fitness_ok = fitness >= float(self.args.fused_track_min_fused_icp_fitness)
@@ -2839,7 +3798,8 @@ class FoundationPoseTrackerNode(Node):
                 dominant_frac = float(axis_jump.max() / (np.linalg.norm(axis_jump) + 1e-9)) if np.linalg.norm(axis_jump) > 1e-9 else 0.0
                 weak_icp = fitness < float(self.args.fused_track_weak_icp_fitness)
                 axis_dominant_ok = True
-                if (prev_base_pose is not None
+                if (not axis_jump_gate_disabled
+                    and prev_base_pose is not None
                     and dominant_frac > float(self.args.fused_track_axis_dominant_fraction)
                     and dt > float(self.args.fused_track_axis_dominant_min_translation_m)
                     and weak_icp):
@@ -2849,23 +3809,30 @@ class FoundationPoseTrackerNode(Node):
 
                 # Kalman soft reject
                 kalman_soft_reject = (
-                    kalman_residual_m is not None
+                    not fused_kalman_disabled
+                    and kalman_residual_m is not None
                     and kalman_residual_m > float(self.args.fused_track_kalman_soft_translation_residual_m)
                     and fitness < float(self.args.fused_track_kalman_soft_max_icp_fitness)
                 )
                 if kalman_soft_reject:
                     accept = False
                     reject_reasons.append(f"kalman_soft(res={kalman_residual_m*1000:.1f}mm)")
+                if not pose_mask_ok:
+                    accept = False
+                    reject_reasons.append(pose_mask_reason)
 
                 
                 # This handles: real fast motion, or tracker snapping back to
                 # correct pose after brief drift.
                 if not accept:
                     # Check: was the rejection purely motion-based?
-                    quality_ok = fitness_ok and rmse_ok and chamfer_ok and axis_dominant_ok and not kalman_soft_reject
+                    quality_ok = (
+                        fitness_ok and rmse_ok and chamfer_ok and axis_dominant_ok
+                        and not kalman_soft_reject and pose_mask_ok
+                    )
                     jump_rejected = not jump_t_ok or not jump_r_ok
 
-                    if quality_ok and jump_rejected:
+                    if quality_ok and jump_rejected and chamfer_due:
                         # The pose FITS the cloud well (good fitness, rmse, chamfer)
                         # but moved too fast.
                         if chamfer is None:
@@ -2970,16 +3937,17 @@ class FoundationPoseTrackerNode(Node):
             _dprint(f"[TIMING] Fused ICP all objects: {(time.time()-t_fuse)*1000:.0f}ms")
 
         # ── Kalman update ──
-        for tid, decision in object_decisions.items():
-            T_base_acc = decision.get("T_base")
-            if not (bool(decision.get("accepted", False)) and T_base_acc is not None):
-                continue
-            kf = self._get_or_create_fused_translation_kalman(tid)
-            pos = np.asarray(T_base_acc[:3, 3], dtype=np.float64).reshape(3)
-            if not kf.is_initialized:
-                kf.initialize(pos)
-            else:
-                kf.update(pos)
+        if not fused_kalman_disabled:
+            for tid, decision in object_decisions.items():
+                T_base_acc = decision.get("T_base")
+                if not (bool(decision.get("accepted", False)) and T_base_acc is not None):
+                    continue
+                kf = self._get_or_create_fused_translation_kalman(tid)
+                pos = np.asarray(T_base_acc[:3, 3], dtype=np.float64).reshape(3)
+                if not kf.is_initialized:
+                    kf.initialize(pos)
+                else:
+                    kf.update(pos)
 
         # Fill in synthetic no_survivors decisions for any tracked track_id
         # that produced no per-cam results at all (instance fully dropped out
@@ -3041,6 +4009,8 @@ class FoundationPoseTrackerNode(Node):
             if tid in self._fused_icp_metrics:
                 self._fused_icp_metrics[tid]["pose_status"] = status
                 self._fused_icp_metrics[tid]["lost_count"] = decision["lost_count"]
+
+        self._log_track_pose_csv(object_decisions, stamp)
     
         # ── Back-project and publish (same structure as original) ──
         track_debug_by_cam = {}
@@ -3097,7 +4067,7 @@ class FoundationPoseTrackerNode(Node):
                         "mask": current_mask.copy(),
                         "occlusion_score": occ,
                         "T_object_camera": T_local.copy(),
-                        "centroid_base": np.asarray(T_base_acc[:3, 3], dtype=np.float64).copy(),
+                        "centroid_base": np.asarray(T_base[:3, 3], dtype=np.float64).copy(),
                     }
                     # Per-object appearance memory: stash a clean RGB crop
                     # while ICP fitness is high so the next reinit can
@@ -3155,21 +4125,22 @@ class FoundationPoseTrackerNode(Node):
                     }
     
         # ── Debug frame publishing ──
-        for view in views:
-            cam_id = view.cam_id
-            states = self.track_states.get(cam_id, [])
-            if not states:
-                continue
-            pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
-            track_debug = track_debug_by_cam.get(cam_id)
-            frame = self._build_debug_frame(
-                cam_id=cam_id, stamp=stamp,
-                update_sam=False, update_dino=False,
-                sam_candidates=[], dino_candidates=[],
-                pose_items=pose_items, track_debug=track_debug,
-            )
-            if cam_id in self.pub_debug_frame:
-                self.pub_debug_frame[cam_id].publish(frame)
+        if self._debug_frame_publish_enabled():
+            for view in views:
+                cam_id = view.cam_id
+                states = self.track_states.get(cam_id, [])
+                if not states:
+                    continue
+                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
+                track_debug = track_debug_by_cam.get(cam_id)
+                frame = self._build_debug_frame(
+                    cam_id=cam_id, stamp=stamp,
+                    update_sam=False, update_dino=False,
+                    sam_candidates=[], dino_candidates=[],
+                    pose_items=pose_items, track_debug=track_debug,
+                )
+                if cam_id in self.pub_debug_frame:
+                    self.pub_debug_frame[cam_id].publish(frame)
     
         # ── Publish fused canonical poses ──
         if not hasattr(self, "_pub_fused_pose"):
@@ -3277,7 +4248,7 @@ class FoundationPoseTrackerNode(Node):
 
             if not masks:
                 selections_by_cam[cam_id] = []
-                if cam_id in self.pub_debug_frame:
+                if self._debug_frame_publish_enabled() and cam_id in self.pub_debug_frame:
                     frame = self._build_debug_frame(
                         cam_id=cam_id, stamp=stamp,
                         update_sam=True, update_dino=True,
@@ -3308,7 +4279,7 @@ class FoundationPoseTrackerNode(Node):
             _dprint(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
             selections_by_cam[cam_id] = selected
 
-            if cam_id in self.pub_debug_frame:
+            if self._debug_frame_publish_enabled() and cam_id in self.pub_debug_frame:
                 frame = self._build_debug_frame(
                     cam_id=cam_id, stamp=stamp,
                     update_sam=True, update_dino=True,
@@ -3755,18 +4726,19 @@ class FoundationPoseTrackerNode(Node):
         self._check_chamfer_drift()
 
         # ── Publish debug frames ──
-        for cam_id, states in new_states_by_cam.items():
-            if not states:
-                continue
-            pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
-            frame = self._build_debug_frame(
-                cam_id=cam_id, stamp=stamp,
-                update_sam=False, update_dino=False,
-                sam_candidates=[], dino_candidates=[],
-                pose_items=pose_items,
-            )
-            if cam_id in self.pub_debug_frame:
-                self.pub_debug_frame[cam_id].publish(frame)
+        if self._debug_frame_publish_enabled():
+            for cam_id, states in new_states_by_cam.items():
+                if not states:
+                    continue
+                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
+                frame = self._build_debug_frame(
+                    cam_id=cam_id, stamp=stamp,
+                    update_sam=False, update_dino=False,
+                    sam_candidates=[], dino_candidates=[],
+                    pose_items=pose_items,
+                )
+                if cam_id in self.pub_debug_frame:
+                    self.pub_debug_frame[cam_id].publish(frame)
 
         # ── Store states with NMS ──
         for cam_id, states in new_states_by_cam.items():
@@ -3788,7 +4760,7 @@ class FoundationPoseTrackerNode(Node):
         Resets warmup counters, median buffers, Kalman filters, and
         per-camera RealtimeTracker instances so the next tick rebuilds
         them against the freshly initialised poses instead of reusing
-        Cutie/SAM2 memory tied to the previous instance.
+        Cutie memory tied to the previous instance.
         """
         fresh_track_ids: set[str] = set()
         for states in self.track_states.values():
@@ -3814,6 +4786,26 @@ class FoundationPoseTrackerNode(Node):
             except Exception:
                 pass
             del self.realtime_trackers[key]
+
+    def _drop_realtime_trackers_for_track_ids(self, track_ids: set[str]) -> None:
+        """Release per-camera video trackers for tracks that are about to reinit."""
+        if not track_ids:
+            return
+        for key, rt in list(self.realtime_trackers.items()):
+            if not any(key.endswith(f"_{tid}") for tid in track_ids):
+                continue
+            try:
+                rt.reset()
+            except Exception:
+                pass
+            del self.realtime_trackers[key]
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _tick(self) -> None:
         if self.busy:
@@ -3843,8 +4835,23 @@ class FoundationPoseTrackerNode(Node):
                 for tid in lost_track_ids:
                     self._fused_lost_count[tid] = 0
                     self._fused_pose_status[tid] = "fresh"
+                self._drop_realtime_trackers_for_track_ids(lost_track_ids)
                 self._force_reinit_tracks.clear()
-                force_init_this_tick = True
+                remaining_track_ids = sorted({
+                    s.track_id
+                    for states in self.track_states.values()
+                    for s in states
+                    if getattr(s, "track_id", "")
+                })
+                allow_partial_reinit = bool(getattr(self.args, "reinit_lost_tracks_while_tracking", False))
+                if remaining_track_ids and not allow_partial_reinit:
+                    self.get_logger().warn(
+                        f"PARTIAL TRACK LOSS: dropped {sorted(lost_track_ids)}; "
+                        f"continuing {remaining_track_ids} without global reinit"
+                    )
+                    force_init_this_tick = False
+                else:
+                    force_init_this_tick = True
             else:
                 force_init_this_tick = False
 
@@ -3852,7 +4859,7 @@ class FoundationPoseTrackerNode(Node):
             any_tracking = any(
                 bool(self.track_states.get(v.cam_id))
                 and all(
-                    s.mode in ("track", "track/rt", "degraded", "fast_recovery")
+                    s.mode in ("track", "track/rt", "track/projected_icp", "degraded", "fast_recovery")
                     for s in self.track_states[v.cam_id]
                 )
                 for v in views
@@ -3865,7 +4872,11 @@ class FoundationPoseTrackerNode(Node):
 
             if any_tracking and not no_states and not force_init_this_tick:
                 # ─── FUSED TRACKING ───
-                self._track_multicam_fused(views, stamp)
+                backend = str(getattr(self.args, "tracking_backend", "cutie")).lower()
+                if backend == "projected_icp":
+                    self._track_multicam_projected_icp(views, stamp)
+                else:
+                    self._track_multicam_fused(views, stamp)
             else:
                 # ─── MULTICAM INIT ───
                 torch.cuda.empty_cache()
@@ -3903,6 +4914,31 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--target-object", default=None)
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
+    p.add_argument(
+        "--tracking-backend",
+        choices=["cutie", "projected_icp"],
+        default="cutie",
+        help="Realtime tracking backend used after multicam init.",
+    )
+    p.add_argument(
+        "--tracking-profile",
+        choices=["default", "fast_cutie", "ultrafast_projected_icp"],
+        default="default",
+        action=_TrackingProfileAction,
+        help="Named tracking profile. fast_cutie keeps Cutie; ultrafast_projected_icp removes Cutie from the hot loop.",
+    )
+    p.add_argument(
+        "--fast-cutie",
+        action=_FastCutieAction,
+        default=False,
+        help="Shortcut for --tracking-profile fast_cutie.",
+    )
+    p.add_argument(
+        "--ultrafast-projected-icp",
+        action=_UltrafastProjectedICPAction,
+        default=False,
+        help="Shortcut for --tracking-profile ultrafast_projected_icp.",
+    )
 
     p.add_argument("--reference-dir", default="Data/ZED_screens")
     p.add_argument("--cad-dir", default="Data/CAD_Models_centered")
@@ -3916,13 +4952,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dino-model-name", default="dinov2_vitl14")
     p.add_argument("--dino-min-score", type=float, default=0.45)
     p.add_argument("--dino-min-margin", type=float, default=0.0)
-    # softmax-entropy gate over per-object scores.
-    p.add_argument("--dino-entropy-threshold", type=float, default=0.0)
-    p.add_argument("--dino-entropy-tau", type=float, default=0.05)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
     # Per-object appearance memory: snapshot a clean RGB crop whenever the
     # fused ICP fitness is good
+
     p.add_argument("--memory-crop-enable", action="store_true", default=True,
                    help="Save high-fitness crops and use them at reinit.")
     p.add_argument("--no-memory-crop", dest="memory_crop_enable",
@@ -4041,18 +5075,52 @@ def parse_args() -> argparse.Namespace:
     # Hold/lost windows
     p.add_argument("--fused-track-hold-window-frames", type=int, default=5)
     p.add_argument("--fused-track-max-lost-frames", type=int, default=20)
+    p.add_argument(
+        "--reinit-lost-tracks-while-tracking",
+        action="store_true",
+        help=(
+            "When one track is lost but other tracks still exist, run global "
+            "multicam init immediately. By default partial loss only drops the "
+            "lost track and keeps tracking the survivors."
+        ),
+    )
  
     # Chamfer distance gate for outlier rejection during tracking
     p.add_argument("--fused-track-max-chamfer-m", type=float, default=0.015)
+    p.add_argument(
+        "--track-require-pose-origin-in-mask",
+        action="store_true",
+        help=(
+            "Reject tracking poses whose projected object-frame origin is not "
+            "inside the current Cutie tracker mask."
+        ),
+    )
+    p.add_argument(
+        "--track-pose-mask-margin-px",
+        type=int,
+        default=8,
+        help="Pixel tolerance around the projected pose origin for --track-require-pose-origin-in-mask.",
+    )
  
     # Median pose buffer (temporal outlier filter, 0 to disable)
     p.add_argument("--median-pose-buffer-size", type=int, default=3)
 
     p.add_argument("--log-init-poses", action="store_true",
                    help="Log CSV of init pose RPY + render 3D PNGs per attempt")
+    p.add_argument("--log-track-poses", action="store_true",
+                   help="Log compact per-tick fused tracking poses and metrics to CSV.")
+    p.add_argument("--track-pose-log-path",
+                   default="outputs/logs/track_pose_log.csv",
+                   help="CSV path for --log-track-poses. Overwritten at node startup.")
 
     # ── Latency / debug flags ──
     p.add_argument("--debug-per-cam-pose-publish", action="store_true")
+    p.add_argument("--debug-frame-publish", dest="debug_frame_publish",
+                   action="store_true", default=True,
+                   help="Publish fp_debug_msgs/DebugFrame messages.")
+    p.add_argument("--no-debug-frame-publish", dest="debug_frame_publish",
+                   action="store_false",
+                   help="Skip DebugFrame construction and publication.")
     # When true, emit per-frame INFO logs and [TIMING] prints. Off by default.
     p.add_argument("--debug-verbose-logs", action="store_true")
     # Master switch for all logging/print statements across the pipeline.
@@ -4063,6 +5131,9 @@ def parse_args() -> argparse.Namespace:
     # fused-cloud ICP refines the pose anyway).
     p.add_argument("--skip-per-cam-icp-tracking", action="store_true", default=True)
 
+    p.add_argument("--cutie-max-internal-size", type=int, default=480,
+                   help="Max image side for Cutie tracking resize. <=0 disables Cutie downscale.")
+
     # Tracking-time model PCD point count (init keeps the original 5000 via a
     # separate cache entry).
     p.add_argument("--track-icp-num-points", type=int, default=2000)
@@ -4072,6 +5143,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chamfer-skip-fitness-min", type=float, default=0.30)
     p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.005)
     p.add_argument("--chamfer-skip-motion-max-m", type=float, default=0.010)
+    p.add_argument("--chamfer-every-n-frames", type=int, default=1,
+                   help="Run non-clean tracking Chamfer gate every N frames. 1 checks every eligible frame.")
+    p.add_argument("--disable-fused-kalman", action="store_true", default=False,
+                   help="Skip fused tracking Kalman prediction/update and soft reject gate.")
+    p.add_argument("--enable-fused-kalman", dest="disable_fused_kalman",
+                   action="store_false",
+                   help="Re-enable fused tracking Kalman when a profile disabled it.")
+    p.add_argument("--disable-axis-jump-gate", action="store_true", default=False,
+                   help="Skip axis-dominant weak-ICP jump rejection.")
+    p.add_argument("--enable-axis-jump-gate", dest="disable_axis_jump_gate",
+                   action="store_false",
+                   help="Re-enable axis-dominant jump rejection when a profile disabled it.")
+
+    # Projected-ICP backend: project the previous CAD pose into each camera,
+    # lift depth only inside that predicted ROI, then run short fused ICP.
+    p.add_argument("--projected-icp-projection-points", type=int, default=800)
+    p.add_argument("--projected-icp-min-projected-points", type=int, default=20)
+    p.add_argument("--projected-icp-mask-dilate-px", type=int, default=8)
+    p.add_argument("--projected-icp-depth-margin-m", type=float, default=0.060)
+    p.add_argument("--projected-icp-min-depth-coverage", type=float, default=0.08)
+    p.add_argument("--projected-icp-min-cloud-points", type=int, default=40)
+    p.add_argument("--projected-icp-max-centroid-dist-m", type=float, default=0.10)
+    p.add_argument("--projected-icp-min-fitness", type=float, default=0.08)
+    p.add_argument("--projected-icp-max-rmse-m", type=float, default=0.014)
+    p.add_argument("--projected-icp-min-depth-overlap-ratio", type=float, default=0.35)
+    p.add_argument("--projected-icp-voxel-size-m", type=float, default=0.003)
+    p.add_argument("--projected-icp-max-correspondence-dist-m", type=float, default=0.035)
 
     # ICP variant for run_icp_in_base_frame.
     p.add_argument("--icp-variant", choices=["point_to_point", "point_to_plane"],
@@ -4108,10 +5206,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dino-gem-p", type=float, default=1.5,
                    help="GeM exponent for the MUSE two-stream patch stream.")
 
-    # PCA-whiten the reference bank. 0 disables.
-    p.add_argument("--dino-bank-pca-dim", type=int, default=0,
-                   help="Project bank+queries to this many PCA-whitened dims.")
-
     p.add_argument("--gdino-use-items-prompt", dest="gdino_use_items_prompt",
                    action="store_true", default=True,
                    help="Use the MUSE class-agnostic literal 'items' prompt.")
@@ -4129,7 +5223,7 @@ def parse_args() -> argparse.Namespace:
 
 
     p.add_argument("--table-plane-z-min", type=float, default=0.0)
-    p.add_argument("--table-plane-z-max", type=float, default=0.5)
+    p.add_argument("--table-plane-z-max", type=float, default=0.9)
 
 
     p.add_argument("--skip-dino-when-tracker-healthy", action="store_true")
@@ -4145,24 +5239,6 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--icp-mask-close-kernel", type=int, default=0)
     p.add_argument("--icp-mask-interior-erosion", type=int, default=0)
-
-    # Bundle 10: A5/A6/B5 — alternative video tracker.
-    # A5: choose backend; default keeps current Cutie behaviour. When set to
-    # sam2 we no longer fall back to Cutie — SAM2 failures propagate.
-    p.add_argument("--video-tracker", choices=["cutie", "sam2"], default="cutie")
-    # B5: pad (in internal-resolution px) of the memory crop used to re-prompt
-    # SAM2 each frame. 0 disables the crop and feeds the full image, matching
-    # current behaviour. Only consulted when --video-tracker sam2 and the
-    # image-predictor path (default SAM2 mode).
-    p.add_argument("--track-memory-crop-padding", type=int, default=0)
-    # True streaming SAM2VideoPredictor with full memory bank across frames
-    # (vs. the default SAM2ImagePredictor-with-prev-mask "length-1 memory"
-    # path). Only consulted when --video-tracker sam2.
-    p.add_argument("--sam2-use-video-predictor", action="store_true")
-    # Sliding-window size for the streaming video-predictor's per-object
-    # output dict. SAM2's memory attention attends to the most recent few
-    # frames (default num_maskmem=7); 16 gives a safe margin.
-    p.add_argument("--sam2-max-memory-frames", type=int, default=16)
 
     return p.parse_args()
 
