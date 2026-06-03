@@ -211,7 +211,9 @@ LATCHED_QOS = QoSProfile(
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
 
-CAMERAS = [
+# All known cameras, in index order. The active set is sliced by --num-cameras
+# (see select_cameras), so cam N maps to zed2i_{N} and the cam{N}-* CLI args.
+ALL_CAMERAS = [
     CameraTopics(
         cam_id="zed2i_1",
         depth_topic="/zed2i_1/zed_node/depth/depth_registered",
@@ -226,7 +228,23 @@ CAMERAS = [
         rgb_topic="/zed2i_2/zed_node/rgb/color/rect/image",
         rgb_info_topic="/zed2i_2/zed_node/rgb/color/rect/image/camera_info",
     ),
+    CameraTopics(
+        cam_id="zed2i_3",
+        depth_topic="/zed2i_3/zed_node/depth/depth_registered",
+        info_topic="/zed2i_3/zed_node/depth/depth_registered/camera_info",
+        rgb_topic="/zed2i_3/zed_node/rgb/color/rect/image",
+        rgb_info_topic="/zed2i_3/zed_node/rgb/color/rect/image/camera_info",
+    ),
 ]
+
+
+def select_cameras(num_cameras: int) -> list[CameraTopics]:
+    """Active camera set for this run (the first `num_cameras` of ALL_CAMERAS)."""
+    if num_cameras < 1 or num_cameras > len(ALL_CAMERAS):
+        raise ValueError(
+            f"num_cameras must be in 1..{len(ALL_CAMERAS)}, got {num_cameras}"
+        )
+    return ALL_CAMERAS[:num_cameras]
 
 class PoseKalmanFilter:
     """
@@ -524,6 +542,9 @@ def T_to_pose_stamped(T: np.ndarray, frame_id: str, stamp) -> PoseStamped:
 
 
 def parse_polygon_string(s: str) -> np.ndarray:
+    # Empty/whitespace => no ROI; resolved to the full frame at use time.
+    if not s or not s.strip():
+        return np.zeros((0, 2), dtype=np.int32)
     vals = [int(v.strip()) for v in s.split(",")]
     if len(vals) % 2 != 0:
         raise ValueError(f"Polygon string must have even number of values: {s}")
@@ -899,6 +920,10 @@ class FoundationPoseTrackerNode(Node):
         self.grabber = grabber
         self.T_base_cam_map = T_base_cam_map
 
+        # Active camera set for this run, sliced by --num-cameras. Everything
+        # downstream iterates self.cameras instead of a hardcoded 2-cam list.
+        self.cameras = select_cameras(int(getattr(args, "num_cameras", 2)))
+
         if not bool(getattr(args, "debug_logging", False)):
             self._null_logger = _NullLogger()
             self.get_logger = lambda: self._null_logger
@@ -915,28 +940,22 @@ class FoundationPoseTrackerNode(Node):
         self.mesh_map = self._build_mesh_map(args.cad_dir)
 
         self.track_states: dict[str, list[ObjectTrackState]] = {
-            c.cam_id: [] for c in CAMERAS
+            c.cam_id: [] for c in self.cameras
         }
 
+        # Per-camera SAM params, built from the cam{N}-* CLI args for each
+        # active camera (cam 1 -> --cam1-*, cam 2 -> --cam2-*, ...).
         self.cam_sam_params: dict[str, CameraSAMParams] = {
-            "zed2i_1": CameraSAMParams(
-                min_mask_area=args.cam1_sam_min_mask_area,
-                min_bbox_side_px=args.cam1_sam_min_bbox_side_px,
-                max_mask_area_ratio=args.cam1_sam_max_mask_area_ratio,
-                max_bbox_area_ratio=args.cam1_sam_max_bbox_area_ratio,
-                border_px=args.cam1_sam_border_px,
-                max_border_fraction=args.cam1_sam_max_border_fraction,
-                roi_polygon=parse_polygon_string(args.cam1_roi_polygon),
-            ),
-            "zed2i_2": CameraSAMParams(
-                min_mask_area=args.cam2_sam_min_mask_area,
-                min_bbox_side_px=args.cam2_sam_min_bbox_side_px,
-                max_mask_area_ratio=args.cam2_sam_max_mask_area_ratio,
-                max_bbox_area_ratio=args.cam2_sam_max_bbox_area_ratio,
-                border_px=args.cam2_sam_border_px,
-                max_border_fraction=args.cam2_sam_max_border_fraction,
-                roi_polygon=parse_polygon_string(args.cam2_roi_polygon),
-            ),
+            cam.cam_id: CameraSAMParams(
+                min_mask_area=getattr(args, f"cam{i}_sam_min_mask_area"),
+                min_bbox_side_px=getattr(args, f"cam{i}_sam_min_bbox_side_px"),
+                max_mask_area_ratio=getattr(args, f"cam{i}_sam_max_mask_area_ratio"),
+                max_bbox_area_ratio=getattr(args, f"cam{i}_sam_max_bbox_area_ratio"),
+                border_px=getattr(args, f"cam{i}_sam_border_px"),
+                max_border_fraction=getattr(args, f"cam{i}_sam_max_border_fraction"),
+                roi_polygon=parse_polygon_string(getattr(args, f"cam{i}_roi_polygon")),
+            )
+            for i, cam in enumerate(self.cameras, start=1)
         }
 
         ref_source = args.reference_source
@@ -979,7 +998,7 @@ class FoundationPoseTrackerNode(Node):
         # differs (boxes from Grounding DINO instead of automatic masks).
         sam_modes = {"sam", "gdino_sam"}
         if args.mask_source in sam_modes:
-            for cam in CAMERAS:
+            for cam in self.cameras:
                 cam_params = self.cam_sam_params[cam.cam_id]
                 self.sam_by_cam[cam.cam_id] = SAMSegmenter(
                     SAMSegmenterConfig(
@@ -1021,7 +1040,7 @@ class FoundationPoseTrackerNode(Node):
             )
 
         self.fp_tracker_by_cam: dict[str, FoundationPoseWrapper] = {}
-        for cam in CAMERAS:
+        for cam in self.cameras:
             self.fp_tracker_by_cam[cam.cam_id] = FoundationPoseWrapper(
                 FoundationPoseConfig(
                     repo_root=args.fp_repo_root,
@@ -1036,14 +1055,14 @@ class FoundationPoseTrackerNode(Node):
         # Pre-cache meshes for faster first init
         self.get_logger().info("Pre-caching meshes for FoundationPose...")
         for obj_id, mesh_path in self.mesh_map.items():
-            for cam in CAMERAS:
+            for cam in self.cameras:
                 self.fp_tracker_by_cam[cam.cam_id].preload_mesh(mesh_path=mesh_path, object_id=obj_id)
                 break  
         self.get_logger().info(f"Pre-cached {len(self.mesh_map)} meshes")
         
         # Real-time tracker (CuteVOS + ICP)
         self.realtime_trackers: dict[str, RealtimeTracker] = {}
-        self.rt_active: dict[str, bool] = {c.cam_id: False for c in CAMERAS}
+        self.rt_active: dict[str, bool] = {c.cam_id: False for c in self.cameras}
 
         self._fused_track_memory: dict[str, dict[str, Any]] = {}
         self._fused_icp_metrics: dict[str, dict[str, Any]] = {}
@@ -1064,7 +1083,7 @@ class FoundationPoseTrackerNode(Node):
             self.get_logger().info("Cutie pre-warmed")
 
         if self._debug_frame_publish_enabled():
-            for c in CAMERAS:
+            for c in self.cameras:
                 cid = c.cam_id
                 self.pub_debug_frame[cid] = self.create_publisher(
                     DebugFrame, f"/perception/fp/debug_frame/{cid}", FAST_QOS
@@ -1077,9 +1096,9 @@ class FoundationPoseTrackerNode(Node):
             f"profile={getattr(self.args, 'tracking_profile', 'default')}"
         )
         self._depth_bias_by_cam = {
-            "zed2i_1": float(self.args.cam1_depth_bias_m),
-            "zed2i_2": float(self.args.cam2_depth_bias_m),
-            }
+            cam.cam_id: float(getattr(self.args, f"cam{i}_depth_bias_m"))
+            for i, cam in enumerate(self.cameras, start=1)
+        }
         self._fused_warmup_count = {}       # track_id -> frames since init
         self._median_pose_buffers = {}      # track_id -> MedianPoseBuffer
         self._T_cam_base_cache: dict[str, np.ndarray] = {}
@@ -1801,6 +1820,13 @@ class FoundationPoseTrackerNode(Node):
         cam_params = self.cam_sam_params[cam_id]
         full_h, full_w = rgb.shape[:2]
         polygon_full = cam_params.roi_polygon
+        # Empty/degenerate ROI (e.g. an untuned cam3) => use the whole frame so
+        # crop/fillPoly/reject stages all behave as a no-op filter.
+        if polygon_full.shape[0] < 3:
+            polygon_full = np.array(
+                [[0, 0], [full_w, 0], [full_w, full_h], [0, full_h]],
+                dtype=np.int32,
+            )
 
         # --- Crop to ROI ---
         t0 = time.time()
@@ -1868,7 +1894,7 @@ class FoundationPoseTrackerNode(Node):
 
         # --- Final filtering ---
         t5 = time.time()
-        masks = reject_outside_roi_polygon(masks, cam_params.roi_polygon)
+        masks = reject_outside_roi_polygon(masks, polygon_full)
         masks = dedup_masks_by_bbox_iou(masks, iou_thresh=self.args.mask_dedup_iou)
         _dprint(f"[TIMING]   Final filter + dedup: {(time.time() - t5)*1000:.0f}ms -> {len(masks)} final")
 
@@ -2129,8 +2155,8 @@ class FoundationPoseTrackerNode(Node):
             is_small_object = bbox_area < 5000
 
             if is_small_object:
-                min_score_for_small = 0.20
-                min_margin_for_small = 0.0
+                min_score_for_small = 0.40
+                min_margin_for_small = 0.025
                 if decision_best_score < min_score_for_small:
                     object_id = "unknown"
                 elif margin < min_margin_for_small:
@@ -3344,7 +3370,9 @@ class FoundationPoseTrackerNode(Node):
         # Run cameras in parallel (or serially if only 1)
 
         if len(camera_work) >= 2:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            # One worker per camera so a 3rd cam overlaps instead of serializing
+            # after the first two (which would ~double tracking-loop latency).
+            with ThreadPoolExecutor(max_workers=len(camera_work)) as pool:
                 futures = [pool.submit(_run_one_camera, v, s) for v, s in camera_work]
                 for f in futures:
                     per_cam_results.update(f.result())
@@ -4298,6 +4326,8 @@ class FoundationPoseTrackerNode(Node):
         # ── Phase 2: Fusion matching ──
         t_fusion = time.time()
         fusion_cfg = FusionConfig(
+            max_centroid_distance=float(self.args.fusion_match_max_centroid_dist_m),
+            match_ambiguity_margin=float(self.args.fusion_match_ambiguity_margin_m),
             debug_enabled=False,
         )
         fused_detections = run_multicam_fusion(
@@ -4753,8 +4783,9 @@ class FoundationPoseTrackerNode(Node):
         torch.cuda.empty_cache()
         t_total = (time.time() - t_start) * 1000
         total_inited = sum(len(s) for s in new_states_by_cam.values())
-        _dprint(f"[TIMING] ========== MULTICAM INIT TOTAL: {t_total:.0f}ms | {total_inited} objects ==========\n")
-
+        self.get_logger().info(
+            f"[TIMING] ========== MULTICAM INIT TOTAL: {t_total:.0f}ms | {total_inited} objects =========="
+        )
     def _reset_tracking_state_for_reinit(self, fused_detections):
         """
         Resets warmup counters, median buffers, Kalman filters, and
@@ -4949,9 +4980,9 @@ def parse_args() -> argparse.Namespace:
                    default="real")
     p.add_argument("--reference-renders-dir", default="Data/reference_renders")
 
-    p.add_argument("--dino-model-name", default="dinov2_vitl14")
-    p.add_argument("--dino-min-score", type=float, default=0.45)
-    p.add_argument("--dino-min-margin", type=float, default=0.0)
+    p.add_argument("--dino-model-name", default="dinov2_vitg14")
+    p.add_argument("--dino-min-score", type=float, default=0.50)
+    p.add_argument("--dino-min-margin", type=float, default=0.05)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
     # Per-object appearance memory: snapshot a clean RGB crop whenever the
@@ -4980,10 +5011,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sam-repo-root", default="external/sam2")
     p.add_argument(
         "--sam-checkpoint",
-        default="external/sam2/checkpoints/sam2.1_hiera_base_plus.pt",
+        default="external/sam2/checkpoints/sam2.1_hiera_large.pt",
     )
     p.add_argument("--sam-model-cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
     p.add_argument("--sam-max-image-side", type=int, default=1536)
+
+    # Number of cameras to use. 2 = zed2i_1+zed2i_2 (default), 3 adds zed2i_3.
+    p.add_argument("--num-cameras", type=int, default=2, choices=[2, 3])
 
     p.add_argument("--cam1-sam-min-mask-area", type=int, default=20)
     p.add_argument("--cam1-sam-min-bbox-side-px", type=int, default=3)
@@ -4999,10 +5033,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cam2-sam-border-px", type=int, default=6)
     p.add_argument("--cam2-sam-max-border-fraction", type=float, default=0.00)
 
+    # cam3 SAM params (only used when --num-cameras 3). Defaults mirror cam2.
+    p.add_argument("--cam3-sam-min-mask-area", type=int, default=10)
+    p.add_argument("--cam3-sam-min-bbox-side-px", type=int, default=2)
+    p.add_argument("--cam3-sam-max-mask-area-ratio", type=float, default=0.06)
+    p.add_argument("--cam3-sam-max-bbox-area-ratio", type=float, default=0.06)
+    p.add_argument("--cam3-sam-border-px", type=int, default=6)
+    p.add_argument("--cam3-sam-max-border-fraction", type=float, default=0.00)
+
     p.add_argument("--cam1-roi-polygon", type=str,
-        default="306,664,1031,346,1506,520,1080,800,1080,1080,550,1080")
+        default="1448,1074,0,750,860,160,1340,200" )
     p.add_argument("--cam2-roi-polygon", type=str,
-        default="530,610,1350,260,1920,500,1700,1080,914,1080")
+        default="900,1080,500,300,1026,230,1812,590")
+    # Empty string => no ROI mask for cam3 until tuned.
+    p.add_argument("--cam3-roi-polygon", type=str, default="")
 
     p.add_argument("--mask-dedup-iou", type=float, default=0.6)
 
@@ -5032,6 +5076,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fused-gate-min-depth-coverage", type=float, default=0.30)
     p.add_argument("--fused-gate-min-cloud-points", type=int, default=40)
     p.add_argument("--fused-gate-max-centroid-dist-m", type=float, default=0.08)
+
+    # Cross-camera fusion MATCHING gate (init-only; distinct from the tracking
+    # gate above). Two per-cam detections fuse into one object iff their base-
+    # frame centroids are within this distance. Tune below the smallest real
+    # object-to-object spacing to avoid merging distinct nearby objects.
+    p.add_argument("--fusion-match-max-centroid-dist-m", type=float, default=0.08)
+    # Geometric ambiguity guard: if a detection's two nearest candidate clusters
+    # are within this margin of each other (both inside the gate), drop it rather
+    # than risk a wrong fuse. 0.0 disables the guard (legacy behaviour).
+    p.add_argument("--fusion-match-ambiguity-margin-m", type=float, default=0.0)
     p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.18)
     p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.015)
 
@@ -5062,6 +5116,7 @@ def parse_args() -> argparse.Namespace:
     # Calibrate: measure known distance, compare to depth reading
     p.add_argument("--cam1-depth-bias-m", type=float, default=0.0)
     p.add_argument("--cam2-depth-bias-m", type=float, default=0.0)
+    p.add_argument("--cam3-depth-bias-m", type=float, default=0.0)
  
     # Distance-weighted cloud merging (mitigates depth bias at distance)
     p.add_argument("--use-weighted-cloud-merge", action="store_true")
@@ -5251,8 +5306,10 @@ def main() -> None:
     rclpy.init()
 
     T_map = load_extrinsics_yaml("config/camera_extrinsics_base.yaml")
+    cameras = select_cameras(args.num_cameras)
+    print(f"[PIPELINE] Using {len(cameras)} cameras: {[c.cam_id for c in cameras]}")
     grabber = MultiCamGrabber(
-        cameras=CAMERAS,
+        cameras=cameras,
         sync_slop_s=0.10,
         use_best_effort_if_unsynced=True,
         static_extrinsics_base_cam=T_map,
