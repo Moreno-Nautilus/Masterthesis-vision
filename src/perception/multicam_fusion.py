@@ -154,20 +154,30 @@ def _arbitrate_label(
     candidate_labels: set[str] = set()
     for d in group:
         sbo = getattr(d, "scores_by_object", None) or {}
-        candidate_labels.update(sbo.keys())
+        candidate_labels.update(
+            lbl for lbl, score in sbo.items()
+            if np.isfinite(float(score))
+        )
         if d.object_id:
             candidate_labels.add(d.object_id)
     if not candidate_labels:
-        return group[0].object_id, False, float(group[0].dino_score), "", 0.0, float(group[0].dino_score)
+        fallback = float(group[0].dino_score)
+        if not np.isfinite(fallback):
+            fallback = 0.0
+        return group[0].object_id, False, fallback, "", 0.0, fallback
 
     sums: dict[str, float] = {lbl: 0.0 for lbl in candidate_labels}
     for d in group:
         sbo = getattr(d, "scores_by_object", None) or {}
         for lbl in candidate_labels:
             if lbl in sbo:
-                sums[lbl] += float(sbo[lbl])
+                score = float(sbo[lbl])
+                if np.isfinite(score):
+                    sums[lbl] += score
             elif lbl == d.object_id:
-                sums[lbl] += float(d.dino_score)
+                score = float(d.dino_score)
+                if np.isfinite(score):
+                    sums[lbl] += score
 
     ranked = sorted(sums.items(), key=lambda kv: (-kv[1], kv[0]))
     winner_lbl, winner_score = ranked[0]
@@ -183,12 +193,55 @@ def _arbitrate_label(
     return winner_lbl, ambiguous, float(winner_score), runner_lbl, float(runner_score), margin
 
 
+def _label_score_vector(det: PerCamDetection) -> dict[str, float]:
+    """Per-class DINO score vector for one detection, falling back to its
+    self-pick (object_id -> dino_score) when raw per-class scores are absent."""
+    sbo = getattr(det, "scores_by_object", None) or {}
+    if sbo:
+        return {k: float(v) for k, v in sbo.items()}
+    if det.object_id:
+        return {det.object_id: float(det.dino_score)}
+    return {}
+
+
+def _label_agreement(det: PerCamDetection, cluster: list[PerCamDetection]) -> float:
+    """Cosine similarity in [0, 1] between a detection's per-class DINO score
+    vector and the cluster's aggregated (summed) score vector. 1.0 = same class
+    with aligned confidence, 0.0 = disjoint classes. Falls back to exact
+    object_id equality when raw per-class scores are unavailable on either side.
+    """
+    a = _label_score_vector(det)
+    b: dict[str, float] = {}
+    for m in cluster:
+        for k, v in _label_score_vector(m).items():
+            b[k] = b.get(k, 0.0) + v
+    if not a or not b:
+        return 1.0 if det.object_id and any(det.object_id == m.object_id for m in cluster) else 0.0
+    labels = set(a) | set(b)
+    va = np.array([a.get(l, 0.0) for l in labels], dtype=np.float64)
+    vb = np.array([b.get(l, 0.0) for l in labels], dtype=np.float64)
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.clip(np.dot(va, vb) / (na * nb), 0.0, 1.0))
+
+
+def _cloud_bbox_diagonal(cloud: np.ndarray | None) -> float:
+    """Bounding-box diagonal of a point cloud in metres. Returns 0 if too few points."""
+    if cloud is None or len(cloud) < 4:
+        return 0.0
+    span = cloud.max(axis=0) - cloud.min(axis=0)
+    return float(np.linalg.norm(span))
+
+
 def match_detections_across_cameras(
     detections_by_cam: dict[str, list[PerCamDetection]],
     max_centroid_distance: float = 0.08,
     label_arbitration_min_margin: float = 0.05,
     label_arbitration_singleton_margin: float = 0.01,
     match_ambiguity_margin: float = 0.0,
+    label_match_penalty_weight: float = 0.0,
+    cloud_extent_gate_scale: float = 0.5,
 ) -> list[list[PerCamDetection]]:
     """
     Cluster detections across N cameras by 3D centroid proximity (geometry-
@@ -212,6 +265,17 @@ def match_detections_across_cameras(
         match_ambiguity_margin: if a detection's two nearest candidate clusters
             are within this margin of each other (both inside the gate), drop it
             rather than risk fusing two distinct nearby objects. 0.0 disables.
+        label_match_penalty_weight: meters of extra matching cost added for a
+            full DINO label disagreement (scaled by 1 - cosine label agreement).
+            Effectively tightens the gate for label-disagreeing pairs so two
+            distinct nearby objects with different identities resist fusing.
+            0.0 disables (pure geometry). Keep small (<~0.03) so it never
+            rejects a true same-object/different-label fuse.
+        cloud_extent_gate_scale: per-pair gate is max(max_centroid_distance,
+            largest_cloud_diagonal * cloud_extent_gate_scale). Large objects
+            (e.g. cooling base, diagonal ~15cm) automatically get a wider gate
+            than small objects (e.g. screws, diagonal ~3cm) without raising the
+            global threshold. Set to 0.0 to disable and use a fixed global gate.
 
     Returns:
         List of matched groups. Each group is a list of 1..N PerCamDetections
@@ -250,23 +314,50 @@ def match_detections_across_cameras(
             continue
 
         centroids = [_cluster_centroid(cl) for cl in clusters]
+        # Representative cloud diagonal per cluster (largest-mask member).
+        cluster_diags = [
+            _cloud_bbox_diagonal(
+                max(cl, key=lambda d: d.mask_area).cloud_base
+            )
+            for cl in clusters
+        ]
         m, k = len(dets), len(clusters)
         cost = np.full((m, k), np.inf, dtype=np.float32)
         for i, d in enumerate(dets):
             ci = d.centroid_base
             if ci is None:
                 continue
+            diag_i = _cloud_bbox_diagonal(d.cloud_base) if cloud_extent_gate_scale > 0.0 else 0.0
             for j, cc in enumerate(centroids):
                 if cc is None:
                     continue
-                cost[i, j] = float(np.linalg.norm(ci - cc))
+                dist = float(np.linalg.norm(ci - cc))
+                # Per-pair adaptive gate: large objects (big cloud diagonal)
+                # get a wider merge window than small ones.
+                if cloud_extent_gate_scale > 0.0:
+                    adaptive_gate = max(
+                        max_centroid_distance,
+                        max(diag_i, cluster_diags[j]) * cloud_extent_gate_scale,
+                    )
+                else:
+                    adaptive_gate = max_centroid_distance
+                if dist > adaptive_gate:
+                    continue  # leave cost[i, j] = inf, pair is ineligible
+                # Soft DINO penalty: nudge label-disagreeing pairs apart so they
+                # only fuse when geometry is well inside the gate. Geometry stays
+                # the primary signal; this is off (0.0) unless explicitly tuned.
+                if label_match_penalty_weight > 0.0:
+                    dist += label_match_penalty_weight * (
+                        1.0 - _label_agreement(d, clusters[j])
+                    )
+                cost[i, j] = dist
 
         joined: set[int] = set()        # det idx -> joined an existing cluster
         used_cluster: set[int] = set()  # cluster idx -> already took a det
         dropped: set[int] = set()       # det idx -> dropped for ambiguity
         while cost.size > 0:
             min_val = float(cost.min())
-            if not np.isfinite(min_val) or min_val > max_centroid_distance:
+            if not np.isfinite(min_val):
                 break
             i_best, j_best = np.unravel_index(cost.argmin(), cost.shape)
             i_best, j_best = int(i_best), int(j_best)
@@ -279,13 +370,11 @@ def match_detections_across_cameras(
                 row[j_best] = np.inf
                 second = float(row.min())
                 if (np.isfinite(second)
-                        and second <= max_centroid_distance
                         and (second - min_val) < match_ambiguity_margin):
                     print(
                         f"[FUSION] MATCH AMBIGUOUS at "
                         f"{tuple(np.round(dets[i_best].centroid_base, 3))}: "
-                        f"{cam_id}={dets[i_best].object_id} within "
-                        f"{max_centroid_distance:.3f}m of two clusters "
+                        f"{cam_id}={dets[i_best].object_id} near two clusters "
                         f"(d1={min_val:.3f} d2={second:.3f}, "
                         f"margin<{match_ambiguity_margin:.3f}) -> DROP (no fuse)"
                     )
@@ -592,6 +681,15 @@ class FusionConfig:
     # inside max_centroid_distance), it is dropped rather than risk fusing two
     # distinct nearby objects. 0.0 disables the guard (legacy behaviour).
     match_ambiguity_margin: float = 0.0
+    # Meters of extra matching cost for a full DINO label disagreement (scaled
+    # by 1 - cosine label agreement). Tightens the gate for label-disagreeing
+    # pairs. 0.0 disables (pure geometry). Keep small to avoid rejecting a true
+    # same-object/different-label fuse.
+    label_match_penalty_weight: float = 0.0
+    # Per-pair gate scaling: gate = max(max_centroid_distance, largest_cloud_diagonal
+    # * cloud_extent_gate_scale). Large objects naturally get a wider window.
+    # 0.0 disables (fixed global gate). ~0.5 is a good starting point.
+    cloud_extent_gate_scale: float = 0.5
     debug_dir: str = ""                     # set to a path to dump debug PLY/PNG
     debug_enabled: bool = False
 
@@ -690,6 +788,18 @@ def build_per_cam_detections(
         for sel in selections:
             if sel.object_id == "unknown":
                 continue
+            dino_score = float(sel.score)
+            if not np.isfinite(dino_score):
+                print(
+                    f"[FUSION] DROP {cam_id}={sel.object_id}: "
+                    f"non-finite selection score {dino_score}"
+                )
+                continue
+            scores_by_object = {
+                str(k): float(v)
+                for k, v in (getattr(sel, "scores_by_object", {}) or {}).items()
+                if np.isfinite(float(v))
+            }
 
             cloud = backproject_masked_depth(
                 depth=view.depth,
@@ -704,7 +814,7 @@ def build_per_cam_detections(
             det = PerCamDetection(
                 cam_id=cam_id,
                 object_id=sel.object_id,
-                dino_score=float(sel.score),
+                dino_score=dino_score,
                 mask=sel.candidate.mask,
                 mask_area=int(sel.candidate.mask.sum()),
                 bbox_xyxy=sel.candidate.bbox_xyxy,
@@ -714,10 +824,7 @@ def build_per_cam_detections(
                 T_base_cam=T_bc,
                 centroid_base=centroid,
                 cloud_base=cloud,
-                scores_by_object={
-                    str(k): float(v)
-                    for k, v in (getattr(sel, "scores_by_object", {}) or {}).items()
-                },
+                scores_by_object=scores_by_object,
             )
             dets.append(det)
 
@@ -928,6 +1035,8 @@ def run_multicam_fusion(
         label_arbitration_min_margin=cfg.label_arbitration_min_margin,
         label_arbitration_singleton_margin=cfg.label_arbitration_singleton_margin,
         match_ambiguity_margin=cfg.match_ambiguity_margin,
+        label_match_penalty_weight=cfg.label_match_penalty_weight,
+        cloud_extent_gate_scale=cfg.cloud_extent_gate_scale,
     )
 
     results = []

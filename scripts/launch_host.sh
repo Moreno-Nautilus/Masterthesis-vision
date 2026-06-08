@@ -5,7 +5,7 @@
 #   window 1: foxglove   — ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 #   window 2: viz1       — visualize_pipeline for zed2i_1
 #   window 3: viz2       — visualize_pipeline for zed2i_2
-#   window 4: viz3       — visualize_pipeline for zed2i_3 (only if NUM_CAMERAS=3)
+#   window 4: viz3       — visualize_pipeline for zed2i_3
 #   window 5: axes       — python3 -m debug_pose_axes
 #
 # Usage:
@@ -13,8 +13,8 @@
 #   scripts/launch_host.sh stop     # kill the session
 #   scripts/launch_host.sh attach   # attach if already running
 #
-# Set NUM_CAMERAS=3 to also open a viz window for the 3rd camera (zed2i_3):
-#   NUM_CAMERAS=3 scripts/launch_host.sh
+# Set NUM_CAMERAS=2 to skip the viz window for the 3rd camera (zed2i_3):
+#   NUM_CAMERAS=2 scripts/launch_host.sh
 #
 # Switch windows in tmux: Ctrl+b then 0/1/2/3/4 (or n/p for next/prev).
 # Detach without killing: Ctrl+b d.
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 SESSION="${SESSION:-mv_host}"
-NUM_CAMERAS="${NUM_CAMERAS:-2}"
+NUM_CAMERAS="${NUM_CAMERAS:-3}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SRC_HOST="export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros/humble/setup.bash && source \"\$HOME/zed_ros2_ws/install/setup.bash\" && source \"$REPO_DIR/install/setup.bash\" && if [ -f \"\$HOME/franka_ros2_ws/install/setup.bash\" ]; then source \"\$HOME/franka_ros2_ws/install/setup.bash\"; fi"

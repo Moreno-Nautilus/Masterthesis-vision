@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 
@@ -50,6 +51,19 @@ class FoundationPoseWrapper:
         self._glctx = None
         self._scorer = None
 
+        # All nvdiffrast / warp / CUDA work for this wrapper MUST run on a single
+        # dedicated thread. nvdiffrast's RasterizeCudaContext and warp kernels are
+        # bound to the thread that created them; touching one from a different
+        # thread corrupts the CUDA context (error 700, illegal memory access at
+        # cudaStreamSynchronize). The ROS MultiThreadedExecutor runs _tick (and
+        # therefore register()) on whichever of its worker threads is free, which
+        # migrates between ticks. Marshalling _build_estimator() and register()
+        # through this 1-worker pool guarantees the context is created AND used on
+        # the same thread for the lifetime of the process.
+        self._gpu_exec = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fp-gpu"
+        )
+
     def _ensure_repo_on_path(self) -> None:
         if not self.repo_root.exists():
             raise FileNotFoundError(f"FoundationPose repo_root does not exist: {self.repo_root}")
@@ -94,7 +108,11 @@ class FoundationPoseWrapper:
             return
         
         try:
-            self._build_estimator(object_id=object_id, mesh_path=mesh_path)
+            # Build on the dedicated GPU thread so the nvdiffrast context is
+            # created there (see __init__).
+            self._gpu_exec.submit(
+                self._build_estimator, object_id=object_id, mesh_path=mesh_path
+            ).result()
             print(f"[FoundationPose] Pre-cached mesh for {object_id}")
         except Exception as e:
             print(f"[FoundationPose] Failed to pre-cache {object_id}: {e}")
@@ -155,29 +173,47 @@ class FoundationPoseWrapper:
         object_debug_dir = self.debug_dir / object_id
         object_debug_dir.mkdir(parents=True, exist_ok=True)
 
-        scorer = self._ScorePredictor()
+        model_pts = np.asarray(mesh.vertices, dtype=np.float32)
+        model_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
 
-        if hasattr(scorer, "model") and scorer.model is not None:
-            scorer.model = scorer.model.float().cuda().eval()
+        if self._est is None:
+            # Build the estimator ONCE. The ScorePredictor / PoseRefinePredictor
+            # networks and the nvdiffrast context are mesh-agnostic; only the mesh
+            # data changes per object. Rebuilding a whole FoundationPose (reloading
+            # both networks + a new RasterizeCudaContext) for every object churned
+            # and fragmented GPU memory, intermittently triggering CUDA error 700
+            # (illegal memory access) once all three cameras pushed ~25 objects
+            # through every init cycle.
+            scorer = self._ScorePredictor()
+            if hasattr(scorer, "model") and scorer.model is not None:
+                scorer.model = scorer.model.float().cuda().eval()
 
-        glctx = self._dr.RasterizeCudaContext()
+            self._glctx = self._dr.RasterizeCudaContext()
 
-        est = self._FoundationPose(
-            model_pts=np.asarray(mesh.vertices, dtype=np.float32),
-            model_normals=np.asarray(mesh.vertex_normals, dtype=np.float32),
-            mesh=mesh,
-            scorer=scorer,
-            refiner=None,
-            debug_dir=str(object_debug_dir),
-            debug=int(self.cfg.debug),
-            glctx=glctx,
-        )
+            self._est = self._FoundationPose(
+                model_pts=model_pts,
+                model_normals=model_normals,
+                mesh=mesh,
+                scorer=scorer,
+                refiner=None,
+                debug_dir=str(object_debug_dir),
+                debug=int(self.cfg.debug),
+                glctx=self._glctx,
+            )
+            self._scorer = scorer
+        else:
+            # Swap only the mesh; reuse the networks, context and rotation grid.
+            # We always use identity symmetry here, so the rotation grid built at
+            # construction stays valid for every object.
+            self._est.reset_object(
+                model_pts=model_pts,
+                model_normals=model_normals,
+                mesh=mesh,
+            )
+            self._est.debug_dir = str(object_debug_dir)
 
         self._mesh_path_loaded = mesh_path
         self._mesh = mesh
-        self._scorer = scorer
-        self._glctx = glctx
-        self._est = est
 
     def estimate_pose(
         self,
@@ -189,6 +225,35 @@ class FoundationPoseWrapper:
         K: np.ndarray,
         mask: np.ndarray,
     ) -> FoundationPoseResult:
+        # CPU-side sanitization is safe on the caller thread; the GPU work
+        # (estimator build + nvdiffrast/warp register) is marshalled onto the
+        # dedicated thread so the CUDA context is never touched cross-thread.
+        rgb = self._sanitize_rgb(rgb)
+        depth = self._sanitize_depth(depth).astype(np.float32)
+        K = self._sanitize_K(K).astype(np.float32)
+        mask = self._sanitize_mask(mask, rgb.shape[:2])
+
+        return self._gpu_exec.submit(
+            self._register_on_gpu_thread,
+            object_id=object_id,
+            mesh_path=mesh_path,
+            rgb=rgb,
+            depth=depth,
+            K=K,
+            mask=mask,
+        ).result()
+
+    def _register_on_gpu_thread(
+        self,
+        *,
+        object_id: str,
+        mesh_path: str,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        K: np.ndarray,
+        mask: np.ndarray,
+    ) -> FoundationPoseResult:
+        """Runs ONLY on self._gpu_exec's single worker thread (see __init__)."""
         try:
             self._build_estimator(object_id=object_id, mesh_path=mesh_path)
         except Exception as e:
@@ -196,11 +261,6 @@ class FoundationPoseWrapper:
                 f"FoundationPose _build_estimator() failed for {object_id} "
                 f"(mesh={mesh_path}): {e}"
             ) from None
-
-        rgb = self._sanitize_rgb(rgb)
-        depth = self._sanitize_depth(depth).astype(np.float32)
-        K = self._sanitize_K(K).astype(np.float32)
-        mask = self._sanitize_mask(mask, rgb.shape[:2])
 
         try:
             if hasattr(self._scorer, "model") and self._scorer.model is not None:

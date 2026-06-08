@@ -1,11 +1,65 @@
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import gc
 
 import numpy as np
 import torch
+
+
+@contextmanager
+def _force_math_sdp_attention():
+    """Force PyTorch's *math* scaled-dot-product-attention backend for the
+    enclosed forward passes, disabling the flash / mem-efficient kernels.
+
+    SAM2's hiera image encoder and mask decoder call F.scaled_dot_product_attention
+    with no backend guard, so PyTorch auto-selects flash/mem-efficient kernels.
+    On some GPU/driver/toolkit combinations (here: RTX 4090 with a CUDA
+    Toolkit-newer-than-Driver skew) those fused kernels intermittently emit
+    garbage — a freshly built model then produces empty/near-empty masks on every
+    forward (the 'cursed build'), randomly ~half the time and independent of
+    bf16/fp32. The math backend is numerically plain and deterministic; it is a
+    bit slower but SAM only runs at init, so the cost is irrelevant. Falls back
+    gracefully across torch SDPA API versions."""
+    try:
+        # torch >= 2.1 preferred API
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        with sdpa_kernel([SDPBackend.MATH]):
+            yield
+        return
+    except Exception:
+        pass
+    try:
+        # older torch fallback
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_mem_efficient=False, enable_math=True
+        ):
+            yield
+        return
+    except Exception:
+        # SDPA backend control unavailable — run unguarded rather than break.
+        yield
+
+
+@contextmanager
+def _suppress_sam_info_logs():
+    """Silence SAM2's per-image `[set_image()]` logging.info spam (3 lines per
+    forward) while keeping warnings/errors. SAM2 logs through the root logger;
+    we raise its effective level to WARNING for the duration of set_image and
+    restore it afterward. The pipeline's own output uses print / the ROS logger,
+    not the `logging` module, so this does not touch it."""
+    root = logging.getLogger()
+    prev_level = root.level
+    if prev_level < logging.WARNING:
+        root.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        root.setLevel(prev_level)
 
 
 @dataclass
@@ -51,7 +105,7 @@ class SAMSegmenterConfig:
     max_aspect_ratio: float = 4.5
 
     # HSV shadow rejection
-    shadow_filter_enabled: bool = True
+    shadow_filter_enabled: bool = False #TRUE
     min_saturation: int = 60
     min_value: int = 80
     max_value_for_low_sat: int = 220
@@ -67,8 +121,130 @@ class SAMSegmenter:
         )
 
         model = self._build_model()
+        self._model = model
         self._predictor = self._build_predictor(model)
         self._auto_mask_generator = self._build_auto_mask_generator(model)
+        self._log_param_health("after-build")
+
+    def _rebuild_model(self) -> bool:
+        """Recreate the SAM model stack for this camera after a persistent
+        collapse. Returns True on a successful swap, False if the rebuild could
+        not complete (in which case the existing model is left untouched).
+
+        CRASH-SAFETY: the new model/predictor/AMG are built into locals FIRST and
+        only swapped onto self once all three succeed. The previous version
+        deleted self._predictor before rebuilding, so any failure during
+        build_sam2() left the segmenter with NO _predictor — permanently bricking
+        this camera (it is cached in sam_by_cam) and crashing every later init
+        tick at set_image(). build_sam2() in particular fails at runtime because
+        Hydra has a single global config search path: Cutie's pre-warm repoints
+        it to external/Cutie/cutie/config after our initial build, so a later
+        build_sam2() raises MissingConfigException for the sam2 configs. Keeping
+        the old (still-usable) predictor on failure means the worst case is one
+        skipped frame, not a dead camera."""
+        print("[SAM-REBUILD] rebuilding SAM model after persistent mask collapse")
+        try:
+            new_model = self._build_model()
+            new_predictor = self._build_predictor(new_model)
+            new_amg = self._build_auto_mask_generator(new_model)
+        except Exception as e:
+            print(f"[SAM-REBUILD] rebuild failed, keeping existing model: {e}")
+            return False
+
+        old_model = getattr(self, "_model", None)
+        old_predictor = getattr(self, "_predictor", None)
+        old_amg = getattr(self, "_auto_mask_generator", None)
+        self._model = new_model
+        self._predictor = new_predictor
+        self._auto_mask_generator = new_amg
+        del old_model, old_predictor, old_amg
+        gc.collect()
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[SAM-REBUILD] empty_cache failed during rebuild: {e}")
+        self._health_logged = False
+        self._log_param_health("after-rebuild")
+        return True
+
+    def _log_param_health(self, tag: str) -> None:
+        """[SAM-WEIGHTS] diagnostic: count parameters AND buffers with NaN/Inf."""
+        try:
+            p_nan = p_inf = p_tot = 0
+            for p in self._model.parameters():
+                p_tot += 1
+                if torch.isnan(p).any():
+                    p_nan += 1
+                if torch.isinf(p).any():
+                    p_inf += 1
+            b_nan = b_inf = b_tot = 0
+            for b in self._model.buffers():
+                b_tot += 1
+                if b.is_floating_point():
+                    if torch.isnan(b).any():
+                        b_nan += 1
+                    if torch.isinf(b).any():
+                        b_inf += 1
+            print(
+                f"[SAM-WEIGHTS:{tag}] params total={p_tot} nan={p_nan} inf={p_inf} | "
+                f"buffers total={b_tot} nan={b_nan} inf={b_inf}"
+            )
+        except Exception as e:
+            print(f"[SAM-WEIGHTS:{tag}] check failed: {e}")
+
+    def warmup(self, max_iters: int = 6) -> bool:
+        """Run dummy forward passes until the model returns a valid mask.
+
+        hiera-large on a fresh CUDA context can emit NaN / empty / sparse masks
+        on its first forward pass(es) — a cold-start quirk; the weights and
+        inputs are clean. Absorbing those here at build time keeps the real
+        init deterministic from cycle 1. Returns True once warm.
+        """
+        # Small saturated block (~3.5% of frame) so the resulting mask clears the
+        # default filters (max_mask_area_ratio=0.06, shadow, fill, aspect) and the
+        # warmup can actually detect "warm" and stop after one forward.
+        dummy = np.full((512, 512, 3), 30, dtype=np.uint8)
+        dummy[208:304, 208:304] = (220, 40, 40)
+        box = np.array([[208, 208, 304, 304]], dtype=np.float32)
+        for i in range(max_iters):
+            try:
+                cands = self.generate_from_boxes(dummy, box)
+            except Exception as e:  # pragma: no cover - defensive
+                print(f"[SAM-WARMUP] iter {i} raised {e!r}")
+                cands = []
+            if cands and np.isfinite(cands[0].score):
+                print(f"[SAM-WARMUP] warm after {i + 1} forward(s)")
+                return True
+        print(f"[SAM-WARMUP] still cold after {max_iters} forward(s) — proceeding anyway")
+        return False
+
+    def warmup_or_rebuild(self, max_rebuilds: int = 4, warmup_iters: int = 6) -> bool:
+        """Warm the model; if it stays persistently cold, rebuild a fresh model
+        and retry, up to max_rebuilds times. Returns True once warm.
+
+        Some builds are 'cursed': the model emits empty/NaN masks no matter how
+        many forward passes it gets (warmup() alone can't fix them — observed as
+        a whole camera that never produces a usable mask and never recovers). A
+        throwaway build only shields the FIRST build, but in practice the 2nd
+        build can be cursed too. Rebuilding until warm is self-correcting for
+        however many leading builds are bad; later builds warm on the first try,
+        so this normally costs at most one extra ~1s build. Meant to run at
+        startup, where rebuilds are cheap and Hydra still resolves the sam2
+        config (and _build_model re-asserts it regardless)."""
+        if self.warmup(max_iters=warmup_iters):
+            return True
+        for attempt in range(1, max_rebuilds + 1):
+            print(f"[SAM-WARMUP] cold model — rebuilding "
+                  f"(attempt {attempt}/{max_rebuilds})")
+            if not self._rebuild_model():
+                print("[SAM-WARMUP] rebuild unavailable; cannot recover cold model")
+                return False
+            if self.warmup(max_iters=warmup_iters):
+                return True
+        print(f"[SAM-WARMUP] still cold after {max_rebuilds} rebuild(s) "
+              f"— proceeding anyway")
+        return False
 
     def _ensure_repo_on_path(self) -> None:
         repo_root = Path(self.cfg.repo_root).resolve()
@@ -89,12 +265,38 @@ class SAMSegmenter:
         # delayed import so the rest of the repo remains importable
         from sam2.build_sam import build_sam2
 
+        # build_sam2() resolves its config through Hydra's SINGLE global config
+        # search path. sam2/__init__ registers the "sam2" config module, but only
+        # `if not GlobalHydra.is_initialized()`. Other packages in this process
+        # (notably Cutie's pre-warm, which runs after our first SAM build) call
+        # hydra.initialize() and repoint that global to THEIR config dir — after
+        # which build_sam2() raises MissingConfigException for the sam2 configs.
+        # That breaks any runtime rebuild. Re-assert the sam2 config module right
+        # before composing so the build is independent of global Hydra state.
+        self._ensure_sam2_hydra_config()
+
         model = build_sam2(
             config_file=self.cfg.model_cfg,
             ckpt_path=str(ckpt),
             device=self.device.type,
         )
         return model
+
+    @staticmethod
+    def _ensure_sam2_hydra_config() -> None:
+        """Point Hydra's global config search path at the sam2 config module,
+        clearing whatever another package (e.g. Cutie) may have initialized it
+        to. Safe to call repeatedly; sam2 only composes (never runs a Hydra job),
+        and Cutie reloads its own config via context-managed initialize() at its
+        own load time, so re-pointing here does not disturb an already-loaded
+        Cutie model."""
+        from hydra import initialize_config_module
+        from hydra.core.global_hydra import GlobalHydra
+
+        gh = GlobalHydra.instance()
+        if gh.is_initialized():
+            gh.clear()
+        initialize_config_module("sam2", version_base="1.2")
 
     def _build_predictor(self, model: Any) -> Any:
         self._ensure_repo_on_path()
@@ -156,33 +358,35 @@ class SAMSegmenter:
         score: float,
         image_shape: tuple[int, int],
         rgb: np.ndarray | None = None,
-    ) -> bool:
+    ) -> str:
+        """Return "" if the mask passes, else a short reason code for why it was
+        rejected (used by the [SAM-REJECT] diagnostic in generate_*)."""
         h, w = image_shape
         area = int(mask.sum())
         if area < self.cfg.min_mask_area:
-            return False
+            return "area_small"
 
         if area > int(self.cfg.max_mask_area_ratio * h * w):
-            return False
+            return "area_large"
 
         x0, y0, x1, y1 = self._bbox_from_mask(mask)
         bw = x1 - x0
         bh = y1 - y0
         if bw < self.cfg.min_bbox_side_px or bh < self.cfg.min_bbox_side_px:
-            return False
+            return "bbox_small"
 
         if not np.isfinite(score):
-            return False
+            return "bad_score"
 
         aspect_ratio = max(bw, bh) / (min(bw, bh) + 1e-6)
         if aspect_ratio > self.cfg.max_aspect_ratio:
-            return False
+            return "aspect"
 
         bbox_area = bw * bh
         if bbox_area > 0:
             fill_ratio = area / bbox_area
             if fill_ratio < 0.20:
-                return False
+                return "fill_ratio"
 
         if self.cfg.shadow_filter_enabled and rgb is not None:
             import cv2
@@ -199,7 +403,7 @@ class SAMSegmenter:
 
                 if mean_saturation < self.cfg.min_saturation:
                     if mean_value > self.cfg.min_value and mean_value < self.cfg.max_value_for_low_sat:
-                        return False
+                        return "shadow"
 
         if area > 5000 and rgb is not None:
             import cv2
@@ -208,14 +412,14 @@ class SAMSegmenter:
             mask_uint8 = mask.astype(np.uint8)
             _, num_features = ndimage.label(mask_uint8)
             if num_features > 1:
-                return False
+                return "fragmented"
 
             eroded = cv2.erode(mask_uint8, np.ones((5, 5), np.uint8), iterations=3)
             _, num_after_erode = ndimage.label(eroded)
             if num_after_erode > 1:
-                return False
+                return "fragmented_erode"
 
-        return True
+        return ""
 
     def generate_from_boxes(
         self,
@@ -236,27 +440,106 @@ class SAMSegmenter:
                     f"box_scores length {box_scores.shape[0]} != boxes {boxes.shape[0]}"
                 )
 
+        if not getattr(self, "_health_logged", False):
+            self._health_logged = True
+            self._log_param_health("first-forward")
+
         rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
         boxes_scaled = boxes * scale if scale != 1.0 else boxes
+        n_boxes = len(boxes)
 
+        # First attempt in the configured precision (bf16 by default).
+        out, _reject = self._predict_boxes_once(
+            rgb, rgb_small, boxes_scaled, scale, box_scores,
+            use_bf16=self.cfg.use_bfloat16,
+        )
+
+        # SAM-collapse recovery: every box's mask falling below min_mask_area at
+        # once is the signature of a degenerate set_image() embedding (a transient
+        # bf16 cold-start glitch), not a genuinely empty scene. Re-encode + re-run
+        # once; if it persists, fall back to fp32 for this frame. Without this a
+        # whole camera silently drops out and init degrades to single-cam.
+        if self._is_mask_collapse(out, n_boxes, _reject):
+            print(f"[SAM-RETRY] from_boxes: {n_boxes} boxes collapsed "
+                  f"(area_small={_reject.get('area_small', 0)}); re-encoding (bf16)")
+            out, _reject = self._predict_boxes_once(
+                rgb, rgb_small, boxes_scaled, scale, box_scores,
+                use_bf16=self.cfg.use_bfloat16,
+            )
+            if self._is_mask_collapse(out, n_boxes, _reject):
+                print(f"[SAM-RETRY] from_boxes: still collapsed; falling back to fp32")
+                out, _reject = self._predict_boxes_once(
+                    rgb, rgb_small, boxes_scaled, scale, box_scores,
+                    use_bf16=False,
+                )
+            if self._is_mask_collapse(out, n_boxes, _reject):
+                # Still collapsed after bf16 + fp32 re-encodes. Do NOT rebuild the
+                # model here: the live collapse is a transient (the model works
+                # again on the next cycle once the GPU settles), and the only
+                # signal we have for "is the rebuild good?" is the synthetic dummy
+                # warmup — which is an unreliable false-negative (a model that
+                # "never warms" on the dummy still segments real images fine). The
+                # old rebuild-until-warm therefore thrashed and, when it gave up,
+                # DROPPED the camera permanently for the cycle. Instead we accept
+                # an empty result for THIS cam THIS cycle; it returns next cycle.
+                print("[SAM-RETRY] from_boxes: still collapsed after fp32; "
+                      "skipping this camera for this cycle (recovers next cycle)")
+
+        if _reject:
+            print(f"[SAM-REJECT] from_boxes: {n_boxes} boxes -> {len(out)} kept "
+                  f"| rejected: {dict(sorted(_reject.items(), key=lambda kv: -kv[1]))}")
+        out.sort(key=lambda x: (x.score, x.area), reverse=True)
+        return out
+
+    @staticmethod
+    def _is_mask_collapse(
+        out: list[SAMMaskCandidate],
+        n_boxes: int,
+        reject: dict[str, int],
+    ) -> bool:
+        """True when the masks collapsed: nothing kept and the vast majority of
+        boxes were rejected as area_small. Requires >=3 boxes so genuinely empty
+        scenes (few proposals) and shadow/area_large rejections don't trigger a
+        retry."""
+        return (
+            len(out) == 0
+            and n_boxes >= 3
+            and reject.get("area_small", 0) >= 0.8 * n_boxes
+        )
+
+    def _predict_boxes_once(
+        self,
+        rgb: np.ndarray,
+        rgb_small: np.ndarray,
+        boxes_scaled: np.ndarray,
+        scale: float,
+        box_scores: np.ndarray | None,
+        use_bf16: bool,
+    ) -> tuple[list[SAMMaskCandidate], dict[str, int]]:
+        """One full set_image() + per-box predict + filter pass. set_image() is
+        called inside so each retry re-encodes the image (a fresh embedding is the
+        actual fix for a collapse)."""
         import cv2
 
         with torch.inference_mode():
-            if self.device.type == "cuda" and self.cfg.use_bfloat16:
+            if self.device.type == "cuda" and use_bf16:
                 ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
             else:
                 # Python 3.10 needs a real context manager; use nullcontext.
                 from contextlib import nullcontext
                 ctx = nullcontext()
-            with ctx:
-                self._predictor.set_image(rgb_small)
+            with ctx, _force_math_sdp_attention():
+                with _suppress_sam_info_logs():
+                    self._predictor.set_image(rgb_small)
                 out: list[SAMMaskCandidate] = []
+                _reject: dict[str, int] = {}  # [SAM-REJECT] diagnostic
                 h0, w0 = rgb.shape[:2]
                 for idx, box in enumerate(boxes_scaled):
                     masks, scores, _ = self._predictor.predict(
                         box=box, multimask_output=False,
                     )
                     if masks is None or len(masks) == 0:
+                        _reject["no_mask"] = _reject.get("no_mask", 0) + 1
                         continue
                     mask_small = np.asarray(masks[0], dtype=np.uint8)
                     if scale != 1.0:
@@ -264,7 +547,9 @@ class SAMSegmenter:
                     else:
                         mask = mask_small > 0
                     score = float(scores[0]) if scores is not None and len(scores) else 0.0
-                    if not self._filter_mask(mask, score, (h0, w0), rgb=rgb):
+                    reason = self._filter_mask(mask, score, (h0, w0), rgb=rgb)
+                    if reason:
+                        _reject[reason] = _reject.get(reason, 0) + 1
                         continue
                     bbox = self._bbox_from_mask(mask)
                     area = int(mask.sum())
@@ -276,8 +561,7 @@ class SAMSegmenter:
                         mask=mask, score=score, bbox_xyxy=bbox, area=area,
                         crop_rgb=crop_rgb, prompt_score=prompt_score,
                     ))
-        out.sort(key=lambda x: (x.score, x.area), reverse=True)
-        return out
+        return out, _reject
 
     def generate_auto(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
         """Automatic mask proposals from one RGB image."""
@@ -297,6 +581,7 @@ class SAMSegmenter:
         import cv2
 
         out: list[SAMMaskCandidate] = []
+        _reject: dict[str, int] = {}  # [SAM-REJECT] diagnostic
         for item in raw_masks:
             mask_small = np.asarray(item["segmentation"], dtype=np.uint8)
 
@@ -307,7 +592,9 @@ class SAMSegmenter:
 
             score = float(item.get("predicted_iou", 0.0))
 
-            if not self._filter_mask(mask, score, (h0, w0), rgb=rgb):
+            reason = self._filter_mask(mask, score, (h0, w0), rgb=rgb)
+            if reason:
+                _reject[reason] = _reject.get(reason, 0) + 1
                 continue
 
             bbox = self._bbox_from_mask(mask)
@@ -324,5 +611,8 @@ class SAMSegmenter:
                 )
             )
 
+        if _reject:
+            print(f"[SAM-REJECT] auto: {len(raw_masks)} raw -> {len(out)} kept "
+                  f"| rejected: {dict(sorted(_reject.items(), key=lambda kv: -kv[1]))}")
         out.sort(key=lambda x: (x.score, x.area), reverse=True)
         return out
