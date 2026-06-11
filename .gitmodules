@@ -1,0 +1,12 @@
+[submodule "external/FoundationPose"]
+	path = external/FoundationPose
+	url = https://github.com/NVlabs/FoundationPose.git
+[submodule "external/dinov2"]
+	path = external/dinov2
+	url = https://github.com/facebookresearch/dinov2.git
+[submodule "external/sam2"]
+	path = external/sam2
+	url = https://github.com/facebookresearch/sam2.git
+[submodule "external/sam3"]
+	path = external/sam3
+	url = https://github.com/facebookresearch/sam3.git
