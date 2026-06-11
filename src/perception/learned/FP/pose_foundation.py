@@ -51,15 +51,7 @@ class FoundationPoseWrapper:
         self._glctx = None
         self._scorer = None
 
-        # All nvdiffrast / warp / CUDA work for this wrapper MUST run on a single
-        # dedicated thread. nvdiffrast's RasterizeCudaContext and warp kernels are
-        # bound to the thread that created them; touching one from a different
-        # thread corrupts the CUDA context (error 700, illegal memory access at
-        # cudaStreamSynchronize). The ROS MultiThreadedExecutor runs _tick (and
-        # therefore register()) on whichever of its worker threads is free, which
-        # migrates between ticks. Marshalling _build_estimator() and register()
-        # through this 1-worker pool guarantees the context is created AND used on
-        # the same thread for the lifetime of the process.
+
         self._gpu_exec = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="fp-gpu"
         )
@@ -108,8 +100,6 @@ class FoundationPoseWrapper:
             return
         
         try:
-            # Build on the dedicated GPU thread so the nvdiffrast context is
-            # created there (see __init__).
             self._gpu_exec.submit(
                 self._build_estimator, object_id=object_id, mesh_path=mesh_path
             ).result()
@@ -177,13 +167,6 @@ class FoundationPoseWrapper:
         model_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
 
         if self._est is None:
-            # Build the estimator ONCE. The ScorePredictor / PoseRefinePredictor
-            # networks and the nvdiffrast context are mesh-agnostic; only the mesh
-            # data changes per object. Rebuilding a whole FoundationPose (reloading
-            # both networks + a new RasterizeCudaContext) for every object churned
-            # and fragmented GPU memory, intermittently triggering CUDA error 700
-            # (illegal memory access) once all three cameras pushed ~25 objects
-            # through every init cycle.
             scorer = self._ScorePredictor()
             if hasattr(scorer, "model") and scorer.model is not None:
                 scorer.model = scorer.model.float().cuda().eval()
@@ -202,9 +185,6 @@ class FoundationPoseWrapper:
             )
             self._scorer = scorer
         else:
-            # Swap only the mesh; reuse the networks, context and rotation grid.
-            # We always use identity symmetry here, so the rotation grid built at
-            # construction stays valid for every object.
             self._est.reset_object(
                 model_pts=model_pts,
                 model_normals=model_normals,
@@ -225,9 +205,7 @@ class FoundationPoseWrapper:
         K: np.ndarray,
         mask: np.ndarray,
     ) -> FoundationPoseResult:
-        # CPU-side sanitization is safe on the caller thread; the GPU work
-        # (estimator build + nvdiffrast/warp register) is marshalled onto the
-        # dedicated thread so the CUDA context is never touched cross-thread.
+    
         rgb = self._sanitize_rgb(rgb)
         depth = self._sanitize_depth(depth).astype(np.float32)
         K = self._sanitize_K(K).astype(np.float32)
@@ -253,7 +231,7 @@ class FoundationPoseWrapper:
         K: np.ndarray,
         mask: np.ndarray,
     ) -> FoundationPoseResult:
-        """Runs ONLY on self._gpu_exec's single worker thread (see __init__)."""
+        """Runs ONLY on self._gpu_exec's single worker thread """
         try:
             self._build_estimator(object_id=object_id, mesh_path=mesh_path)
         except Exception as e:

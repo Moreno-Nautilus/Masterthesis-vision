@@ -1,32 +1,3 @@
-"""Generate synthetic DINO reference crops by rendering CAD meshes from
-multiple viewpoints.
-
-Output layout matches what DINOIdentifier expects:
-
-    <out_dir>/<object_id>/<view_idx>.png
-
-Each output PNG is the rendered object on a black background, cropped tight
-around the object silhouette and (optionally) padded.
-
-Usage:
-    python3 tools/generate_dino_reference_renders.py \
-        --cad-dir Data/CAD_Models_centered \
-        --out-dir Data/reference_renders \
-        --views 42 \
-        --image-size 512 \
-        --mesh-scale 0.01
-
-Notes
------
-- Uses Open3D's offscreen renderer when DISPLAY is unset, falls back to
-  trimesh + pyrender otherwise. We default to Open3D's OffscreenRenderer
-  since it's already a dependency in this repo.
-- Viewpoints are sampled on a Fibonacci sphere. Camera looks at the mesh
-  centroid; up is +Y unless the polar angle is too close to ±Y.
-- Background is set to black so DINOIdentifier's masked-background path
-  doesn't double-mask. The generated images are tight crops around the
-  rendered silhouette so DINOv2's resize-to-518 keeps the object large.
-"""
 from __future__ import annotations
 
 import argparse
@@ -145,9 +116,7 @@ def render_object_views(
         img = renderer.render_to_image()
         rgb = np.asarray(img)  # (H, W, 3) uint8
 
-        # Crop to silhouette using non-black pixels. Threshold above the
-        # faint ambient scatter on the background (defaultLit + matte
-        # material spills a little light across the scene).
+
         non_bg = rgb.max(axis=2) > 15
         if not non_bg.any():
             continue

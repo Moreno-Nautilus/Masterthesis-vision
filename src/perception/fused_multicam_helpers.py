@@ -1,10 +1,3 @@
-"""
-fused_multicam_helpers.py
-
-Helper functions for multi-camera fused pose estimation.
-Used by both init (dual-FP + ICP refinement + weighted average)
-and tracking (Cutie per-cam + fused ICP).
-"""
 from __future__ import annotations
 
 from collections import deque
@@ -49,9 +42,7 @@ def fill_depth_holes_in_mask(
 ) -> np.ndarray:
     """
     Fill zero / non-finite depth holes that fall inside `mask` using a
-    median blur, leaving outside-mask pixels untouched. Cheap (a single
-    cv2.medianBlur on uint16) and good enough for the small holes ZED
-    leaves on shiny / black surfaces.
+    median blur, leaving outside-mask pixels untouched.
     """
     import cv2
 
@@ -86,7 +77,6 @@ def lift_masked_depth_to_base(
     z_min: float = 0.05,
     z_max: float = 3.0,
     voxel_size: float = 0.002,
-    depth_bias_m: float = 0.0,
     mask_morph_close_kernel: int = 0,
     mask_interior_erosion: int = 0,
 ) -> Optional[o3d.geometry.PointCloud]:
@@ -119,10 +109,6 @@ def lift_masked_depth_to_base(
 
     ys, xs = np.where(mask_bool)
     zs = depth[ys, xs].astype(np.float64)
-
-    # Apply per-camera depth bias correction
-    if abs(depth_bias_m) > 1e-6:
-        zs = zs + depth_bias_m
 
     valid = np.isfinite(zs) & (zs > z_min) & (zs < z_max)
     if valid.sum() < 10:
@@ -292,8 +278,7 @@ def evaluate_icp_in_base_frame(
     max_correspondence_dist: float = 0.05,
 ) -> tuple[float, float]:
     """Return (fitness, inlier_rmse) for the given transform without running
-    ICP iterations. Use after a non-ICP refinement (symmetry grid, FP-refine)
-    so logged metrics and fusion weights reflect the final pose.
+    ICP iterations.
     """
     T = np.asarray(T_base_object, dtype=np.float64).reshape(4, 4)
     result = o3d.pipelines.registration.evaluate_registration(
@@ -374,22 +359,6 @@ class MedianPoseBuffer:
     @property
     def count(self) -> int:
         return len(self._buffer)
-
-
-# ─── X-bias correction utility ──────────────────────────────────────────
-
-def apply_x_bias_correction(
-    T_base: np.ndarray,
-    x_bias_m: float,
-) -> np.ndarray:
-    """
-    Apply a constant correction to the x-component of a base-frame pose.
-
-    If measurements consistently underestimate x, set x_bias_m > 0 to compensate.
-    """
-    T_corrected = T_base.copy()
-    T_corrected[0, 3] += x_bias_m
-    return T_corrected
 
 
 # ─── Weighted pose averaging ────────────────────────────────────────────

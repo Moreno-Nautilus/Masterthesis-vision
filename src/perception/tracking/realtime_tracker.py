@@ -198,9 +198,7 @@ class RealtimeTracker:
         K = K if K is not None else self._K
         t0 = time.time()
 
-        # =====================================================================
         # Stage 1: Mask tracking with Cutie.
-        # =====================================================================
         occlusion_score = 0.0
         backend_used = self._mask_backend
         try:
@@ -221,10 +219,8 @@ class RealtimeTracker:
                 cutie_ms=cutie_ms,
             )
 
-        # =====================================================================
         # Mask-only fast path: skip ICP, return pose unchanged. The fused-cloud
         # ICP downstream is the authoritative pose refinement.
-        # =====================================================================
         if skip_icp:
             self._lost_count = 0
             self._frame_count += 1
@@ -247,9 +243,7 @@ class RealtimeTracker:
                 mask_backend=backend_used,
             )
         
-        # =====================================================================
         # Stage 2: Pose refinement with ICP
-        # =====================================================================
         t1 = time.time()
         
         try:
@@ -271,9 +265,7 @@ class RealtimeTracker:
         
         icp_ms = icp_result.elapsed_ms
         
-        # =====================================================================
         # Stage 3: Quality checks
-        # =====================================================================
         
         # Check ICP quality
         if icp_result.fitness < self.cfg.min_icp_fitness:
@@ -304,9 +296,7 @@ class RealtimeTracker:
                 icp_rmse=icp_result.inlier_rmse,
             )
         
-        # =====================================================================
         # Success: Update state
-        # =====================================================================
         self._T_prev = self._T_current.copy()
         self._T_current = T_new.copy()
         self._lost_count = 0

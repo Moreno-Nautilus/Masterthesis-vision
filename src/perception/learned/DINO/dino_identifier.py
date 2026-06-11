@@ -275,7 +275,6 @@ class DINOIdentifier:
         denom = qq + rr - qr
         return qr / np.maximum(denom, 1e-12)
 
-    # ── per-class score aggregation helpers ────────────────────────────────
     def _aggregate_per_class(
         self,
         sims: np.ndarray,

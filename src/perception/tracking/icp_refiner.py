@@ -40,14 +40,7 @@ class ICPConfig:
     nb_neighbors: int = 20
     std_ratio: float = 2.0
 
-    # Bundle 11: morphological close on the mask before sampling depth.
-    # Closes pinholes from speculars / partial occluders so the cloud
-    # isn't shot through with background depth. 0 disables.
     mask_morph_close_kernel: int = 0
-    # Bundle 11: per-pixel "depth confidence" proxy via mask interior
-    # erosion. Drops pixels within this many px of the mask boundary,
-    # where ZED depth is least reliable (subpixel edge artefacts).
-    # 0 disables and keeps every masked pixel.
     mask_interior_erosion: int = 0
 
 
@@ -65,19 +58,6 @@ class ICPResult:
 class ICPRefiner:
     """
     Point cloud registration for pose refinement.
-    
-    Usage:
-        refiner = ICPRefiner(ICPConfig())
-        refiner.set_model_cloud(mesh_vertices)  # Once per object
-        
-        for frame in video:
-            result = refiner.refine(
-                depth=depth_image,
-                rgb=rgb_image,
-                mask=tracked_mask,
-                K=camera_intrinsics,
-                T_init=previous_pose,
-            )
     """
     
     def __init__(self, cfg: Optional[ICPConfig] = None):
@@ -149,7 +129,6 @@ class ICPRefiner:
         # Sample points
         cloud = mesh.sample_points_uniformly(number_of_points=num_points)
         
-        # NEW: Re-center based on center of mass of sampled points
         pts = np.asarray(cloud.points)
         center_of_mass = pts.mean(axis=0)
         cloud.translate(-center_of_mass)
@@ -165,10 +144,6 @@ class ICPRefiner:
 
         mask_bool = mask.astype(bool, copy=False)
 
-        # Bundle 11: optional morphological close + interior erosion on the
-        # mask before sampling depth. Close fills tiny holes (specular
-        # speckles, partial occluders); erosion drops boundary pixels that
-        # are the noisiest depth pixels on ZED.
         close_k = int(self.cfg.mask_morph_close_kernel)
         erode_k = int(self.cfg.mask_interior_erosion)
         if close_k > 0 or erode_k > 0:
@@ -271,10 +246,6 @@ class ICPRefiner:
                     elapsed_ms=(time.time() - t0) * 1000,
                 )
             
-            # Pass T_init directly to registration_icp via the `init` arg —
-            # avoids copying + transforming the model cloud every frame and
-            # avoids re-estimating normals (model normals from set_model_cloud
-            # stay valid in object frame since the source isn't transformed).
             source_model = self._model_cloud_down
             T_init64 = T_init.astype(np.float64)
 

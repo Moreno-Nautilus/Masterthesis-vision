@@ -1,16 +1,3 @@
-"""
-Fixed external visualizer for FoundationPose.
-
-Adds:
-1. Correct camera-frame object axes drawing: pose_camera is NOT inverted.
-2. Base-frame axes projected into the camera image at the object origin.
-3. z-vs-base-z angle printed on the image.
-4. Optional extrinsics YAML loading for T_base_cam.
-5. Track and pose overlays both show:
-   - O/x/y/z = object local axes from pose_camera
-   - Bx/By/Bz = base-frame axes projected into image
-"""
-
 from __future__ import annotations
 
 import argparse

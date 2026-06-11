@@ -66,7 +66,6 @@ from src.perception.fused_multicam_helpers import (
     chamfer_distance_one_way,
     weighted_average_poses,
     MedianPoseBuffer,
-    apply_x_bias_correction,
     fill_depth_holes_in_mask,
 )
 
@@ -249,8 +248,7 @@ LATCHED_QOS = QoSProfile(
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
 
-# All known cameras, in index order. The active set is sliced by --num-cameras
-# (see select_cameras), so cam N maps to zed2i_{N} and the cam{N}-* CLI args.
+
 ALL_CAMERAS = [
     CameraTopics(
         cam_id="zed2i_1",
@@ -667,24 +665,6 @@ def bbox_crop_with_local_mask(
     )
 
 
-def apply_clahe_rgb(
-    rgb: np.ndarray,
-    clip_limit: float = 2.0,
-    grid_size: int = 8,
-) -> np.ndarray:
-    """CLAHE on the L channel of LAB. Returns a new (H, W, 3) uint8 RGB array.
-    """
-    if rgb.size == 0:
-        return rgb
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    clahe = cv2.createCLAHE(
-        clipLimit=float(clip_limit),
-        tileGridSize=(int(grid_size), int(grid_size)),
-    )
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-
 def upscale_crop_if_small(
     rgb: np.ndarray,
     mask: np.ndarray,
@@ -958,14 +938,8 @@ class FoundationPoseTrackerNode(Node):
         self.grabber = grabber
         self.T_base_cam_map = T_base_cam_map
 
-        # Active camera set for this run, sliced by --num-cameras. Everything
-        # downstream iterates self.cameras instead of a hardcoded 2-cam list.
         self.cameras = select_cameras(int(getattr(args, "num_cameras", 2)))
 
-        # Route every get_logger() call through the single-stream unified logger
-        # (stdout + flush) instead of the ROS logger (stderr) so the redirected
-        # log is ordered and consistent. Verbosity follows --debug-logging:
-        # info/debug are gated, warn/error/fatal always print.
         self._unified_logger = _UnifiedLogger(
             verbose=bool(getattr(args, "debug_logging", False))
         )
@@ -1037,42 +1011,16 @@ class FoundationPoseTrackerNode(Node):
 
         self.sam: Optional[SAMSegmenter] = None
 
-        # One SAM2 instance per camera. SAM2 normalizes every input to its own
-        # 1024px grid internally, so per-camera image sizes are irrelevant to the
-        # model; per-cam configs differ only in downstream min-area / min-bbox
-        # filters. TWO independent hiera-large quirks are worked around here:
-        #   (1) The FIRST build_sam2() in a process yields a PERMANENTLY broken
-        #       model (NaN forward forever) — warmup cannot fix it. We build a
-        #       throwaway first to absorb it, so every real per-cam model is a
-        #       2nd+ build. (This is why cam1 — the first build — was the weak one.)
-        #   (2) A freshly built (healthy) model can still emit NaN/empty/sparse
-        #       masks on its first forward pass(es) on a cold CUDA context. We warm
-        #       each model up (SAMSegmenter.warmup) until it returns a valid mask.
-        # Need BOTH: throwaway alone left cam2/cam3 cold; warmup alone left cam1
-        # (the cursed first build) broken.
         sam_modes = {"sam", "gdino_sam"}
         if args.mask_source in sam_modes:
             use_bf16 = not bool(getattr(args, "sam_fp32", False))
-            # Make the precision unambiguous in every log — bf16 vs fp32 is the
-            # single biggest driver of the random mask-collapse, so we must be
-            # able to tell at a glance which one a run used.
             print(
                 f"[SAM-PRECISION] use_bfloat16={use_bf16} "
                 f"({'bf16 autocast' if use_bf16 else 'fp32'}) "
                 f"| pass --sam-fp32 to force fp32",
                 flush=True,
             )
-            # ONE shared SAM model for ALL cameras. The per-camera SAMSegmenters
-            # were identical except for the min_mask_area / min_bbox_side_px
-            # filters (now re-applied per camera downstream in
-            # _generate_and_filter_masks), so 3 separate models just tripled VRAM
-            # for no benefit. SAM's mask "collapse" is driven by low free VRAM
-            # (<~2GB → the encoder forward silently returns empty masks), so fewer
-            # resident models = more headroom = far fewer collapses. The model is
-            # built with the most permissive (smallest) min_* across cameras so it
-            # never over-filters for any one camera. No throwaway needed —
-            # warmup_or_rebuild already handles a cursed first build, and dropping
-            # the throwaway saves its ~0.6GB during the critical warmup window.
+            # ONE shared SAM model for ALL cameras. 
             min_area = min(p.min_mask_area for p in self.cam_sam_params.values())
             min_bbox = min(p.min_bbox_side_px for p in self.cam_sam_params.values())
             self.get_logger().info("Building shared SAM model for all cameras...")
@@ -1116,14 +1064,6 @@ class FoundationPoseTrackerNode(Node):
                     text_prompts=text_prompts,
                 )
             )
-            # Eagerly load GDINO's weights NOW, during __init__, instead of
-            # lazily on the first propose() call. Lazy-loading meant GDINO pulled
-            # its ~1.2GB model onto the GPU *during the first init cycle*, right
-            # before SAM ran — and that startup load-churn window is exactly where
-            # SAM intermittently collapsed (confirmed: collapses cluster in cycles
-            # 1-2 around the 'Loading weights' line). DINO/Cutie/FP are already
-            # pre-loaded here; this makes GDINO match so the first real cycle runs
-            # on a fully-settled GPU.
             try:
                 self.gdino_proposer._lazy_load()
             except Exception as e:
@@ -1133,17 +1073,7 @@ class FoundationPoseTrackerNode(Node):
                 f"prompts={text_prompts}"
             )
 
-        # ONE shared FoundationPose wrapper for ALL cameras — i.e. a single
-        # estimator, a single nvdiffrast RasterizeCudaContext, and a single GPU
-        # worker thread. Previously there was one wrapper per camera (3 separate
-        # CudaRaster contexts). nvdiffrast's CudaRaster backend keeps process-
-        # global CUDA state; multiple contexts created on multiple threads race
-        # on it and intermittently corrupt the rasterizer, crashing fineRasterKernel
-        # with CUDA error 700 (illegal memory access) — confirmed via
-        # CUDA_LAUNCH_BLOCKING. FP init runs serially (one object across all cams
-        # before the next), so a single shared estimator is correct and actually
-        # cheaper: all cameras for one object reuse the same loaded mesh, so the
-        # mesh is swapped once per object instead of once per (object, camera).
+        # ONE shared FoundationPose wrapper for ALL cameras
         self.fp_tracker = FoundationPoseWrapper(
             FoundationPoseConfig(
                 repo_root=args.fp_repo_root,
@@ -1196,10 +1126,6 @@ class FoundationPoseTrackerNode(Node):
             f"tracking_backend={getattr(self.args, 'tracking_backend', 'cutie')} "
             f"profile={getattr(self.args, 'tracking_profile', 'default')}"
         )
-        self._depth_bias_by_cam = {
-            cam.cam_id: float(getattr(self.args, f"cam{i}_depth_bias_m"))
-            for i, cam in enumerate(self.cameras, start=1)
-        }
         self._fused_warmup_count = {}       # track_id -> frames since init
         self._median_pose_buffers = {}      # track_id -> MedianPoseBuffer
         self._T_cam_base_cache: dict[str, np.ndarray] = {}
@@ -1281,9 +1207,7 @@ class FoundationPoseTrackerNode(Node):
     ) -> str:
         """At init, try to reuse an existing track_id whose last accepted
         base-frame centroid is within match_radius_m of the new detection's
-        centroid. Falls back to allocating a fresh id. Preserves Kalman /
-        memory / pose_status continuity across reinit cycles when the same
-        physical instance is re-detected."""
+        centroid. Falls back to allocating a fresh id."""
         c = np.asarray(base_centroid, dtype=np.float64).reshape(3)
         best_tid: Optional[str] = None
         best_dist = float("inf")
@@ -1342,17 +1266,6 @@ class FoundationPoseTrackerNode(Node):
         mats.extend(list(SciRot.random(num=n - 1, random_state=42).as_matrix()))
         return mats
 
-    @staticmethod
-    def _jitter_rotations(R_center: np.ndarray, n: int, max_deg: float, seed: int = 0) -> list[np.ndarray]:
-        """n random rotations with axis-angle magnitude ≤ max_deg, applied to R_center."""
-        from scipy.spatial.transform import Rotation as SciRot
-        rng = np.random.default_rng(seed)
-        axes = rng.normal(size=(n, 3))
-        axes /= (np.linalg.norm(axes, axis=1, keepdims=True) + 1e-12)
-        angles = rng.uniform(0.0, np.radians(max_deg), size=n)
-        R_jit = SciRot.from_rotvec(axes * angles[:, None]).as_matrix()
-        return [R_center @ R_j for R_j in R_jit]
-
     def _grid_chamfer(
         self,
         model_pcd,
@@ -1382,12 +1295,6 @@ class FoundationPoseTrackerNode(Node):
             n_rot = int(getattr(self.args, "icp_grid_n_rot", 100))
             prescreen = bool(getattr(self.args, "icp_grid_prescreen", False))
             prescreen_tau = float(getattr(self.args, "icp_grid_prescreen_tau", 0.06))
-            second_pass = bool(getattr(self.args, "icp_grid_second_pass", False))
-            second_k = int(getattr(self.args, "icp_grid_second_pass_k", 3))
-            second_n = int(getattr(self.args, "icp_grid_second_pass_n", 8))
-            second_jitter = float(getattr(self.args, "icp_grid_second_pass_jitter_deg", 15.0))
-            tie_by_inliers = bool(getattr(self.args, "icp_grid_tie_by_inliers", False))
-            tie_chamfer_eps = float(getattr(self.args, "icp_grid_tie_chamfer_eps_m", 0.0005))
 
             CANDIDATES = self._fibonacci_rotations(n_rot)
 
@@ -1418,35 +1325,7 @@ class FoundationPoseTrackerNode(Node):
 
             scored.sort(key=lambda x: x[0])
 
-            if second_pass and second_k > 0 and second_n > 0:
-                for k_idx, (_, _, _, R_top) in enumerate(scored[:second_k]):
-                    for R_jit in self._jitter_rotations(R_top, second_n, second_jitter, seed=42 + k_idx):
-                        T_seed = np.eye(4, dtype=np.float32)
-                        T_seed[:3, :3] = R_jit.astype(np.float32)
-                        T_seed[:3, 3] = t_base
-
-                        if prescreen:
-                            raw_ch = chamfer_distance_one_way(model_pcd, fused_cloud, T_seed)
-                            if raw_ch > prescreen_tau:
-                                continue
-
-                        T_ref, fit, _ = run_icp_in_base_frame(
-                            fused_cloud, model_pcd, T_seed, max_iteration=30,
-                            variant=self.args.icp_variant,
-                        )
-                        if fit < 0.10:
-                            continue
-                        ch = self._grid_chamfer(model_pcd, fused_cloud, per_cam_clouds, T_ref)
-                        scored.append((ch, T_ref, fit, R_jit.astype(np.float32)))
-
-                scored.sort(key=lambda x: x[0])
-
             best = scored[0]
-            if tie_by_inliers and len(scored) >= 2:
-                # Among entries within tie_chamfer_eps of the best, pick highest fitness.
-                ties = [s for s in scored if s[0] <= best[0] + tie_chamfer_eps]
-                best = max(ties, key=lambda s: s[2])
-
             return best[1], float(best[0])
 
     def _log_base_pose(
@@ -1920,9 +1799,7 @@ class FoundationPoseTrackerNode(Node):
         sam = self.sam
         cam_params = self.cam_sam_params[cam_id]
 
-        # [VRAM] free-memory at each SAM forward. SAM masks collapse to empty
-        # when free VRAM drops below ~2GB, so logging it here lets us correlate a
-        # zero-mask cam-cycle with the headroom at that moment.
+        # [VRAM] free-memory at each SAM forward.
         try:
             _free, _total = torch.cuda.mem_get_info()
             _dprint(f"[VRAM] {cam_id}: free={_free/1e9:.2f}GB / {_total/1e9:.1f}GB")
@@ -1930,8 +1807,6 @@ class FoundationPoseTrackerNode(Node):
             pass
         full_h, full_w = rgb.shape[:2]
         polygon_full = cam_params.roi_polygon
-        # Empty/degenerate ROI (e.g. an untuned cam3) => use the whole frame so
-        # crop/fillPoly/reject stages all behave as a no-op filter.
         if polygon_full.shape[0] < 3:
             polygon_full = np.array(
                 [[0, 0], [full_w, 0], [full_w, full_h], [0, full_h]],
@@ -1948,14 +1823,6 @@ class FoundationPoseTrackerNode(Node):
         rgb_crop_masked = rgb_crop.copy()
         rgb_crop_masked[roi_mask_crop == 0] = 0
 
-        # CLAHE
-        if bool(getattr(self.args, "clahe_enabled", False)):
-            rgb_crop_masked = apply_clahe_rgb(
-                rgb_crop_masked,
-                clip_limit=float(self.args.clahe_clip_limit),
-                grid_size=int(self.args.clahe_grid_size),
-            )
-
         _dprint(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
 
         # --- Main proposal stage ---
@@ -1963,10 +1830,7 @@ class FoundationPoseTrackerNode(Node):
         if (self.args.mask_source == "gdino_sam"
                 and self.gdino_proposer is not None):
             proposals = self.gdino_proposer.propose(rgb_crop_masked)
-            # Record how many box proposals SAM was handed this call — used to
-            # distinguish a genuinely empty scene (no boxes) from a bad SAM
-            # session (boxes present but every mask collapses) in the dead-init
-            # auto-restart detector.
+            # Record how many box proposals SAM was handed this call
             self._last_sam_n_boxes = len(proposals)
             if proposals:
                 boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
@@ -2004,10 +1868,7 @@ class FoundationPoseTrackerNode(Node):
         else:
             # --- Filtering ---
             t2 = time.time()
-            # Per-camera min area / min bbox side. The shared SAM model is built
-            # with the loosest min across cameras, so re-apply this camera's
-            # (possibly stricter) thresholds here. No-op when all cameras share
-            # the same values.
+            # Per-camera min area / min bbox side.
             masks_crop = [
                 m for m in masks_crop
                 if m.area >= cam_params.min_mask_area
@@ -2133,8 +1994,7 @@ class FoundationPoseTrackerNode(Node):
         ambiguous_objects: Optional[set[str]] = None,
         ) -> dict[str, float]:
         """Return max cosine similarity between the query embedding and each
-        object's memory bank. Objects with empty banks are omitted. Assumes
-        all embeddings are L2-normalised (DINO default)."""
+        object's memory bank. Assumes all embeddings are L2-normalised."""
         out: dict[str, float] = {}
         if query_embedding is None:
             return out
@@ -2782,7 +2642,6 @@ class FoundationPoseTrackerNode(Node):
             z_min=float(getattr(self.args, "min_valid_z_m", 0.05)),
             z_max=float(getattr(self.args, "max_valid_z_m", 3.0)),
             voxel_size=float(getattr(self.args, "projected_icp_voxel_size_m", 0.003)),
-            depth_bias_m=self._depth_bias_by_cam.get(cam_id, 0.0),
             mask_morph_close_kernel=int(getattr(self.args, "icp_mask_close_kernel", 0)),
             mask_interior_erosion=int(getattr(self.args, "icp_mask_interior_erosion", 0)),
         )
@@ -3063,10 +2922,6 @@ class FoundationPoseTrackerNode(Node):
                     buf.push(T_base_refined)
                     if buf.is_ready():
                         T_base_publish = buf.get_median()
-
-                x_bias = float(getattr(self.args, "x_bias_correction_m", 0.0))
-                if abs(x_bias) > 1e-6:
-                    T_base_publish = apply_x_bias_correction(T_base_publish, x_bias)
 
                 decision.update({
                     "mode": "projected_icp",
@@ -3394,9 +3249,8 @@ class FoundationPoseTrackerNode(Node):
             metrics["reason"] = f"depth_coverage_low({depth_coverage:.2f})"
             return metrics
     
-        # ── Build point cloud (WITH depth bias correction) ──
+        # ── Build point cloud ──
         T_bc = self._resolve_T_base_cam(cam_id)
-        depth_bias = self._depth_bias_by_cam.get(cam_id, 0.0)
         pcd = lift_masked_depth_to_base(
             depth=view.depth,
             mask=mask,
@@ -3405,7 +3259,6 @@ class FoundationPoseTrackerNode(Node):
             z_min=self.args.min_valid_z_m,
             z_max=self.args.max_valid_z_m,
             voxel_size=0.002,
-            depth_bias_m=depth_bias,
             mask_morph_close_kernel=int(getattr(self.args, "icp_mask_close_kernel", 0)),
             mask_interior_erosion=int(getattr(self.args, "icp_mask_interior_erosion", 0)),
         )
@@ -3452,9 +3305,7 @@ class FoundationPoseTrackerNode(Node):
         ) -> list[dict]:
         """Drop survivor cameras whose cloud centroid disagrees with the others
         before fusing, guarding against one camera's tracker drifting onto a
-        nearby object. Checks cameras against EACH OTHER (robust median for >=3
-        cams; anchor-disambiguated for 2), so coherent fast motion is preserved.
-        No-op when disabled (<=0) or <2 survivors; never returns empty."""
+        nearby object"""
         if max_disagreement_m <= 0.0 or len(survivors) < 2:
             return survivors
 
@@ -3489,8 +3340,7 @@ class FoundationPoseTrackerNode(Node):
                 return kept
             return survivors
 
-        # Exactly two cameras: median can't disambiguate. If they disagree,
-        # keep the one closer to the anchor (previous pose); else keep both.
+        
         d = float(np.linalg.norm(cents[0] - cents[1]))
         if d <= max_disagreement_m or anchor_pos is None:
             return survivors
@@ -3854,10 +3704,6 @@ class FoundationPoseTrackerNode(Node):
                         if buf.is_ready():
                             T_base_publish = buf.get_median()
 
-                    x_bias = float(getattr(self.args, 'x_bias_correction_m', 0.0))
-                    if abs(x_bias) > 1e-6:
-                        T_base_publish = apply_x_bias_correction(T_base_publish, x_bias)
-
                     decision.update({
                         "mode": "single_cam_fallback",
                         "pose_mode": single_cam_pose_mode,
@@ -4054,8 +3900,7 @@ class FoundationPoseTrackerNode(Node):
                     accept = False
                     reject_reasons.append(f"jump_r({drot:.1f}>{max_rot_jump_deg:.1f})")
 
-                # Chamfer gate. If we skipped the chamfer compute above
-                # (quality already clean), treat the gate as passed.
+                # Chamfer gate
                 max_chamfer = float(getattr(self.args, 'fused_track_max_chamfer_m', 0.015))
                 chamfer_ok = (chamfer is None) or (chamfer <= max_chamfer)
                 if not chamfer_ok:
@@ -4090,11 +3935,9 @@ class FoundationPoseTrackerNode(Node):
                     accept = False
                     reject_reasons.append(pose_mask_reason)
 
-                
-                # This handles: real fast motion, or tracker snapping back to
-                # correct pose after brief drift.
+            
                 if not accept:
-                    # Check: was the rejection purely motion-based?
+                    # Check: was the rejection purely motion-based
                     quality_ok = (
                         fitness_ok and rmse_ok and chamfer_ok and axis_dominant_ok
                         and not kalman_soft_reject and pose_mask_ok
@@ -4131,11 +3974,6 @@ class FoundationPoseTrackerNode(Node):
                     buf.push(T_base_fused)
                     if buf.is_ready():
                         T_base_publish = buf.get_median()
-
-                # ── X-bias correction ──
-                x_bias = float(getattr(self.args, 'x_bias_correction_m', 0.0))
-                if abs(x_bias) > 1e-6:
-                    T_base_publish = apply_x_bias_correction(T_base_publish, x_bias)
 
                 # Determine mode — flag rescued jumps distinctly
                 was_rescued = any("RESCUED" in r for r in reject_reasons)
@@ -4218,9 +4056,7 @@ class FoundationPoseTrackerNode(Node):
                 else:
                     kf.update(pos)
 
-        # Fill in synthetic no_survivors decisions for any tracked track_id
-        # that produced no per-cam results at all (instance fully dropped out
-        # of every camera this tick).
+
         warmup_frames_default = int(getattr(self.args, 'fused_track_warmup_frames', 5))
         for tid in all_tracked_track_ids:
             if tid in object_decisions:
@@ -4503,9 +4339,6 @@ class FoundationPoseTrackerNode(Node):
         selections_by_cam: dict[str, list[CandidateSelection]] = {}
         views_by_cam: dict[str, Any] = {}
 
-        # Dead-init detector: a bad SAM session produces 0 masks on EVERY camera
-        # despite GDINO handing it valid boxes — for the whole process lifetime,
-        # cured only by a restart (see gdinoeager1). Track this cycle's totals.
         cycle_total_masks = 0
         cycle_total_boxes = 0
 
@@ -4567,12 +4400,7 @@ class FoundationPoseTrackerNode(Node):
                 )
                 self.pub_debug_frame[cam_id].publish(frame)
 
-        # ── Dead-init (bad SAM session) detection + auto-restart ──
-        # Signature: GDINO proposed boxes (cycle_total_boxes > 0) but SAM
-        # produced 0 masks on ALL cameras (cycle_total_masks == 0). One cycle
-        # could be a fluke, so require N consecutive cycles. This state persists
-        # for the whole process and is only cured by a restart, so we exit with a
-        # distinct code (42) for the supervisor wrapper to relaunch.
+    
         if bool(getattr(self.args, "restart_on_dead_init", True)):
             min_boxes = int(getattr(self.args, "dead_init_min_boxes", 3))
             if cycle_total_boxes >= min_boxes and cycle_total_masks == 0:
@@ -4620,10 +4448,6 @@ class FoundationPoseTrackerNode(Node):
         _dprint(f"[TIMING] Fusion matching: {(time.time()-t_fusion)*1000:.0f}ms -> {len(fused_detections)} fused objects")
 
         # ── Phase 3: Single-FP + ICP + symmetry grid + weighted average ──
-        # Hand PyTorch's cached-but-freed blocks back to the driver before the
-        # FoundationPose stage. nvdiffrast / Warp allocate raw CUDA memory outside
-        # PyTorch's caching allocator, so without this the SAM+DINO cache can
-        # starve nvdiffrast's render buffers and surface as CUDA error 700.
         t_fp_all = time.time()
         new_states_by_cam: dict[str, list[ObjectTrackState]] = {
             v.cam_id: [] for v in views
@@ -4971,7 +4795,6 @@ class FoundationPoseTrackerNode(Node):
                 f"{' [SINGLE-CAM]' if is_single_cam else ''}"
             )
 
-            # C9: distance/mask-area-based confidence warning. Cheap, log-only.
             if self.args.distance_confidence_warn:
                 dist_m = float(np.linalg.norm(T_publish[:3, 3]))
                 min_mask_area = min(
@@ -5238,7 +5061,6 @@ def parse_args() -> argparse.Namespace:
         "--gdino-text-prompts",
         default="cooling base,cooling f,cooling screw,pb base,pb pipe,pb screw,pb top",
     )
-    p.add_argument("--target-object", default=None)
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
     p.add_argument(
         "--tracking-backend",
@@ -5311,14 +5133,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--sam-model-cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
     p.add_argument("--sam-max-image-side", type=int, default=1536)
-    # Run SAM in fp32 instead of bfloat16 autocast. Slower, but avoids NaN
-    # blowups that the deeper hiera-large encoder can hit in bf16.
     p.add_argument("--sam-fp32", action="store_true")
 
-    # Dead-init (bad SAM session) auto-restart. If GDINO proposes boxes but SAM
-    # returns 0 masks on ALL cameras for N consecutive init cycles, the SAM
-    # session is bad (restart-cured) — exit code 42 so a supervisor wrapper
-    # (scripts/run_pipeline_supervised.sh) relaunches.
     p.add_argument("--restart-on-dead-init", action="store_true", default=True)
     p.add_argument("--no-restart-on-dead-init", dest="restart_on_dead_init",
                    action="store_false")
@@ -5394,27 +5210,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fused-gate-min-depth-coverage", type=float, default=0.30)
     p.add_argument("--fused-gate-min-cloud-points", type=int, default=40)
     p.add_argument("--fused-gate-max-centroid-dist-m", type=float, default=0.08)
-    # Cross-camera consistency check at merge (tracking). When >0, survivor
-    # cameras whose cloud centroid disagrees with the others by more than this
-    # (meters) are dropped before fusing, guarding against one camera's tracker
-    # drifting onto a nearby same-class object. Unlike the gate above (vs the
-    # previous pose), this checks the cameras against EACH OTHER, so coherent
-    # fast motion is preserved. 0.0 disables.
+    # Cross-camera consistency check at merge 
     p.add_argument("--fused-consistency-max-disagreement-m", type=float, default=0.0)
 
     # Cross-camera fusion MATCHING gate (init-only; distinct from the tracking
     # gate above). Two per-cam detections fuse into one object iff their base-
-    # frame centroids are within this distance. Tune below the smallest real
-    # object-to-object spacing to avoid merging distinct nearby objects.
+    # frame centroids are within this distance. 
     p.add_argument("--fusion-match-max-centroid-dist-m", type=float, default=0.07)
-    # Geometric ambiguity guard: if a detection's two nearest candidate clusters
-    # are within this margin of each other (both inside the gate), drop it rather
-    # than risk a wrong fuse. 0.0 disables the guard (legacy behaviour).
+    # Geometric ambiguity guard
     p.add_argument("--fusion-match-ambiguity-margin-m", type=float, default=0.0)
     # Soft DINO label penalty (meters of extra matching cost for a full label
-    # disagreement). Helps the case where each camera sees a DIFFERENT nearby
-    # object: confidently-different labels resist fusing. 0.0 disables. Keep
-    # small (<~0.03) so it never rejects a true same-object/different-label fuse.
+    # disagreement)
     p.add_argument("--fusion-match-label-penalty-m", type=float, default=0.0)
     p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.18)
     p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.015)
@@ -5442,19 +5248,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
     p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
 
-    # Positive = sensor reads too short, negative = too long
-    # Calibrate: measure known distance, compare to depth reading
-    p.add_argument("--cam1-depth-bias-m", type=float, default=0.0)
-    p.add_argument("--cam2-depth-bias-m", type=float, default=0.0)
-    p.add_argument("--cam3-depth-bias-m", type=float, default=0.0)
- 
     # Distance-weighted cloud merging (mitigates depth bias at distance)
     p.add_argument("--use-weighted-cloud-merge", action="store_true")
     p.add_argument("--cloud-merge-distance-exponent", type=float, default=2.0)
- 
-    p.add_argument("--x-bias-correction-m", type=float, default=0.0)
- 
-    # Warmup frames after init 
+
+    # Warmup frames after init
     p.add_argument("--fused-track-warmup-frames", type=int, default=5)
 
     # Hold/lost windows
@@ -5568,19 +5366,11 @@ def parse_args() -> argparse.Namespace:
    
     #   --icp-grid-n-rot              : number of uniform SO(3) seed rotations
     #   --icp-grid-prescreen          : skip ICP for seeds whose raw-Chamfer > tau (cheap)
-    #   --icp-grid-second-pass        : refine top-K winners with small angular jitter
     #   --icp-grid-cross-cam-chamfer  : score by mean Chamfer across per-cam clouds
-    #   --icp-grid-tie-by-inliers     : break Chamfer ties by ICP fitness (≈ inlier count)
     p.add_argument("--icp-grid-n-rot", type=int, default=45)
     p.add_argument("--icp-grid-prescreen", action="store_true")
     p.add_argument("--icp-grid-prescreen-tau", type=float, default=0.04)
-    p.add_argument("--icp-grid-second-pass", action="store_true")
-    p.add_argument("--icp-grid-second-pass-k", type=int, default=3)
-    p.add_argument("--icp-grid-second-pass-n", type=int, default=8)
-    p.add_argument("--icp-grid-second-pass-jitter-deg", type=float, default=15.0)
     p.add_argument("--icp-grid-cross-cam-chamfer", action="store_true")
-    p.add_argument("--icp-grid-tie-by-inliers", action="store_true")
-    p.add_argument("--icp-grid-tie-chamfer-eps-m", type=float, default=0.0005)
 
 
     p.add_argument("--depth-fill-holes-kernel", type=int, default=0)
@@ -5600,12 +5390,6 @@ def parse_args() -> argparse.Namespace:
 
     # bicubic-upscale DINO crops whose short side is below this many pixels
     p.add_argument("--dino-min-crop-side", type=int, default=0)
-
-    # CLAHE
-    p.add_argument("--clahe-enabled", action="store_true")
-    p.add_argument("--clahe-clip-limit", type=float, default=2.0)
-    p.add_argument("--clahe-grid-size", type=int, default=8)
-
 
     p.add_argument("--table-plane-z-min", type=float, default=0.0)
     p.add_argument("--table-plane-z-max", type=float, default=0.9)

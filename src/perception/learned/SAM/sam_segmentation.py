@@ -194,16 +194,6 @@ class SAMSegmenter:
             print(f"[SAM-WEIGHTS:{tag}] check failed: {e}")
 
     def warmup(self, max_iters: int = 6) -> bool:
-        """Run dummy forward passes until the model returns a valid mask.
-
-        hiera-large on a fresh CUDA context can emit NaN / empty / sparse masks
-        on its first forward pass(es) — a cold-start quirk; the weights and
-        inputs are clean. Absorbing those here at build time keeps the real
-        init deterministic from cycle 1. Returns True once warm.
-        """
-        # Small saturated block (~3.5% of frame) so the resulting mask clears the
-        # default filters (max_mask_area_ratio=0.06, shadow, fill, aspect) and the
-        # warmup can actually detect "warm" and stop after one forward.
         dummy = np.full((512, 512, 3), 30, dtype=np.uint8)
         dummy[208:304, 208:304] = (220, 40, 40)
         box = np.array([[208, 208, 304, 304]], dtype=np.float32)
@@ -265,14 +255,6 @@ class SAMSegmenter:
         # delayed import so the rest of the repo remains importable
         from sam2.build_sam import build_sam2
 
-        # build_sam2() resolves its config through Hydra's SINGLE global config
-        # search path. sam2/__init__ registers the "sam2" config module, but only
-        # `if not GlobalHydra.is_initialized()`. Other packages in this process
-        # (notably Cutie's pre-warm, which runs after our first SAM build) call
-        # hydra.initialize() and repoint that global to THEIR config dir — after
-        # which build_sam2() raises MissingConfigException for the sam2 configs.
-        # That breaks any runtime rebuild. Re-assert the sam2 config module right
-        # before composing so the build is independent of global Hydra state.
         self._ensure_sam2_hydra_config()
 
         model = build_sam2(
@@ -455,10 +437,7 @@ class SAMSegmenter:
         )
 
         # SAM-collapse recovery: every box's mask falling below min_mask_area at
-        # once is the signature of a degenerate set_image() embedding (a transient
-        # bf16 cold-start glitch), not a genuinely empty scene. Re-encode + re-run
-        # once; if it persists, fall back to fp32 for this frame. Without this a
-        # whole camera silently drops out and init degrades to single-cam.
+        # once is the signature of a degenerate set_image() embedding 
         if self._is_mask_collapse(out, n_boxes, _reject):
             print(f"[SAM-RETRY] from_boxes: {n_boxes} boxes collapsed "
                   f"(area_small={_reject.get('area_small', 0)}); re-encoding (bf16)")
@@ -473,15 +452,6 @@ class SAMSegmenter:
                     use_bf16=False,
                 )
             if self._is_mask_collapse(out, n_boxes, _reject):
-                # Still collapsed after bf16 + fp32 re-encodes. Do NOT rebuild the
-                # model here: the live collapse is a transient (the model works
-                # again on the next cycle once the GPU settles), and the only
-                # signal we have for "is the rebuild good?" is the synthetic dummy
-                # warmup — which is an unreliable false-negative (a model that
-                # "never warms" on the dummy still segments real images fine). The
-                # old rebuild-until-warm therefore thrashed and, when it gave up,
-                # DROPPED the camera permanently for the cycle. Instead we accept
-                # an empty result for THIS cam THIS cycle; it returns next cycle.
                 print("[SAM-RETRY] from_boxes: still collapsed after fp32; "
                       "skipping this camera for this cycle (recovers next cycle)")
 
@@ -525,7 +495,6 @@ class SAMSegmenter:
             if self.device.type == "cuda" and use_bf16:
                 ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
             else:
-                # Python 3.10 needs a real context manager; use nullcontext.
                 from contextlib import nullcontext
                 ctx = nullcontext()
             with ctx, _force_math_sdp_attention():

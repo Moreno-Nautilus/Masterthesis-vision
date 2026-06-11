@@ -15,9 +15,9 @@
 
 set -euo pipefail
 
-CONTAINER="${CONTAINER:-thesis-newcuda}"
+CONTAINER="${CONTAINER:-vision}"
 
-SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros-thesis-venv/bin/activate && source /workspace/MasterThesis/install/setup.bash && cd /workspace/MasterThesis'
+SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros-thesis-venv/bin/activate && source /workspace/Masterthesis-vision/install/setup.bash && cd /workspace/Masterthesis-vision'
 
 BASELINE_ARGS=(
     --num-cameras 3

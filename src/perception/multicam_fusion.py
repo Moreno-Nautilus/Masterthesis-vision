@@ -1,19 +1,3 @@
-"""
-multicam_fusion.py — Multi-camera point cloud fusion for improved 6D pose estimation.
-
-Pipeline:
-  1. Back-project per-object masked depth → 3D point cloud in base frame
-  2. Cluster detections across cameras by 3D centroid proximity (geometry-first),
-     then arbitrate the class label by summed DINO-score voting within each cluster
-  3. ICP-align per-object clouds from different cameras
-  4. Fuse (concatenate + voxel downsample) into a single cloud
-  5. Render fused cloud back into reference camera's depth image
-  6. Feed fused depth + reference RGB/mask/K to FoundationPose
-
-Place this file alongside run_pipeline_track.py:
-  src/perception/ros/learn_runners/multicam_fusion.py
-"""
-
 from __future__ import annotations
 
 import time
@@ -25,9 +9,7 @@ import numpy as np
 import open3d as o3d
 
 
-# ---------------------------------------------------------------------------
 # Data structures
-# ---------------------------------------------------------------------------
 
 @dataclass
 class PerCamDetection:
@@ -44,9 +26,6 @@ class PerCamDetection:
     T_base_cam: np.ndarray  # 4x4 cam-to-base extrinsic
     centroid_base: np.ndarray | None = None  # (3,) computed lazily
     cloud_base: np.ndarray | None = None     # (N, 3) in base frame
-    # Raw per-class DINO scores carried from CandidateSelection — used by
-    # cross-camera label arbitration so each member contributes a vote for
-    # every candidate label, not just its own self-pick.
     scores_by_object: dict[str, float] = field(default_factory=dict)
 
 
@@ -61,10 +40,7 @@ class FusedDetection:
     fused_mask: np.ndarray | None = None   # (H, W) bool, reprojected mask
 
 
-# ---------------------------------------------------------------------------
 # Back-projection: masked depth → 3D points in base frame
-# ---------------------------------------------------------------------------
-
 def backproject_masked_depth(
     depth: np.ndarray,
     mask: np.ndarray,
@@ -119,9 +95,7 @@ def compute_cloud_centroid(pts: np.ndarray) -> np.ndarray:
     return pts.mean(axis=0).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
 # Cross-camera object matching
-# ---------------------------------------------------------------------------
 
 def _arbitrate_label(
     group: list[PerCamDetection],
@@ -248,17 +222,6 @@ def match_detections_across_cameras(
     first), then arbitrate the class label per cluster by summed DINO-score
     voting.
 
-    This handles the failure mode where cam1 labels a physical object as
-    cooling_screw while cam2 labels the same physical object as cooling_f:
-    both detections still cluster together by centroid, vote on the label,
-    and produce a single fused detection with the winning label written back
-    onto every member's object_id.
-
-    Clustering is incremental: cameras are folded in one at a time and each
-    detection joins the nearest existing cluster within max_centroid_distance,
-    holding at most one detection per camera. With exactly two cameras this
-    reduces to the original greedy pairwise matcher.
-
     Args:
         detections_by_cam: cam_id -> list of detections (centroid_base populated)
         max_centroid_distance: max base-frame distance to consider a match
@@ -300,9 +263,6 @@ def match_detections_across_cameras(
         return np.mean(np.stack(pts, axis=0), axis=0)
 
     # ── Phase 1: geometry-first incremental clustering across cameras ──
-    # Each cluster holds at most one detection per camera. Detections that are
-    # geometrically ambiguous (two near-tied candidate clusters) are dropped,
-    # NOT turned into singletons, to avoid phantom-duplicate tracks.
     clusters: list[list[PerCamDetection]] = []
     for cam_id in cam_ids:
         dets = detections_by_cam.get(cam_id, [])
@@ -343,9 +303,6 @@ def match_detections_across_cameras(
                     adaptive_gate = max_centroid_distance
                 if dist > adaptive_gate:
                     continue  # leave cost[i, j] = inf, pair is ineligible
-                # Soft DINO penalty: nudge label-disagreeing pairs apart so they
-                # only fuse when geometry is well inside the gate. Geometry stays
-                # the primary signal; this is off (0.0) unless explicitly tuned.
                 if label_match_penalty_weight > 0.0:
                     dist += label_match_penalty_weight * (
                         1.0 - _label_agreement(d, clusters[j])
@@ -413,9 +370,6 @@ def match_detections_across_cameras(
 
         if ambiguous:
             if margin >= float(label_arbitration_singleton_margin):
-                # Keep the winner-side member(s) as a (possibly multi-cam)
-                # group; consume the loser-side members WITHOUT singletonising
-                # them, to avoid re-introducing phantom-duplicate tracks.
                 winner_members = [d for d in group if d.object_id == winner]
                 if winner_members:
                     keep = winner_members
@@ -458,9 +412,7 @@ def match_detections_across_cameras(
     return matched_groups
 
 
-# ---------------------------------------------------------------------------
 # ICP alignment of per-object clouds
-# ---------------------------------------------------------------------------
 
 def icp_align_clouds(
     cloud_source: np.ndarray,
@@ -468,24 +420,7 @@ def icp_align_clouds(
     max_correspondence_distance: float = 0.025,
     voxel_size: float = 0.001,
 ) -> tuple[np.ndarray, float, float]:
-    """
-    Align cloud_source to cloud_target using ICP.
-
-    Both clouds should be in the same frame (base frame) already,
-    so this corrects residual calibration error.
-
-    Args:
-        cloud_source: (N, 3) source points
-        cloud_target: (M, 3) target points
-        max_correspondence_distance: ICP max distance (meters)
-        voxel_size: downsample before ICP for speed
-
-    Returns:
-        (aligned_source, fitness, rmse)
-        aligned_source: (N, 3) transformed source points
-        fitness: ICP fitness (0-1, higher = more inliers)
-        rmse: ICP RMSE in meters
-    """
+    
     if len(cloud_source) < 10 or len(cloud_target) < 10:
         # Not enough points for ICP, return as-is
         return cloud_source, 0.0, float('inf')
@@ -538,9 +473,7 @@ def icp_align_clouds(
     return aligned, fitness, rmse
 
 
-# ---------------------------------------------------------------------------
 # Cloud fusion: concatenate + voxel downsample
-# ---------------------------------------------------------------------------
 
 def fuse_and_downsample(
     clouds: list[np.ndarray],
@@ -572,9 +505,7 @@ def fuse_and_downsample(
     return np.asarray(pcd_ds.points, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
 # Render fused cloud back into a camera's depth image
-# ---------------------------------------------------------------------------
 
 def render_fused_depth(
     cloud_base: np.ndarray,
@@ -585,17 +516,6 @@ def render_fused_depth(
     """
     Project fused point cloud (in base frame) into a camera to create
     a synthetic depth image and mask.
-
-    Args:
-        cloud_base: (N, 3) points in base frame
-        K: 3x3 camera intrinsics
-        T_base_cam: 4x4 base-to-camera extrinsic (cam_to_base transform)
-        image_shape: (H, W) of the target image
-
-    Returns:
-        (depth_img, mask_img)
-        depth_img: (H, W) float32, depth in meters (0 where no projection)
-        mask_img: (H, W) bool, True where a point was projected
     """
     H, W = image_shape
 
@@ -654,9 +574,8 @@ def render_fused_depth(
     return depth_img, mask_img
 
 
-# ---------------------------------------------------------------------------
+# 
 # Top-level fusion pipeline
-# ---------------------------------------------------------------------------
 
 @dataclass
 class FusionConfig:
@@ -668,35 +587,20 @@ class FusionConfig:
     icp_min_fitness: float = 0.10           # below this, skip ICP correction
     min_depth: float = 0.05
     max_depth: float = 3.0
-    # Cross-camera label arbitration is tiered by summed per-class DINO
-    # vote margin:
-    #   margin >= label_arbitration_min_margin: fuse under the winner label
-    #   singleton_margin <= margin < min_margin: keep the winner-side detection
-    #       as single-cam and consume the loser to avoid duplicate phantoms
-    #   margin < singleton_margin: drop both as a true coin flip
+  
     label_arbitration_min_margin: float = 0.05
     label_arbitration_singleton_margin: float = 0.01
-    # Geometric ambiguity guard for cross-cam matching. If a detection's two
-    # nearest candidate clusters are within this margin of each other (both
-    # inside max_centroid_distance), it is dropped rather than risk fusing two
-    # distinct nearby objects. 0.0 disables the guard (legacy behaviour).
+    
     match_ambiguity_margin: float = 0.0
-    # Meters of extra matching cost for a full DINO label disagreement (scaled
-    # by 1 - cosine label agreement). Tightens the gate for label-disagreeing
-    # pairs. 0.0 disables (pure geometry). Keep small to avoid rejecting a true
-    # same-object/different-label fuse.
+    
     label_match_penalty_weight: float = 0.0
-    # Per-pair gate scaling: gate = max(max_centroid_distance, largest_cloud_diagonal
-    # * cloud_extent_gate_scale). Large objects naturally get a wider window.
-    # 0.0 disables (fixed global gate). ~0.5 is a good starting point.
+   
     cloud_extent_gate_scale: float = 0.5
     debug_dir: str = ""                     # set to a path to dump debug PLY/PNG
     debug_enabled: bool = False
 
 
-# ---------------------------------------------------------------------------
 # Debug visualization
-# ---------------------------------------------------------------------------
 
 def _save_debug_cloud(
     path: str,

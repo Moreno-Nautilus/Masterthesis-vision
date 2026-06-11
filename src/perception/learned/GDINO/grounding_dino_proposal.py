@@ -101,8 +101,6 @@ class GroundingDINOProposer:
         except TypeError as e:
             if "box_threshold" not in str(e):
                 raise
-            # Transformers versions differ here: some expect the box score
-            # cutoff as "threshold" instead of "box_threshold".
             results = self._processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
