@@ -1093,6 +1093,15 @@ class FoundationPoseTrackerNode(Node):
         
         # Real-time tracker (CuteVOS + ICP)
         self.realtime_trackers: dict[str, RealtimeTracker] = {}
+        # One multi-object Cutie session per CAMERA (keyed by cam_id). Each
+        # session tracks ALL of that camera's objects in a single forward, so
+        # the per-tick Cutie call count is one-per-camera instead of
+        # one-per-(camera, object). Per-object ICP/fusion stays in the
+        # RealtimeTrackers above.
+        self.cutie_sessions: dict[str, CutieTracker] = {}
+        # Per-mesh shaft (principal) axis in the object frame, for the optional
+        # PCA axis correction (--fused-track-pca-axis). Untouched when off.
+        self._shaft_axis_cache: dict[str, Optional[np.ndarray]] = {}
         self.rt_active: dict[str, bool] = {c.cam_id: False for c in self.cameras}
 
         self._fused_track_memory: dict[str, dict[str, Any]] = {}
@@ -1136,6 +1145,7 @@ class FoundationPoseTrackerNode(Node):
         self._fused_lost_count: dict[str, int] = {}
         self._fused_pose_status: dict[str, str] = {}
         self._force_reinit_tracks: set[str] = set()
+        self._fused_last_drop_reasons: dict[str, dict[str, Any]] = {}
 
         # Per-class monotonic counter feeding _allocate_track_id.
         self._next_track_id_counter: dict[str, int] = {}
@@ -1173,6 +1183,10 @@ class FoundationPoseTrackerNode(Node):
                     "dt_mm",
                     "drot_deg",
                     "reason",
+                    "qx",
+                    "qy",
+                    "qz",
+                    "qw",
                 ])
 
         self._consecutive_chamfer_fails: dict[str, int] = {}
@@ -1287,12 +1301,19 @@ class FoundationPoseTrackerNode(Node):
             model_pcd,
             fused_cloud,
             per_cam_clouds=None,
+            n_rot: Optional[int] = None,
+            icp_max_iter: int = 30,
         ) -> tuple:
             """
             Search rotation seeds around translation `t_base`, refine each by ICP,
             score by Chamfer (lowest = best)
+
+            n_rot/icp_max_iter default to the init-grid behavior; the tracking
+            rotation re-seed passes smaller values for a cheaper search.
             """
-            n_rot = int(getattr(self.args, "icp_grid_n_rot", 100))
+            if n_rot is None:
+                n_rot = int(getattr(self.args, "icp_grid_n_rot", 100))
+            n_rot = int(n_rot)
             prescreen = bool(getattr(self.args, "icp_grid_prescreen", False))
             prescreen_tau = float(getattr(self.args, "icp_grid_prescreen_tau", 0.06))
 
@@ -1312,7 +1333,7 @@ class FoundationPoseTrackerNode(Node):
                         continue
 
                 T_ref, fit, _ = run_icp_in_base_frame(
-                    fused_cloud, model_pcd, T_seed, max_iteration=30,
+                    fused_cloud, model_pcd, T_seed, max_iteration=int(icp_max_iter),
                     variant=self.args.icp_variant,
                 )
                 if fit < 0.10:
@@ -1327,6 +1348,70 @@ class FoundationPoseTrackerNode(Node):
 
             best = scored[0]
             return best[1], float(best[0])
+
+    # ── PCA shaft-axis correction helpers (used only by --fused-track-pca-axis) ──
+    @staticmethod
+    def _principal_axis(pts: np.ndarray) -> tuple:
+        """PCA of a point set. Returns (unit principal axis, elongation ratio
+        lambda1/lambda2). For an elongated object the principal axis is the
+        shaft direction — a global estimate with no ICP local-minimum issue."""
+        c = pts.mean(axis=0)
+        X = pts - c
+        cov = (X.T @ X) / max(len(pts) - 1, 1)
+        evals, evecs = np.linalg.eigh(cov)  # ascending eigenvalues
+        axis = evecs[:, -1]
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        l1 = float(evals[-1])
+        l2 = float(evals[-2])
+        return axis, (l1 / max(l2, 1e-12))
+
+    @staticmethod
+    def _axis_angle_to_R(axis: np.ndarray, angle: float) -> np.ndarray:
+        """Rodrigues: rotation matrix for `angle` rad about unit `axis`."""
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        x, y, z = axis
+        c = np.cos(angle)
+        s = np.sin(angle)
+        C = 1.0 - c
+        return np.array([
+            [c + x*x*C,   x*y*C - z*s, x*z*C + y*s],
+            [y*x*C + z*s, c + y*y*C,   y*z*C - x*s],
+            [z*x*C - y*s, z*y*C + x*s, c + z*z*C],
+        ], dtype=np.float64)
+
+    def _rotation_between(self, a: np.ndarray, b: np.ndarray, blend: float = 1.0) -> np.ndarray:
+        """Minimal rotation taking unit vector `a` onto `b`, scaled by `blend`
+        in [0,1] (1.0 = full snap). Handles the parallel/anti-parallel cases."""
+        a = a / (np.linalg.norm(a) + 1e-12)
+        b = b / (np.linalg.norm(b) + 1e-12)
+        v = np.cross(a, b)
+        s = float(np.linalg.norm(v))
+        cdot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+        if s < 1e-9:
+            if cdot > 0.0:
+                return np.eye(3)
+            # 180 deg: rotate about any axis perpendicular to a
+            perp = np.array([0.0, 1.0, 0.0]) if abs(a[0]) > 0.9 else np.array([1.0, 0.0, 0.0])
+            axis = np.cross(a, perp)
+            full_angle = np.pi
+        else:
+            axis = v / s
+            full_angle = float(np.arccos(cdot))
+        return self._axis_angle_to_R(axis, full_angle * float(np.clip(blend, 0.0, 1.0)))
+
+    def _object_shaft_axis(self, mesh_path: str, model_pcd) -> Optional[np.ndarray]:
+        """Cached principal (shaft) axis of the object model, in object frame."""
+        if mesh_path in self._shaft_axis_cache:
+            return self._shaft_axis_cache[mesh_path]
+        axis = None
+        try:
+            pts = np.asarray(model_pcd.points)
+            if len(pts) >= 3:
+                axis, _ = self._principal_axis(pts)
+        except Exception:
+            axis = None
+        self._shaft_axis_cache[mesh_path] = axis
+        return axis
 
     def _log_base_pose(
         self,
@@ -2361,9 +2446,14 @@ class FoundationPoseTrackerNode(Node):
             if T_base is not None:
                 t = np.asarray(T_base[:3, 3], dtype=np.float64).reshape(3)
                 tx, ty, tz = (self._csv_float(v) for v in t)
+                q = rotation_matrix_to_quaternion_xyzw(
+                    np.asarray(T_base[:3, :3], dtype=np.float64)
+                )
+                qx, qy, qz, qw = (self._csv_float(v, digits=6) for v in q)
             else:
                 pose_source = "none"
                 tx = ty = tz = ""
+                qx = qy = qz = qw = ""
 
             chamfer_m = decision.get("chamfer_m", float("nan"))
             chamfer_mm = (
@@ -2395,6 +2485,10 @@ class FoundationPoseTrackerNode(Node):
                 self._csv_float(float(decision.get("trans_jump_m", 0.0)) * 1000.0, digits=3),
                 self._csv_float(decision.get("rot_jump_deg", 0.0), digits=3),
                 decision.get("reason", ""),
+                qx,
+                qy,
+                qz,
+                qw,
             ])
 
         try:
@@ -2423,6 +2517,76 @@ class FoundationPoseTrackerNode(Node):
         min_trans = float(getattr(self.args, 'fused_track_min_translation_jump_m', 0.008))
         min_rot = float(getattr(self.args, 'fused_track_min_rotation_jump_deg', 4.0))
         return max(min_trans, v_max * float(dt_eff)), max(min_rot, w_max * float(dt_eff))
+
+    def _remember_fused_drop_reason(
+        self,
+        track_id: str,
+        decision: dict[str, Any],
+        *,
+        accepted: bool,
+        status: str,
+    ) -> None:
+        if accepted:
+            self._fused_last_drop_reasons.pop(track_id, None)
+            return
+
+        reason = str(decision.get("reason", "") or "unknown")
+        self._fused_last_drop_reasons[track_id] = {
+            "object_id": str(
+                decision.get("object_id", "")
+                or self._track_id_to_object_id.get(track_id, "")
+            ),
+            "reason": reason,
+            "mode": str(decision.get("mode", "")),
+            "pose_mode": str(decision.get("pose_mode", "")),
+            "pose_status": status,
+            "lost_count": int(self._fused_lost_count.get(track_id, 0)),
+            "gate_reasons": self._summarize_fused_gate_metrics(
+                decision.get("gate_metrics", [])
+            ),
+        }
+
+    @staticmethod
+    def _summarize_fused_gate_metrics(gate_metrics: Any) -> str:
+        if not gate_metrics:
+            return ""
+        parts = []
+        for m in gate_metrics:
+            try:
+                cam = str(m.get("cam_id", "?"))
+                reason = str(m.get("reason", "unknown") or "unknown")
+                mask_area = int(m.get("mask_area", 0) or 0)
+                ratio = m.get("mask_area_ratio")
+                ratio_s = "na" if ratio is None else f"{float(ratio):.2f}"
+                cov = float(m.get("depth_coverage", 0.0) or 0.0)
+                pts = int(m.get("cloud_points", 0) or 0)
+                centroid = m.get("cloud_centroid_dist_m")
+                centroid_s = "na" if centroid is None else f"{float(centroid):.3f}m"
+                parts.append(
+                    f"{cam}:{reason},mask={mask_area},ratio={ratio_s},"
+                    f"cov={cov:.2f},pts={pts},centroid={centroid_s}"
+                )
+            except Exception:
+                continue
+        return " | ".join(parts)
+
+    def _format_fused_drop_reasons(self, track_ids: set[str]) -> str:
+        parts = []
+        for tid in sorted(track_ids):
+            info = self._fused_last_drop_reasons.get(tid, {})
+            obj_id = str(info.get("object_id", "") or self._track_id_to_object_id.get(tid, ""))
+            label = tid if not obj_id or obj_id in tid else f"{tid}/{obj_id}"
+            lost_count = int(info.get("lost_count", self._fused_lost_count.get(tid, 0)))
+            reason = str(info.get("reason", "unknown") or "unknown")
+            mode = str(info.get("mode", "") or "")
+            mode_suffix = f", mode={mode}" if mode else ""
+            gate_reasons = str(info.get("gate_reasons", "") or "")
+            gate_suffix = f", gates=[{gate_reasons}]" if gate_reasons else ""
+            parts.append(
+                f"{label}: max_lost_exceeded(lost_count={lost_count}, "
+                f"last_reason={reason}{mode_suffix}{gate_suffix})"
+            )
+        return "[" + "; ".join(parts) + "]"
 
     def _get_or_create_fused_translation_kalman(self, track_id: str) -> PoseKalmanFilter:
         kf = self._fused_translation_kalman.get(track_id)
@@ -3030,6 +3194,12 @@ class FoundationPoseTrackerNode(Node):
             self._fused_pose_status[tid] = status
             decision["pose_status"] = status
             decision["lost_count"] = int(self._fused_lost_count.get(tid, 0))
+            self._remember_fused_drop_reason(
+                tid,
+                decision,
+                accepted=accepted,
+                status=status,
+            )
             if tid in self._fused_icp_metrics:
                 self._fused_icp_metrics[tid]["pose_status"] = status
                 self._fused_icp_metrics[tid]["lost_count"] = decision["lost_count"]
@@ -3354,6 +3524,83 @@ class FoundationPoseTrackerNode(Node):
         )
         return [valid[keep_idx]]
 
+    def _build_centroid_recovery_seed(
+        self,
+        *,
+        track_id: str,
+        obj_id: str,
+        gate_metrics: list[dict],
+        normal_survivors: list[dict],
+        prev_base_pose: Optional[np.ndarray],
+    ) -> tuple[list[dict], Optional[np.ndarray], str]:
+        if prev_base_pose is None:
+            return [], None, ""
+
+        candidates = []
+        centroids = []
+        for m in gate_metrics:
+            reason = str(m.get("reason", ""))
+            pcd = m.get("pcd")
+            if not reason.startswith("centroid_far(") or pcd is None:
+                continue
+            if int(m.get("cloud_points", 0) or 0) < int(self.args.fused_gate_min_cloud_points):
+                continue
+            pts = np.asarray(pcd.points)
+            if pts.size == 0:
+                continue
+            candidates.append(m)
+            centroids.append(pts.mean(axis=0).astype(np.float64))
+
+        if not candidates:
+            return [], None, ""
+
+        cluster_dist = float(getattr(self.args, "fused_track_centroid_recovery_cluster_dist_m", 0.12))
+        min_cams = max(1, int(getattr(self.args, "fused_track_centroid_recovery_min_cameras", 1)))
+
+        best_idxs: list[int] = []
+        for i, c0 in enumerate(centroids):
+            idxs = [
+                j for j, c in enumerate(centroids)
+                if float(np.linalg.norm(c - c0)) <= cluster_dist
+            ]
+            if len(idxs) > len(best_idxs):
+                best_idxs = idxs
+
+        if len(best_idxs) < min_cams:
+            return [], None, ""
+
+        # If a normal survivor cluster has equal-or-better support, stay on the
+        # ordinary path. Recovery is meant for obvious jumps, not tie-breaking.
+        if normal_survivors and len(best_idxs) <= len(normal_survivors):
+            return [], None, ""
+
+        recovery_survivors = [candidates[i] for i in best_idxs]
+        cluster_centroid = np.mean(np.stack([centroids[i] for i in best_idxs]), axis=0)
+
+        mem = self._fused_track_memory.get(track_id, {})
+        prev_cloud_centroid = mem.get("cloud_centroid_base")
+        if prev_cloud_centroid is None:
+            prev_cloud_centroid = prev_base_pose[:3, 3]
+        prev_cloud_centroid = np.asarray(prev_cloud_centroid, dtype=np.float64).reshape(3)
+
+        delta = cluster_centroid - prev_cloud_centroid
+        max_seed_jump = float(getattr(self.args, "fused_track_centroid_recovery_max_seed_jump_m", 0.75))
+        jump_norm = float(np.linalg.norm(delta))
+        if jump_norm > max_seed_jump:
+            return [], None, ""
+
+        T_seed = prev_base_pose.astype(np.float32).copy()
+        T_seed[:3, 3] = (prev_base_pose[:3, 3].astype(np.float64) + delta).astype(np.float32)
+
+        cam_ids = [str(m.get("cam_id", "?")) for m in recovery_survivors]
+        reason = (
+            f"centroid_recovery_seed(cams={cam_ids},"
+            f"jump={jump_norm*1000:.1f}mm)"
+        )
+        if getattr(self.args, "debug_verbose_logs", False):
+            self.get_logger().info(f"CENTROID RECOVERY {obj_id}[{track_id}]: {reason}")
+        return recovery_survivors, T_seed, reason
+
 
     def _track_multicam_fused(self, views: list, stamp) -> None:
         """Fused multi-camera tracking"""
@@ -3373,22 +3620,47 @@ class FoundationPoseTrackerNode(Node):
             camera_work.append((view, states))
     
         def _run_one_camera(view, states):
-            """Run Cutie+ICP for all objects on one camera. Thread-safe."""
+            """Run multi-object Cutie + per-object ICP for one camera.
+
+            One Cutie session per camera tracks ALL objects in a single
+            forward (instead of one session per (camera, object)), then each
+            object's mask is fed into its own RealtimeTracker for the existing
+            ICP/fusion path. Thread-safe: each camera owns its own session and
+            its own RealtimeTrackers (keyed by cam_id).
+            """
             cam_id = view.cam_id
             rgb = view.rgb
             depth = view.depth
             K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
             results = {}
-            _cutie_ms = 0.0
-            _cutie_n = 0
-    
+            skip_icp = bool(getattr(self.args, "skip_per_cam_icp_tracking", True))
+
+            # One multi-object Cutie session per camera.
+            session = self.cutie_sessions.get(cam_id)
+            if session is None:
+                session = CutieTracker(CutieConfig(
+                    max_internal_size=int(getattr(self.args, "cutie_max_internal_size", 480)),
+                ))
+                self.cutie_sessions[cam_id] = session
+
+            # ── Pass 1: make sure every state has a RealtimeTracker (pose/ICP
+            # state) and is registered in the shared Cutie session. New objects
+            # are memorized incrementally; existing ones keep their memory. ──
+            active = []  # (state_idx, state, tracker_key)
             for idx, state in enumerate(states):
-                # Tracker key is per-instance (track_id) so multi-instance
-                # same-class scenes get a distinct Cutie session each.
+                # Per-instance key (track_id) so multi-instance same-class
+                # scenes stay distinct in the Cutie session.
                 tracker_key = f"{cam_id}_{state.track_id}"
-    
+
                 if tracker_key not in self.realtime_trackers:
                     try:
+                        init_mask = state.recovery_mask
+                        if init_mask is None or init_mask.sum() < 100:
+                            continue
+                        init_mask = np.asarray(init_mask).astype(bool)
+                        if init_mask.ndim != 2:
+                            continue
+
                         cfg = RealtimeTrackerConfig(
                             cutie_cfg=CutieConfig(
                                 max_internal_size=int(getattr(self.args, "cutie_max_internal_size", 480)),
@@ -3406,36 +3678,71 @@ class FoundationPoseTrackerNode(Node):
                             verbose=False,
                         )
                         rt = RealtimeTracker(cfg)
-                        init_mask = state.recovery_mask
-                        if init_mask is None or init_mask.sum() < 100:
-                            continue
-                        init_mask = np.asarray(init_mask).astype(bool)
-                        if init_mask.ndim != 2:
-                            continue
-    
+                        # Register the object in the shared per-camera session;
+                        # the RealtimeTracker's own Cutie is not used here.
+                        session.add_object(state.track_id, rgb, init_mask)
                         rt.initialize(
                             rgb=rgb, depth=depth, mask=init_mask,
                             T_init=state.T_object_camera, K=K,
                             mesh_path=state.mesh_path,
+                            init_cutie=False,
                         )
                         self.realtime_trackers[tracker_key] = rt
                         state.last_good_mask = init_mask.copy()
                         state.last_good_T = state.T_object_camera.copy()
-                    except Exception as e:
+                    except Exception:
                         continue
-    
-                rt = self.realtime_trackers[tracker_key]
+                elif not session.has_object(state.track_id):
+                    # Tracker exists but the session lost this object (e.g.
+                    # after a partial drop). Re-register from the last good mask.
+                    seed = state.last_good_mask
+                    if seed is None:
+                        seed = state.recovery_mask
+                    try:
+                        if seed is not None:
+                            seed = np.asarray(seed).astype(bool)
+                            if seed.ndim == 2 and seed.sum() >= 100:
+                                session.add_object(state.track_id, rgb, seed)
+                    except Exception:
+                        pass
+
+                active.append((idx, state, tracker_key))
+
+            # Drop session objects whose track is no longer present on this cam,
+            # so Cutie stops segmenting stale objects.
+            current_track_ids = {s.track_id for s in states}
+            for tid in list(session.tracked_object_ids):
+                if tid not in current_track_ids:
+                    session.remove_object(tid)
+
+            # ── ONE Cutie forward for all of this camera's objects. ──
+            _t_cutie = time.time()
+            try:
+                masks_by_track = session.track_multi(rgb)
+            except Exception:
+                masks_by_track = {}
+            _cutie_ms = (time.time() - _t_cutie) * 1000.0
+            _cutie_n = 1 if session.tracked_object_ids else 0
+
+            # ── Pass 2: feed each object's mask into its RealtimeTracker. ──
+            for idx, state, tracker_key in active:
+                rt = self.realtime_trackers.get(tracker_key)
+                if rt is None:
+                    continue
+
+                cutie_result = masks_by_track.get(state.track_id)
+                if cutie_result is None:
+                    state.lost_count += 1
+                    state.mode = "degraded"
+                    continue
+
                 try:
-                    _t_trk = time.time()
-                    result = rt.track(
-                        rgb, depth, K,
-                        skip_icp=bool(getattr(self.args, "skip_per_cam_icp_tracking", True)),
+                    result = rt.track_with_mask(
+                        cutie_result, depth, K=K, skip_icp=skip_icp, rgb=rgb,
                     )
-                    _cutie_ms += (time.time() - _t_trk) * 1000.0
-                    _cutie_n += 1
                 except Exception:
                     result = None
-    
+
                 if result is not None and result.mask_area > 20:
                     results[tracker_key] = {
                         "tracker_key": tracker_key,
@@ -3510,6 +3817,8 @@ class FoundationPoseTrackerNode(Node):
                 for cr in entries
             ]
             survivors = [m for m in gate_metrics if m["accepted"]]
+            centroid_recovery_seed: Optional[np.ndarray] = None
+            centroid_recovery_reason = ""
             # Cross-camera consistency: drop a camera that drifted onto a nearby
             # object before it can corrupt the fused cloud. Skipped during warmup
             # (init->track shift is expected) and a no-op unless enabled.
@@ -3520,6 +3829,20 @@ class FoundationPoseTrackerNode(Node):
                     float(getattr(self.args, "fused_consistency_max_disagreement_m", 0.0)),
                     obj_id, track_id,
                 )
+                if bool(getattr(self.args, "fused_track_centroid_recovery", False)):
+                    recovery_survivors, recovery_seed, recovery_reason = (
+                        self._build_centroid_recovery_seed(
+                            track_id=track_id,
+                            obj_id=obj_id,
+                            gate_metrics=gate_metrics,
+                            normal_survivors=survivors,
+                            prev_base_pose=prev_base_pose,
+                        )
+                    )
+                    if recovery_seed is not None and recovery_survivors:
+                        survivors = recovery_survivors
+                        centroid_recovery_seed = recovery_seed
+                        centroid_recovery_reason = recovery_reason
             survived_cam_ids = [m["cam_id"] for m in survivors]
             survived_keys = [(m["cam_id"], m["state_idx"]) for m in survivors]
 
@@ -3602,8 +3925,11 @@ class FoundationPoseTrackerNode(Node):
                         num_points=track_num_points_sc,
                     )
                     T_init_sc = (
-                        prev_base_pose.astype(np.float32)
-                        if prev_base_pose is not None else T_base_seed
+                        centroid_recovery_seed.astype(np.float32)
+                        if centroid_recovery_seed is not None
+                        else prev_base_pose.astype(np.float32)
+                        if prev_base_pose is not None
+                        else T_base_seed
                     )
                     try:
                         T_refined, fit_sc, rmse_sc = run_icp_in_base_frame(
@@ -3711,22 +4037,38 @@ class FoundationPoseTrackerNode(Node):
                         if buf.is_ready():
                             T_base_publish = buf.get_median()
 
+                    mode_str = (
+                        "single_cam_centroid_recovery"
+                        if centroid_recovery_seed is not None
+                        else "single_cam_fallback"
+                    )
                     decision.update({
-                        "mode": "single_cam_fallback",
+                        "mode": mode_str,
                         "pose_mode": single_cam_pose_mode,
                         "accepted": True,
-                        "reason": "single_cam_ok",
+                        "reason": (
+                            centroid_recovery_reason or "centroid_recovery_ok"
+                            if centroid_recovery_seed is not None
+                            else "single_cam_ok"
+                        ),
                         "T_base": T_base_publish,
                         "fitness": fitness_val,
                         "rmse_m": rmse_val,
                         "trans_jump_m": dt,
                         "rot_jump_deg": drot,
                     })
-                    self._fused_track_memory[track_id] = {
+                    memory_update = {
                         "T_base": T_base_publish.copy(),
-                        "mode": "single_cam_fallback",
+                        "mode": mode_str,
                         "stamp_s": self._stamp_to_seconds(stamp),
                     }
+                    if bool(getattr(self.args, "fused_track_centroid_recovery", False)):
+                        pcd = m.get("pcd")
+                        if pcd is not None and len(pcd.points) > 0:
+                            memory_update["cloud_centroid_base"] = (
+                                np.asarray(pcd.points).mean(axis=0).astype(np.float32)
+                            )
+                    self._fused_track_memory[track_id] = memory_update
                     self._last_known_track_centroids[track_id] = (
                         T_base_publish[:3, 3].astype(np.float64).copy()
                     )
@@ -3785,7 +4127,7 @@ class FoundationPoseTrackerNode(Node):
                 )
             else:
                 fused_cloud = merge_point_clouds(survivor_pcds, voxel_size=0.0)
-    
+
             if fused_cloud is None or len(fused_cloud.points) < int(self.args.fused_gate_min_cloud_points):
                 decision["reason"] = f"fused_cloud_too_small({0 if fused_cloud is None else len(fused_cloud.points)})"
                 decision["pose_mode"] = "hold_previous"
@@ -3798,8 +4140,10 @@ class FoundationPoseTrackerNode(Node):
                 object_decisions[track_id] = decision
                 self._fused_warmup_count[track_id] = warmup_count + 1
                 continue
-    
-            if prev_base_pose is not None:
+
+            if centroid_recovery_seed is not None:
+                T_base_init = centroid_recovery_seed.astype(np.float32)
+            elif prev_base_pose is not None:
                 T_base_init = prev_base_pose.astype(np.float32)
             else:
                 first_survivor = survivors[0]
@@ -3819,6 +4163,82 @@ class FoundationPoseTrackerNode(Node):
                 relative_fitness=float(getattr(self.args, 'fused_track_icp_relative_fitness', 1e-4)),
                 relative_rmse=float(getattr(self.args, 'fused_track_icp_relative_rmse', 1e-4)),
             )
+
+            # ── Optional rotation re-seed (opt-in: --fused-track-rot-reseed) ──
+            # Local ICP can settle on a wrong shaft-axis minimum that still has
+            # good fitness/RMSE. When enabled AND the post-ICP chamfer says the
+            # axis is wrong (but the object isn't fully lost), re-run the
+            # init-style rotation grid around the CURRENT translation and keep
+            # it only if it lowers chamfer. The whole block — including the
+            # chamfer it needs to decide — is inside this guard, so there is
+            # zero added cost when the flag is off (never fires on its own).
+            if getattr(self.args, "fused_track_rot_reseed", False) and not is_warmup:
+                reseed_lo = float(getattr(self.args, "fused_track_rot_reseed_chamfer_m", 0.010))
+                reseed_hi = float(getattr(self.args, "fused_track_rot_reseed_max_chamfer_m", 0.080))
+                ch_now = self._grid_chamfer(model_pcd, fused_cloud, survivor_pcds, T_base_fused)
+                if reseed_lo <= ch_now <= reseed_hi:
+                    T_reseed, ch_reseed = self._icp_rotation_grid(
+                        t_base=T_base_fused[:3, 3],
+                        model_pcd=model_pcd,
+                        fused_cloud=fused_cloud,
+                        per_cam_clouds=survivor_pcds,
+                        n_rot=int(getattr(self.args, "fused_track_rot_reseed_n_rot", 24)),
+                        icp_max_iter=int(getattr(self.args, "fused_track_rot_reseed_icp_iters", 10)),
+                    )
+                    if T_reseed is not None and ch_reseed < ch_now:
+                        T_base_fused = T_reseed.astype(np.float32)
+                        fitness, rmse = evaluate_icp_in_base_frame(
+                            fused_cloud, model_pcd, T_base_fused,
+                            float(self.args.fused_track_icp_max_correspondence_dist_m),
+                        )
+                        if getattr(self.args, "debug_verbose_logs", False):
+                            self.get_logger().info(
+                                f"ROT-RESEED {obj_id}[{track_id}]: chamfer "
+                                f"{ch_now*1000:.1f}->{ch_reseed*1000:.1f}mm fitness={fitness:.3f}"
+                            )
+
+            # ── Optional PCA shaft-axis correction (opt-in: --fused-track-pca-axis) ──
+            # ICP/chamfer barely constrain a thin symmetric screw's shaft-axis
+            # direction (flat cost landscape), so a better optimizer can't fix
+            # it. The fused cloud's principal axis (PCA) IS the shaft direction,
+            # estimated globally from all points at once — cheap (one
+            # eigendecomposition) and free of ICP's ambiguity. When enabled and
+            # the cloud is genuinely shaft-like, snap the pose's shaft axis onto
+            # it (keeping the spin about the shaft, the harmless symmetric DOF).
+            # Whole block inside the guard => zero cost when off.
+            if (getattr(self.args, "fused_track_pca_axis", False)
+                    and not is_warmup and prev_base_pose is not None):
+                min_pts = int(getattr(self.args, "fused_track_pca_axis_min_points", 50))
+                scene_pts = np.asarray(fused_cloud.points)
+                model_axis_obj = self._object_shaft_axis(state0.mesh_path, model_pcd)
+                if model_axis_obj is not None and len(scene_pts) >= min_pts:
+                    scene_axis, elong = self._principal_axis(scene_pts)
+                    min_elong = float(getattr(self.args, "fused_track_pca_axis_min_elongation", 3.0))
+                    if elong >= min_elong:
+                        R = T_base_fused[:3, :3].astype(np.float64)
+                        icp_axis = R @ model_axis_obj
+                        icp_axis = icp_axis / (np.linalg.norm(icp_axis) + 1e-12)
+                        # Sign: keep continuity with the current (ICP) direction.
+                        if float(np.dot(scene_axis, icp_axis)) < 0.0:
+                            scene_axis = -scene_axis
+                        cosang = float(np.clip(np.dot(icp_axis, scene_axis), -1.0, 1.0))
+                        ang_deg = float(np.degrees(np.arccos(cosang)))
+                        min_deg = float(getattr(self.args, "fused_track_pca_axis_min_deg", 10.0))
+                        max_deg = float(getattr(self.args, "fused_track_pca_axis_max_deg", 60.0))
+                        if min_deg <= ang_deg <= max_deg:
+                            blend = float(getattr(self.args, "fused_track_pca_axis_blend", 1.0))
+                            R_corr = self._rotation_between(icp_axis, scene_axis, blend)
+                            T_base_fused = T_base_fused.copy()
+                            T_base_fused[:3, :3] = (R_corr @ R).astype(np.float32)
+                            fitness, rmse = evaluate_icp_in_base_frame(
+                                fused_cloud, model_pcd, T_base_fused,
+                                float(self.args.fused_track_icp_max_correspondence_dist_m),
+                            )
+                            if getattr(self.args, "debug_verbose_logs", False):
+                                self.get_logger().info(
+                                    f"PCA-AXIS {obj_id}[{track_id}]: shaft off "
+                                    f"{ang_deg:.1f}deg -> corrected (elong={elong:.1f})"
+                                )
 
             pose_mask_entries = []
             for m in survivors:
@@ -3985,7 +4405,9 @@ class FoundationPoseTrackerNode(Node):
                 # Determine mode — flag rescued jumps distinctly
                 was_rescued = any("RESCUED" in r for r in reject_reasons)
                 unique_cams_used = len({m["cam_id"] for m in survivors})
-                if was_rescued:
+                if centroid_recovery_seed is not None:
+                    mode_str = "fusion_centroid_recovery"
+                elif was_rescued:
                     mode_str = "fusion_rescued"
                 elif unique_cams_used >= 2:
                     mode_str = "fusion_2cam"
@@ -3996,7 +4418,11 @@ class FoundationPoseTrackerNode(Node):
                     "mode": mode_str,
                     "pose_mode": "fused_icp",
                     "accepted": True,
-                    "reason": reject_reasons[0] if reject_reasons else "ok",
+                    "reason": (
+                        centroid_recovery_reason or "centroid_recovery_ok"
+                        if centroid_recovery_seed is not None and not reject_reasons
+                        else reject_reasons[0] if reject_reasons else "ok"
+                    ),
                     "T_base": T_base_publish,
                     "fitness": float(fitness),
                     "rmse_m": float(rmse),
@@ -4004,11 +4430,18 @@ class FoundationPoseTrackerNode(Node):
                     "rot_jump_deg": drot,
                     "chamfer_m": float(chamfer) if chamfer is not None else -1.0,
                 })
-                self._fused_track_memory[track_id] = {
+                memory_update = {
                     "T_base": T_base_publish.copy(),
                     "mode": decision["mode"],
                     "stamp_s": self._stamp_to_seconds(stamp),
                 }
+                if bool(getattr(self.args, "fused_track_centroid_recovery", False)):
+                    pts_mem = np.asarray(fused_cloud.points)
+                    if pts_mem.size > 0:
+                        memory_update["cloud_centroid_base"] = (
+                            pts_mem.mean(axis=0).astype(np.float32)
+                        )
+                self._fused_track_memory[track_id] = memory_update
                 self._last_known_track_centroids[track_id] = (
                     T_base_publish[:3, 3].astype(np.float64).copy()
                 )
@@ -4119,6 +4552,12 @@ class FoundationPoseTrackerNode(Node):
             self._fused_pose_status[tid] = status
             decision["pose_status"] = status
             decision["lost_count"] = int(self._fused_lost_count.get(tid, 0))
+            self._remember_fused_drop_reason(
+                tid,
+                decision,
+                accepted=accepted,
+                status=status,
+            )
             if tid in self._fused_icp_metrics:
                 self._fused_icp_metrics[tid]["pose_status"] = status
                 self._fused_icp_metrics[tid]["lost_count"] = decision["lost_count"]
@@ -4952,6 +5391,7 @@ class FoundationPoseTrackerNode(Node):
                 del self._fused_track_memory[tid]
             self._fused_lost_count[tid] = 0
             self._fused_pose_status[tid] = "fresh"
+            self._fused_last_drop_reasons.pop(tid, None)
             self._force_reinit_tracks.discard(tid)
 
         for key, rt in list(self.realtime_trackers.items()):
@@ -4960,6 +5400,15 @@ class FoundationPoseTrackerNode(Node):
             except Exception:
                 pass
             del self.realtime_trackers[key]
+
+        # Reset the per-camera Cutie sessions too (clears Cutie memory and
+        # object identities) but keep the loaded network weights so the next
+        # tick re-registers objects without reloading the model.
+        for session in self.cutie_sessions.values():
+            try:
+                session.reset()
+            except Exception:
+                pass
 
     def _drop_realtime_trackers_for_track_ids(self, track_ids: set[str]) -> None:
         """Release per-camera video trackers for tracks that are about to reinit."""
@@ -4973,6 +5422,14 @@ class FoundationPoseTrackerNode(Node):
             except Exception:
                 pass
             del self.realtime_trackers[key]
+
+        # Remove the dropped objects from every camera's shared Cutie session.
+        for session in self.cutie_sessions.values():
+            for tid in track_ids:
+                try:
+                    session.remove_object(tid)
+                except Exception:
+                    pass
         try:
             import gc
             gc.collect()
@@ -4997,8 +5454,10 @@ class FoundationPoseTrackerNode(Node):
     
             if self._force_reinit_tracks:
                 lost_track_ids = set(self._force_reinit_tracks)
+                drop_reasons = self._format_fused_drop_reasons(lost_track_ids)
                 self.get_logger().warn(
                     f"FORCE REINIT: pose_status=lost for {sorted(lost_track_ids)} "
+                    f"reasons={drop_reasons} "
                     f"— dropping their states, re-detecting on this tick"
                 )
                 for cid in list(self.track_states.keys()):
@@ -5009,6 +5468,7 @@ class FoundationPoseTrackerNode(Node):
                 for tid in lost_track_ids:
                     self._fused_lost_count[tid] = 0
                     self._fused_pose_status[tid] = "fresh"
+                    self._fused_last_drop_reasons.pop(tid, None)
                 self._drop_realtime_trackers_for_track_ids(lost_track_ids)
                 self._force_reinit_tracks.clear()
                 remaining_track_ids = sorted({
@@ -5021,7 +5481,8 @@ class FoundationPoseTrackerNode(Node):
                 if remaining_track_ids and not allow_partial_reinit:
                     self.get_logger().warn(
                         f"PARTIAL TRACK LOSS: dropped {sorted(lost_track_ids)}; "
-                        f"continuing {remaining_track_ids} without global reinit"
+                        f"reasons={drop_reasons}; continuing {remaining_track_ids} "
+                        f"without global reinit"
                     )
                     force_init_this_tick = False
                 else:
@@ -5272,6 +5733,51 @@ def parse_args() -> argparse.Namespace:
     # Adaptive early-stop tolerances for tracking ICP
     p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
     p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
+
+    # Optional fast-motion recovery (OFF by default). When Cutie/depth masks
+    # remain healthy but their cloud centroid jumps beyond the normal tracking
+    # gate, seed ICP from the observed centroid displacement instead of the old
+    # pose. Adds no runtime work unless --fused-track-centroid-recovery is set.
+    p.add_argument("--fused-track-centroid-recovery", action="store_true",
+                   help="Enable centroid-seeded ICP recovery for large mask-cloud jumps.")
+    p.add_argument("--fused-track-centroid-recovery-cluster-dist-m", type=float, default=0.12,
+                   help="Max distance between camera cloud centroids to form a recovery cluster.")
+    p.add_argument("--fused-track-centroid-recovery-min-cameras", type=int, default=1,
+                   help="Minimum agreeing centroid-far cameras required for recovery.")
+    p.add_argument("--fused-track-centroid-recovery-max-seed-jump-m", type=float, default=0.75,
+                   help="Reject centroid recovery if the proposed seed jump exceeds this distance.")
+
+    # Optional rotation re-seed during tracking (OFF by default; never fires
+    # unless --fused-track-rot-reseed is passed, and adds zero cost when off).
+    # Re-runs the init-style rotation grid around the current translation when
+    # the post-ICP chamfer says the shaft axis is wrong, fixing the estimate
+    # (vs. the chamfer GATE, which only rejects -> holds -> drops).
+    p.add_argument("--fused-track-rot-reseed", action="store_true",
+                   help="Enable chamfer-triggered rotation re-seed during tracking.")
+    p.add_argument("--fused-track-rot-reseed-chamfer-m", type=float, default=0.010,
+                   help="Trigger: re-seed only when grid-chamfer exceeds this (m).")
+    p.add_argument("--fused-track-rot-reseed-max-chamfer-m", type=float, default=0.080,
+                   help="Ceiling: above this the object is lost (not mis-rotated); skip the grid.")
+    p.add_argument("--fused-track-rot-reseed-n-rot", type=int, default=24,
+                   help="Rotation candidates for the tracking re-seed grid (init uses --icp-grid-n-rot).")
+    p.add_argument("--fused-track-rot-reseed-icp-iters", type=int, default=10,
+                   help="ICP iterations per candidate in the tracking re-seed grid.")
+
+    # Optional PCA shaft-axis correction (OFF by default; zero cost when off).
+    # Snaps the tracked shaft-axis onto the fused cloud's principal axis, which
+    # is a global, ICP-free estimate of the axis for an elongated object.
+    p.add_argument("--fused-track-pca-axis", action="store_true",
+                   help="Enable PCA shaft-axis correction during tracking.")
+    p.add_argument("--fused-track-pca-axis-min-deg", type=float, default=10.0,
+                   help="Only correct when ICP shaft-axis disagrees with PCA axis by more than this (deg).")
+    p.add_argument("--fused-track-pca-axis-max-deg", type=float, default=60.0,
+                   help="Ceiling: above this the PCA axis is likely unreliable; skip correction (deg).")
+    p.add_argument("--fused-track-pca-axis-min-elongation", type=float, default=3.0,
+                   help="Only apply when the cloud is shaft-like (lambda1/lambda2 >= this).")
+    p.add_argument("--fused-track-pca-axis-min-points", type=int, default=50,
+                   help="Minimum fused-cloud points required for a stable PCA axis.")
+    p.add_argument("--fused-track-pca-axis-blend", type=float, default=1.0,
+                   help="Correction strength in [0,1]; 1.0 = full snap, <1.0 = partial (less jitter).")
 
     # Distance-weighted cloud merging (mitigates depth bias at distance)
     p.add_argument("--use-weighted-cloud-merge", action="store_true")

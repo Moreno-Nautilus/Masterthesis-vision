@@ -132,12 +132,13 @@ class RealtimeTracker:
         K: np.ndarray,
         mesh_path: Optional[str] = None,
         model_vertices: Optional[np.ndarray] = None,
+        init_cutie: bool = True,
     ) -> None:
         """
         Initialize tracker with first detection.
-        
+
         Must provide either mesh_path or model_vertices.
-        
+
         Args:
             rgb: (H, W, 3) uint8 RGB image
             depth: (H, W) float32 depth in meters
@@ -146,9 +147,14 @@ class RealtimeTracker:
             K: (3, 3) camera intrinsics
             mesh_path: Path to object mesh file
             model_vertices: (N, 3) model point cloud (alternative to mesh)
+            init_cutie: when False, skip this tracker's own Cutie init. Used by
+                the multicam-fused pipeline, where a single per-camera Cutie
+                session (shared across all objects) owns mask propagation and
+                masks are fed in via track_with_mask().
         """
-        self._cutie.initialize(rgb, mask.astype(np.uint8))
-        
+        if init_cutie:
+            self._cutie.initialize(rgb, mask.astype(np.uint8))
+
         # Initialize ICP with model
         if mesh_path is not None:
             self._icp.set_model_from_mesh(mesh_path,  scale=0.01)
@@ -195,11 +201,7 @@ class RealtimeTracker:
         if self._state == TrackingState.NEEDS_REINIT:
             return self._make_invalid_result("Needs re-initialization")
 
-        K = K if K is not None else self._K
-        t0 = time.time()
-
-        # Stage 1: Mask tracking with Cutie.
-        occlusion_score = 0.0
+        # Stage 1: Mask tracking with this tracker's own Cutie session.
         backend_used = self._mask_backend
         try:
             cutie_result = self._cutie.track(rgb)
@@ -207,6 +209,43 @@ class RealtimeTracker:
             self._handle_lost(f"{backend_used} failed: {e}")
             return self._make_invalid_result(f"{backend_used} failed: {e}")
 
+        return self.track_with_mask(cutie_result, depth, K=K, skip_icp=skip_icp, rgb=rgb)
+
+    def track_with_mask(
+        self,
+        cutie_result,
+        depth: np.ndarray,
+        K: Optional[np.ndarray] = None,
+        skip_icp: bool = False,
+        rgb: Optional[np.ndarray] = None,
+    ) -> TrackingResult:
+        """
+        Same as track() but with the Cutie mask supplied externally.
+
+        Used by the multicam-fused pipeline: one shared per-camera Cutie
+        session runs a single multi-object forward, then feeds each object's
+        CutieResult (mask/prob/bbox/area) into its tracker here. This replaces
+        per-(camera, object) Cutie forwards with one per camera.
+
+        Args:
+            cutie_result: a CutieResult-like object exposing .mask, .prob,
+                .bbox_xyxy, .area and .elapsed_ms.
+            depth: (H, W) float32 depth in meters.
+            K: (3, 3) camera intrinsics (uses stored K if not provided).
+            skip_icp: mask-only fast path; hold the current pose (fused-cloud
+                ICP downstream is authoritative).
+        """
+        if self._state == TrackingState.UNINITIALIZED:
+            return self._make_invalid_result("Not initialized")
+
+        if self._state == TrackingState.NEEDS_REINIT:
+            return self._make_invalid_result("Needs re-initialization")
+
+        K = K if K is not None else self._K
+        t0 = time.time()
+
+        occlusion_score = 0.0
+        backend_used = self._mask_backend
         cutie_ms = cutie_result.elapsed_ms
 
         # Check mask validity
@@ -225,7 +264,7 @@ class RealtimeTracker:
             self._lost_count = 0
             self._frame_count += 1
             self._state = TrackingState.TRACKING
-            total_ms = (time.time() - t0) * 1000
+            total_ms = cutie_ms + (time.time() - t0) * 1000
             return TrackingResult(
                 valid=True,
                 state=TrackingState.TRACKING,
@@ -302,9 +341,9 @@ class RealtimeTracker:
         self._lost_count = 0
         self._frame_count += 1
         self._state = TrackingState.TRACKING
-        
-        total_ms = (time.time() - t0) * 1000
-        
+
+        total_ms = cutie_ms + (time.time() - t0) * 1000
+
         if self.cfg.verbose:
             print(f"[Track #{self._frame_count}] "
                   f"cutie={cutie_ms:.1f}ms icp={icp_ms:.1f}ms total={total_ms:.1f}ms "
