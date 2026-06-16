@@ -3361,6 +3361,7 @@ class FoundationPoseTrackerNode(Node):
     
         per_cam_results = {}
         tracker_key_to_state = {}
+        cam_timing: dict = {}  # cam_id -> (n_cutie_calls, cutie_ms), for latency profiling
     
         # Collect work items
         camera_work = []
@@ -3378,6 +3379,8 @@ class FoundationPoseTrackerNode(Node):
             depth = view.depth
             K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
             results = {}
+            _cutie_ms = 0.0
+            _cutie_n = 0
     
             for idx, state in enumerate(states):
                 # Tracker key is per-instance (track_id) so multi-instance
@@ -3423,10 +3426,13 @@ class FoundationPoseTrackerNode(Node):
     
                 rt = self.realtime_trackers[tracker_key]
                 try:
+                    _t_trk = time.time()
                     result = rt.track(
                         rgb, depth, K,
                         skip_icp=bool(getattr(self.args, "skip_per_cam_icp_tracking", True)),
                     )
+                    _cutie_ms += (time.time() - _t_trk) * 1000.0
+                    _cutie_n += 1
                 except Exception:
                     result = None
     
@@ -3445,7 +3451,8 @@ class FoundationPoseTrackerNode(Node):
                 else:
                     state.lost_count += 1
                     state.mode = "degraded"
-    
+
+            cam_timing[cam_id] = (_cutie_n, _cutie_ms)
             return results
     
         # Run cameras in parallel (or serially if only 1)
@@ -4040,8 +4047,9 @@ class FoundationPoseTrackerNode(Node):
             object_decisions[track_id] = decision
             self._fused_warmup_count[track_id] = warmup_count + 1
 
+        t_icp_end = time.time()
         if getattr(self.args, "debug_verbose_logs", False):
-            _dprint(f"[TIMING] Fused ICP all objects: {(time.time()-t_fuse)*1000:.0f}ms")
+            _dprint(f"[TIMING] Fused ICP all objects: {(t_icp_end-t_fuse)*1000:.0f}ms")
 
         # ── Kalman update ──
         if not fused_kalman_disabled:
@@ -4279,11 +4287,28 @@ class FoundationPoseTrackerNode(Node):
                 T_to_pose_stamped(T_pub, frame_id="base", stamp=stamp)
             )
 
+        t_end = time.time()
+        t_total = (t_end - t_start) * 1000
+        accepted_count = sum(1 for d in object_decisions.values() if d.get("accepted"))
         if getattr(self.args, "debug_verbose_logs", False):
-            t_total = (time.time() - t_start) * 1000
-            accepted_count = sum(1 for d in object_decisions.values() if d.get("accepted"))
             self.get_logger().info(
                 f"FUSED TRACK total: {t_total:.0f}ms | {accepted_count} objects updated"
+            )
+        # Per-stage latency breakdown — printed every 20 ticks regardless of
+        # debug flags, so we can profile the tracking loop with logging OFF
+        # (clean FPS). percam = Cutie mask propagation + depth lift (all cams);
+        # icp = fused ICP (all objects); post = gates/Kalman/decision/publish.
+        if self.frame_counter % 20 == 0:
+            percam_ms = (t_fuse - t_start) * 1000.0
+            icp_ms = (t_icp_end - t_fuse) * 1000.0
+            post_ms = (t_end - t_icp_end) * 1000.0
+            cutie_n = sum(v[0] for v in cam_timing.values())
+            cutie_sum = sum(v[1] for v in cam_timing.values())
+            print(
+                f"[STAGE] percam={percam_ms:.0f}ms (cutie {cutie_n} calls, "
+                f"{cutie_sum:.0f}ms sum)  icp+lift={icp_ms:.0f}ms  "
+                f"post={post_ms:.0f}ms  total={t_total:.0f}ms",
+                flush=True,
             )
 
    
@@ -5189,7 +5214,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fp-debug", type=int, default=0)
     p.add_argument("--mesh-scale", type=float, default=0.01)
 
-    p.add_argument("--timer-period-s", type=float, default=0.25)
+    p.add_argument("--timer-period-s", type=float, default=0.05)
     p.add_argument("--max-candidate-draw", type=int, default=25)
 
     p.add_argument("--min-valid-z-m", type=float, default=0.05)
