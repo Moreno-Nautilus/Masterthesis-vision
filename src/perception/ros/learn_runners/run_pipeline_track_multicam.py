@@ -4240,6 +4240,48 @@ class FoundationPoseTrackerNode(Node):
                                     f"{ang_deg:.1f}deg -> corrected (elong={elong:.1f})"
                                 )
 
+            # ── Optional rotation damping (opt-in: --fused-track-rot-slew-limit-deg
+            #    and/or --fused-track-rot-lowpass) ──
+            # The thin symmetric screws' shaft-axis DIRECTION is only weakly
+            # observable from depth (flat chamfer landscape), so per-frame fused
+            # ICP can WALK the orientation away from the trusted init quality even
+            # while translation stays good. Damp the rotation update: cap how far
+            # it may turn per frame (slew limit) and optionally low-pass it toward
+            # the previous orientation (jitter). This is a CLAMP, not a gate — it
+            # never rejects a frame (rejection -> hold_previous -> drops, which
+            # already bit us). Translation (T_base_fused[:3, 3]) is left exactly
+            # untouched so fast motion still tracks. Must run AFTER the optional
+            # re-seed / PCA blocks so it damps the final ICP rotation. Whole block
+            # inside the guard => zero cost and a byte-identical pose when off.
+            slew_limit_deg = float(getattr(self.args, "fused_track_rot_slew_limit_deg", 0.0))
+            rot_lowpass = float(getattr(self.args, "fused_track_rot_lowpass", 0.0))
+            if ((slew_limit_deg > 0.0 or rot_lowpass > 0.0)
+                    and not is_warmup and prev_base_pose is not None):
+                from scipy.spatial.transform import Rotation as SciRot
+                R_prev = prev_base_pose[:3, :3].astype(np.float64)
+                R_new = T_base_fused[:3, :3].astype(np.float64)
+                # rotvec from prev->new; its norm is the geodesic angle (rad).
+                rotvec = SciRot.from_matrix(R_prev.T @ R_new).as_rotvec()
+                ang_deg = float(np.degrees(np.linalg.norm(rotvec)))
+                if ang_deg > 1e-6:
+                    # Fraction of the prev->new turn to keep (1.0 = full update).
+                    frac = 1.0
+                    if slew_limit_deg > 0.0 and ang_deg > slew_limit_deg:
+                        frac = slew_limit_deg / ang_deg
+                    if rot_lowpass > 0.0:
+                        # Blend the slew-limited rotation toward prev by lowpass;
+                        # along the same geodesic this scales the kept fraction.
+                        frac *= (1.0 - float(np.clip(rot_lowpass, 0.0, 1.0)))
+                    if frac < 1.0:
+                        R_damped = R_prev @ SciRot.from_rotvec(frac * rotvec).as_matrix()
+                        T_base_fused = T_base_fused.copy()
+                        T_base_fused[:3, :3] = R_damped.astype(np.float32)
+                        if getattr(self.args, "debug_verbose_logs", False):
+                            self.get_logger().info(
+                                f"ROT-DAMP {obj_id}[{track_id}]: turn {ang_deg:.1f}deg "
+                                f"-> {ang_deg * frac:.1f}deg (frac={frac:.2f})"
+                            )
+
             pose_mask_entries = []
             for m in survivors:
                 cr_match = next(
@@ -5778,6 +5820,19 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum fused-cloud points required for a stable PCA axis.")
     p.add_argument("--fused-track-pca-axis-blend", type=float, default=1.0,
                    help="Correction strength in [0,1]; 1.0 = full snap, <1.0 = partial (less jitter).")
+
+    # Optional rotation damping during tracking (OFF by default; zero cost and a
+    # byte-identical pose when both flags are 0.0). The thin symmetric screws'
+    # shaft axis is only weakly observable from depth, so fused ICP can walk the
+    # orientation away from the trusted init quality. These CLAMP the rotation
+    # update (they never reject a frame -> no holds/drops); translation is left
+    # exactly untouched so fast motion keeps tracking.
+    p.add_argument("--fused-track-rot-slew-limit-deg", type=float, default=0.0,
+                   help="Cap the per-frame rotation change (deg) vs the previous pose; "
+                        "SLERP from prev toward the ICP update so the change == limit. 0.0 = off.")
+    p.add_argument("--fused-track-rot-lowpass", type=float, default=0.0,
+                   help="Low-pass the (slew-limited) rotation toward the previous pose by "
+                        "this factor in [0,1] to smooth jitter. 0.0 = off.")
 
     # Distance-weighted cloud merging (mitigates depth bias at distance)
     p.add_argument("--use-weighted-cloud-merge", action="store_true")

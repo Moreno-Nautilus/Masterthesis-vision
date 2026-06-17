@@ -125,15 +125,21 @@ Restarts the docker container, sources ROS + the venv, and runs
 `run_pipeline_track_multicam`:
 
 ```bash
-scripts/launch_pipeline.sh baseline      # the locked 3-camera init baseline
-scripts/launch_pipeline.sh               # interactive shell in the container (sources only)
-scripts/launch_pipeline.sh --run-mode track --num-cameras 3 ...   # custom args
-CONTAINER=other-name scripts/launch_pipeline.sh baseline          # different container
+scripts/launch_pipeline.sh init-only       # locked 3-camera init baseline
+scripts/launch_pipeline.sh fast-track      # fast tracking preset
+scripts/launch_pipeline.sh accurate-track  # settled-axis accuracy preset
+scripts/launch_pipeline.sh baseline        # alias for init-only
+scripts/launch_pipeline.sh                 # interactive shell in the container
+scripts/launch_pipeline.sh --run-mode track --num-cameras 3 ...  # custom args
+CONTAINER=other-name scripts/launch_pipeline.sh fast-track       # different container
 ```
 
-`baseline` runs in `init_only` mode (re-detect every tick, never tracks) and tees
-output to `outputs/logs/multicam_init_final_baseline.log`. The exact pinned flags
-are listed in the launch file and explained in
+`init-only`/`baseline` runs in `init_only` mode (re-detect every tick, never
+tracks) and tees output to `outputs/logs/multicam_init_final_baseline.log`.
+`fast-track` keeps tracking responsive with centroid recovery and no rotation
+reseed/PCA/damping. `accurate-track` adds the rotation reseed + cautious PCA +
+light damping preset for better settled screw-axis estimates. The exact pinned
+flags are listed in the launch file and the init-only baseline is explained in
 [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).
 
 ### 3.3 Supervised run ([scripts/run_pipeline_supervised.sh](scripts/run_pipeline_supervised.sh))
