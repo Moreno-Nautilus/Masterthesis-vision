@@ -24,7 +24,6 @@ SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros-thesis-venv/bin/
 
 COMMON_ARGS=(
     --num-cameras 3
-    --mask-source gdino_sam
     --gdino-device cpu
     --gdino-box-threshold 0.30
     --gdino-text-threshold 0.20

@@ -69,7 +69,7 @@ class SAMMaskCandidate:
     bbox_xyxy: tuple[int, int, int, int]
     area: int
     crop_rgb: np.ndarray | None = None
-    # Box-proposer confidence for prompted masks; None for auto masks.
+    # Box-proposer confidence for prompted masks.
     prompt_score: float | None = None
 
 
@@ -93,14 +93,6 @@ class SAMSegmenterConfig:
     # whether to keep crop RGB for downstream DINO
     attach_rgb_crops: bool = True
 
-    # automatic mask generation
-    auto_points_per_side: int = 64
-    auto_pred_iou_thresh: float = 0.70
-    auto_stability_score_thresh: float = 0.65
-    auto_crop_n_layers: int = 1
-    auto_crop_n_points_downscale_factor: int = 2
-    auto_min_mask_region_area: int = 150
-
     # max_side / min_side
     max_aspect_ratio: float = 4.5
 
@@ -112,7 +104,7 @@ class SAMSegmenterConfig:
 
 
 class SAMSegmenter:
-    """SAM2 wrapper for auto and box-prompted mask proposals."""
+    """SAM2 wrapper for box-prompted mask proposals."""
 
     def __init__(self, cfg: SAMSegmenterConfig | None = None) -> None:
         self.cfg = cfg or SAMSegmenterConfig()
@@ -120,11 +112,10 @@ class SAMSegmenter:
             self.cfg.device if self.cfg.device == "cuda" and torch.cuda.is_available() else "cpu"
         )
 
-        # Build the model plus both inference frontends (box predictor + auto generator).
+        # Build the model plus the box-prompt predictor.
         model = self._build_model()
         self._model = model
         self._predictor = self._build_predictor(model)
-        self._auto_mask_generator = self._build_auto_mask_generator(model)
         self._log_param_health("after-build")
 
     def _rebuild_model(self) -> bool:
@@ -132,7 +123,7 @@ class SAMSegmenter:
         collapse. Returns True on a successful swap, False if the rebuild could
         not complete (in which case the existing model is left untouched).
 
-        CRASH-SAFETY: the new model/predictor/AMG are built into locals FIRST and
+        CRASH-SAFETY: the new model/predictor are built into locals FIRST and
         only swapped onto self once all three succeed. The previous version
         deleted self._predictor before rebuilding, so any failure during
         build_sam2() left the segmenter with NO _predictor — permanently bricking
@@ -148,7 +139,6 @@ class SAMSegmenter:
         try:
             new_model = self._build_model()
             new_predictor = self._build_predictor(new_model)
-            new_amg = self._build_auto_mask_generator(new_model)
         except Exception as e:
             print(f"[SAM-REBUILD] rebuild failed, keeping existing model: {e}")
             return False
@@ -156,11 +146,9 @@ class SAMSegmenter:
         # Swap the new stack in and free the old one.
         old_model = getattr(self, "_model", None)
         old_predictor = getattr(self, "_predictor", None)
-        old_amg = getattr(self, "_auto_mask_generator", None)
         self._model = new_model
         self._predictor = new_predictor
-        self._auto_mask_generator = new_amg
-        del old_model, old_predictor, old_amg
+        del old_model, old_predictor
         gc.collect()
         if self.device.type == "cuda":
             try:
@@ -292,21 +280,6 @@ class SAMSegmenter:
 
         predictor = SAM2ImagePredictor(model)
         return predictor
-
-    def _build_auto_mask_generator(self, model: Any) -> Any:
-        self._ensure_repo_on_path()
-        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-
-        amg = SAM2AutomaticMaskGenerator(
-            model=model,
-            points_per_side=self.cfg.auto_points_per_side,
-            pred_iou_thresh=self.cfg.auto_pred_iou_thresh,
-            stability_score_thresh=self.cfg.auto_stability_score_thresh,
-            crop_n_layers=self.cfg.auto_crop_n_layers,
-            crop_n_points_downscale_factor=self.cfg.auto_crop_n_points_downscale_factor,
-            min_mask_region_area=self.cfg.auto_min_mask_region_area,
-        )
-        return amg
 
     @staticmethod
     def _resize_if_needed(rgb: np.ndarray, max_side: int | None) -> tuple[np.ndarray, float]:
@@ -550,59 +523,3 @@ class SAMSegmenter:
                         crop_rgb=crop_rgb, prompt_score=prompt_score,
                     ))
         return out, _reject
-
-    def generate_auto(self, rgb: np.ndarray) -> list[SAMMaskCandidate]:
-        """Automatic mask proposals from one RGB image."""
-        if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
-
-        rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
-        h0, w0 = rgb.shape[:2]
-
-        # Let SAM propose masks across a point grid (no prompts).
-        with torch.inference_mode():
-            if self.device.type == "cuda" and self.cfg.use_bfloat16:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    raw_masks = self._auto_mask_generator.generate(rgb_small)
-            else:
-                raw_masks = self._auto_mask_generator.generate(rgb_small)
-
-        import cv2
-
-        # Upscale, filter, and collect each proposed mask.
-        out: list[SAMMaskCandidate] = []
-        _reject: dict[str, int] = {}  # [SAM-REJECT] diagnostic
-        for item in raw_masks:
-            mask_small = np.asarray(item["segmentation"], dtype=np.uint8)
-
-            if scale != 1.0:
-                mask = cv2.resize(mask_small, (w0, h0), interpolation=cv2.INTER_NEAREST) > 0
-            else:
-                mask = mask_small > 0
-
-            score = float(item.get("predicted_iou", 0.0))
-
-            reason = self._filter_mask(mask, score, (h0, w0), rgb=rgb)
-            if reason:
-                _reject[reason] = _reject.get(reason, 0) + 1
-                continue
-
-            bbox = self._bbox_from_mask(mask)
-            area = int(mask.sum())
-            crop_rgb = self._crop_rgb(rgb, bbox) if self.cfg.attach_rgb_crops else None
-
-            out.append(
-                SAMMaskCandidate(
-                    mask=mask,
-                    score=score,
-                    bbox_xyxy=bbox,
-                    area=area,
-                    crop_rgb=crop_rgb,
-                )
-            )
-
-        if _reject:
-            print(f"[SAM-REJECT] auto: {len(raw_masks)} raw -> {len(out)} kept "
-                  f"| rejected: {dict(sorted(_reject.items(), key=lambda kv: -kv[1]))}")
-        out.sort(key=lambda x: (x.score, x.area), reverse=True)
-        return out

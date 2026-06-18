@@ -75,7 +75,6 @@ From [scripts/launch_pipeline.sh](../scripts/launch_pipeline.sh):
 | Setting | Value | Meaning |
 |---|---|---|
 | `--num-cameras` | `3` | `zed2i_1`, `zed2i_2`, `zed2i_3` |
-| `--mask-source` | `gdino_sam` | GDINO proposes boxes → SAM segments them |
 | `--gdino-device` | `cpu` | Grounding-DINO runs on CPU (keeps GPU VRAM for SAM/FP) |
 | `--gdino-box-threshold` | `0.30` | box-confidence cutoff |
 | `--gdino-text-threshold` | `0.20` | text-token cutoff |
@@ -484,8 +483,7 @@ Survivors are split by camera count:
 - **Single camera** (`unique_survivor_cams == 1`): run one base-frame ICP of that
   camera's cloud against the model, seeded from the previous pose (or the centroid
   recovery seed). Mode tag `single_cam_fallback`.
-- **Two or more cameras**: merge the survivor clouds (voxel 1 mm; optionally
-  distance-weighted with `--use-weighted-cloud-merge`) into one fused cloud, then
+- **Two or more cameras**: merge the survivor clouds into one fused cloud, then
   run **one fused ICP** against the model seeded from the previous pose. Mode tag
   `fusion` / `fusion_2cam`.
 

@@ -53,12 +53,11 @@ from src.perception.multicam_fusion import (
     FusionConfig,
     run_multicam_fusion,
 )
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 import open3d as o3d
 from src.perception.fused_multicam_helpers import (
     lift_masked_depth_to_base,
     merge_point_clouds,
-    merge_point_clouds_weighted,
     mesh_to_pcd_cached,
     run_icp_in_base_frame,
     evaluate_icp_in_base_frame,
@@ -85,7 +84,6 @@ FAST_CUTIE_PROFILE_OVERRIDES = {
     "fused_track_max_rotation_speed_degps": 180.0,
     "fused_track_min_translation_jump_m": 0.02,
     "fused_track_min_rotation_jump_deg": 10.0,
-    "memory_crop_enable": False,
     "skip_per_cam_icp_tracking": True,
     "debug_frame_publish": False,
     "debug_per_cam_pose_publish": False,
@@ -101,35 +99,12 @@ def _apply_fast_cutie_profile(namespace: argparse.Namespace) -> None:
     # Mutate argparse's namespace exactly as if each fast-tracking flag was passed.
     for key, value in FAST_CUTIE_PROFILE_OVERRIDES.items():
         setattr(namespace, key, value)
-    setattr(namespace, "fast_cutie", True)
     setattr(namespace, "tracking_profile", "fast_cutie")
-
-
-def _apply_default_tracking_profile(
-    parser: argparse.ArgumentParser,
-    namespace: argparse.Namespace,
-) -> None:
-    # Reset profile-owned fields back to parser defaults when --tracking-profile default wins.
-    for key in FAST_CUTIE_PROFILE_OVERRIDES:
-        setattr(namespace, key, parser.get_default(key))
-    setattr(namespace, "fast_cutie", False)
-    setattr(namespace, "tracking_profile", "default")
-
-
-class _FastCutieAction(argparse.Action):
-    def __init__(self, option_strings, dest, nargs=0, **kwargs):
-        super().__init__(option_strings, dest, nargs=0, **kwargs)
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        _apply_fast_cutie_profile(namespace)
 
 
 class _TrackingProfileAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
-        if values == "fast_cutie":
-            _apply_fast_cutie_profile(namespace)
-        else:
-            _apply_default_tracking_profile(parser, namespace)
+        _apply_fast_cutie_profile(namespace)
 
 
 def _dprint(*args, **kwargs) -> None:
@@ -354,21 +329,6 @@ class ObjectTrackState:
             self.kalman = PoseKalmanFilter()
 
 
-@dataclass
-class MemoryCrop:
-    """A clean appearance snapshot of a tracked object, captured when ICP
-    fitness was good. Used at reinit to re-rank SAM/DINO candidates so the
-    pipeline picks the same instance it was tracking instead of a same-class
-    look-alike."""
-    object_id: str
-    cam_id: str
-    frame_idx: int
-    fitness: float
-    embedding: np.ndarray            # L2-normalised DINO embedding
-    track_id: str = ""
-    rgb_crop: Optional[np.ndarray] = None   # uint8 HxWx3;
-    mask_crop: Optional[np.ndarray] = None  # bool HxW
-
 # One accepted detection for an object on a camera (chosen mask + its DINO scores).
 @dataclass
 class CandidateSelection:
@@ -378,7 +338,6 @@ class CandidateSelection:
     candidate: SAMMaskCandidate
     base_scores_by_object: dict[str, float] = field(default_factory=dict)
     score_source: str = "dino_base"
-    track_id_hint: str = ""
     dino_class_score: float = 0.0
     dino_margin: float = 0.0
 
@@ -964,70 +923,64 @@ class FoundationPoseTrackerNode(Node):
             f"DINO ready | objects={sorted(set(r.object_id for r in self.dino.reference_bank))}"
         )
 
-        self.sam: Optional[SAMSegmenter] = None
-
         # SAM is heavy, so the node shares one segmenter across all camera streams.
-        sam_modes = {"sam", "gdino_sam"}
-        if args.mask_source in sam_modes:
-            use_bf16 = not bool(getattr(args, "sam_fp32", False))
-            print(
-                f"[SAM-PRECISION] use_bfloat16={use_bf16} "
-                f"({'bf16 autocast' if use_bf16 else 'fp32'}) "
-                f"| pass --sam-fp32 to force fp32",
-                flush=True,
+        use_bf16 = not bool(getattr(args, "sam_fp32", False))
+        print(
+            f"[SAM-PRECISION] use_bfloat16={use_bf16} "
+            f"({'bf16 autocast' if use_bf16 else 'fp32'}) "
+            f"| pass --sam-fp32 to force fp32",
+            flush=True,
+        )
+        # One shared SAM model for all cameras.
+        min_area = min(p.min_mask_area for p in self.cam_sam_params.values())
+        min_bbox = min(p.min_bbox_side_px for p in self.cam_sam_params.values())
+        self.get_logger().info("Building shared SAM model for all cameras...")
+        self.sam = SAMSegmenter(
+            SAMSegmenterConfig(
+                repo_root=args.sam_repo_root,
+                checkpoint=args.sam_checkpoint,
+                model_cfg=args.sam_model_cfg,
+                device=args.device,
+                max_image_side=args.sam_max_image_side,
+                min_mask_area=min_area,
+                min_bbox_side_px=min_bbox,
+                attach_rgb_crops=False,
+                use_bfloat16=use_bf16,
             )
-            # One shared SAM model for all cameras.
-            min_area = min(p.min_mask_area for p in self.cam_sam_params.values())
-            min_bbox = min(p.min_bbox_side_px for p in self.cam_sam_params.values())
-            self.get_logger().info("Building shared SAM model for all cameras...")
-            self.sam = SAMSegmenter(
-                SAMSegmenterConfig(
-                    repo_root=args.sam_repo_root,
-                    checkpoint=args.sam_checkpoint,
-                    model_cfg=args.sam_model_cfg,
-                    device=args.device,
-                    max_image_side=args.sam_max_image_side,
-                    min_mask_area=min_area,
-                    min_bbox_side_px=min_bbox,
-                    attach_rgb_crops=False,
-                    use_bfloat16=use_bf16,
-                )
+        )
+        if not self.sam.warmup_or_rebuild():
+            self.get_logger().warn(
+                "Shared SAM never warmed after rebuilds — masks may be unreliable"
             )
-            if not self.sam.warmup_or_rebuild():
-                self.get_logger().warn(
-                    "Shared SAM never warmed after rebuilds — masks may be unreliable"
-                )
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-        # Optional Grounding-DINO front-end proposes boxes before SAM masks them.
-        self.gdino_proposer = None
-        if args.mask_source == "gdino_sam":
-            from src.perception.learned.GDINO.grounding_dino_proposal import (
-                GDINOConfig, GroundingDINOProposer,
+        # Grounding-DINO proposes boxes before SAM masks them.
+        from src.perception.learned.GDINO.grounding_dino_proposal import (
+            GDINOConfig, GroundingDINOProposer,
+        )
+        if bool(getattr(args, "gdino_use_items_prompt", False)):
+            # MUSE-style class-agnostic prompt.
+            text_prompts = ["items"]
+        else:
+            text_prompts = [p.strip() for p in args.gdino_text_prompts.split(",") if p.strip()]
+        self.gdino_proposer = GroundingDINOProposer(
+            GDINOConfig(
+                model_id=args.gdino_model_id,
+                device=args.gdino_device or args.device,
+                box_threshold=float(args.gdino_box_threshold),
+                text_threshold=float(args.gdino_text_threshold),
+                max_boxes_per_image=int(args.gdino_max_boxes),
+                text_prompts=text_prompts,
             )
-            if bool(getattr(args, "gdino_use_items_prompt", False)):
-                # MUSE-style class-agnostic prompt.
-                text_prompts = ["items"]
-            else:
-                text_prompts = [p.strip() for p in args.gdino_text_prompts.split(",") if p.strip()]
-            self.gdino_proposer = GroundingDINOProposer(
-                GDINOConfig(
-                    model_id=args.gdino_model_id,
-                    device=args.gdino_device or args.device,
-                    box_threshold=float(args.gdino_box_threshold),
-                    text_threshold=float(args.gdino_text_threshold),
-                    max_boxes_per_image=int(args.gdino_max_boxes),
-                    text_prompts=text_prompts,
-                )
-            )
-            try:
-                self.gdino_proposer._lazy_load()
-            except Exception as e:
-                self.get_logger().warn(f"GDINO eager preload failed (will lazy-load): {e}")
-            self.get_logger().info(
-                f"GDINO proposer ready | model={args.gdino_model_id} "
-                f"prompts={text_prompts}"
-            )
+        )
+        try:
+            self.gdino_proposer._lazy_load()
+        except Exception as e:
+            self.get_logger().warn(f"GDINO eager preload failed (will lazy-load): {e}")
+        self.get_logger().info(
+            f"GDINO proposer ready | model={args.gdino_model_id} "
+            f"prompts={text_prompts}"
+        )
 
         # One FoundationPose wrapper handles all cameras and object meshes.
         self.fp_tracker = FoundationPoseWrapper(
@@ -1084,7 +1037,7 @@ class FoundationPoseTrackerNode(Node):
         self.timer = self.create_timer(args.timer_period_s, self._tick)
         self.get_logger().info(
             f"FoundationPoseTrackerNode started | run_mode={self.args.run_mode} "
-            f"profile={getattr(self.args, 'tracking_profile', 'default')}"
+            f"profile={getattr(self.args, 'tracking_profile', None) or 'none'}"
         )
         self._fused_warmup_count = {}       # track_id -> frames since init
         self._median_pose_buffers = {}      # track_id -> MedianPoseBuffer
@@ -1146,18 +1099,6 @@ class FoundationPoseTrackerNode(Node):
         self._init_chamfer_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=10)
         )
-        # Recent healthy masks are a shortcut for reinit: match by IoU/centroid before DINO.
-        self._recent_tracker_health: dict[tuple[str, str], dict] = {}
-
-        # Per-object appearance memory bank.
-        max_crops = int(getattr(args, "memory_crop_max_per_object", 8))
-        self._memory_crops_by_object: dict[str, deque[MemoryCrop]] = defaultdict(
-            lambda: deque(maxlen=max(1, max_crops))
-        )
-        self._memory_crops_by_track_id: dict[str, deque[MemoryCrop]] = defaultdict(
-            lambda: deque(maxlen=max(1, max_crops))
-        )
-
     # ── track_id allocation / cross-init identity preservation ──────────
     def _allocate_track_id(self, object_id: str) -> str:
         n = self._next_track_id_counter.get(object_id, 0)
@@ -1625,197 +1566,6 @@ class FoundationPoseTrackerNode(Node):
         T_base_cam = self._resolve_T_base_cam(cam_id)
         return (T_base_cam @ T_object_camera.astype(np.float64)).astype(np.float32)
 
-    def _mask_base_centroid(
-        self,
-        cam_id: str,
-        depth: np.ndarray | None,
-        K: np.ndarray | None,
-        mask: np.ndarray,
-    ) -> Optional[np.ndarray]:
-        """Lift a mask to base-frame depth points and return its centroid."""
-        if depth is None or K is None:
-            return None
-        try:
-            pcd = lift_masked_depth_to_base(
-                depth=np.asarray(depth),
-                mask=np.asarray(mask).astype(bool),
-                K=np.asarray(K, dtype=np.float32).reshape(3, 3),
-                T_base_cam=self._resolve_T_base_cam(cam_id),
-                z_min=float(getattr(self.args, "min_valid_z_m", 0.05)),
-                z_max=float(getattr(self.args, "max_valid_z_m", 3.0)),
-                voxel_size=0.004,
-            )
-            if pcd is None or len(pcd.points) < 10:
-                return None
-            pts = np.asarray(pcd.points, dtype=np.float64)
-            return pts.mean(axis=0).reshape(3)
-        except Exception as e:
-            if bool(getattr(self.args, "debug_verbose_logs", False)):
-                self.get_logger().info(
-                    f"identity centroid failed cam={cam_id}: {e}"
-                )
-            return None
-
-    def _track_matches_by_object(
-        self,
-        base_centroid: Optional[np.ndarray],
-        object_ids: Iterable[str],
-    ) -> tuple[dict[str, str], set[str], dict[str, float]]:
-        """Find nearby live tracks for candidate memory/DINO disambiguation."""
-        matched: dict[str, str] = {}
-        ambiguous: set[str] = set()
-        nearest_dist: dict[str, float] = {}
-        if base_centroid is None:
-            return matched, ambiguous, nearest_dist
-
-        c = np.asarray(base_centroid, dtype=np.float64).reshape(3)
-        max_dist = float(getattr(self.args, "identity_shortcut_max_centroid_dist_m", 0.05))
-        ambiguity_radius = float(getattr(self.args, "identity_shortcut_ambiguity_radius_m", 0.05))
-
-        for obj_id in {str(o) for o in object_ids if str(o)}:
-            candidates: list[tuple[float, str]] = []
-            for tid, last_c in self._last_known_track_centroids.items():
-                if self._track_id_to_object_id.get(tid) != obj_id:
-                    continue
-                d = float(np.linalg.norm(np.asarray(last_c, dtype=np.float64).reshape(3) - c))
-                candidates.append((d, tid))
-            if not candidates:
-                continue
-            candidates.sort(key=lambda x: x[0])
-            nearest_dist[obj_id] = candidates[0][0]
-            if len(candidates) >= 2 and candidates[1][0] <= ambiguity_radius:
-                ambiguous.add(obj_id)
-                continue
-            if candidates[0][0] <= max_dist:
-                matched[obj_id] = candidates[0][1]
-        return matched, ambiguous, nearest_dist
-
-
-    def _inherit_from_tracker_health(
-        self,
-        cam_id: str,
-        masks: list[SAMMaskCandidate],
-        depth: np.ndarray | None = None,
-        K: np.ndarray | None = None,
-        ) -> tuple[list[CandidateSelection], list[SAMMaskCandidate]]:
-        """Assign masks to recently healthy tracks, avoiding DINO when identity is clear."""
-        if not masks:
-            return [], masks
-        stale_frames = int(getattr(self.args, "tracker_health_stale_frames", 5))
-        iou_thr = float(getattr(self.args, "tracker_health_iou_threshold", 0.5))
-        max_occ = float(getattr(self.args, "tracker_health_max_occlusion", 0.4))
-
-        max_centroid_dist = float(getattr(self.args, "identity_shortcut_max_centroid_dist_m", 0.05))
-        ambiguity_radius = float(getattr(self.args, "identity_shortcut_ambiguity_radius_m", 0.05))
-
-        # Collect healthy entries for this cam, per-instance (track_id-keyed).
-        healthy: list[tuple[str, str, np.ndarray, Optional[np.ndarray]]] = []
-        for (cid, track_id), info in self._recent_tracker_health.items():
-            if cid != cam_id:
-                continue
-            if (self.frame_counter - int(info.get("frame_idx", 0))) > stale_frames:
-                continue
-            if float(info.get("occlusion_score", 0.0)) > max_occ:
-                continue
-            mask = info.get("mask")
-            if mask is None or int(np.asarray(mask).sum()) <= 0:
-                continue
-            obj_id = str(info.get("object_id", ""))
-            if not obj_id or not track_id:
-                continue
-            centroid = info.get("centroid_base")
-            if centroid is None and info.get("T_object_camera") is not None:
-                try:
-                    centroid = self._safe_to_base_pose(
-                        cam_id, info["T_object_camera"]
-                    )[:3, 3]
-                except Exception:
-                    centroid = None
-            centroid_arr = (
-                np.asarray(centroid, dtype=np.float64).reshape(3)
-                if centroid is not None else None
-            )
-            healthy.append((track_id, obj_id, np.asarray(mask, dtype=bool), centroid_arr))
-
-        if not healthy:
-            return [], masks
-
-        inherited: list[CandidateSelection] = []
-        remaining: list[SAMMaskCandidate] = []
-        used_track_ids: set[str] = set()
-        for cand in masks:
-            cm = np.asarray(cand.mask, dtype=bool)
-            cm_sum = int(cm.sum())
-            if cm_sum == 0:
-                remaining.append(cand)
-                continue
-            best_iou = 0.0
-            best_obj: Optional[str] = None
-            best_tid: Optional[str] = None
-            best_centroid_dist: Optional[float] = None
-            cand_centroid = self._mask_base_centroid(cam_id, depth, K, cm)
-            for tid, obj_id, hmask, hcentroid in healthy:
-                if tid in used_track_ids:
-                    continue
-                if hmask.shape != cm.shape:
-                    continue
-                if cand_centroid is None or hcentroid is None:
-                    continue
-                centroid_dist = float(np.linalg.norm(cand_centroid - hcentroid))
-                if centroid_dist > max_centroid_dist:
-                    continue
-                inter = int(np.logical_and(cm, hmask).sum())
-                if inter == 0:
-                    continue
-                union = cm_sum + int(hmask.sum()) - inter
-                if union <= 0:
-                    continue
-                iou = float(inter) / float(union)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_obj = obj_id
-                    best_tid = tid
-                    best_centroid_dist = centroid_dist
-            if best_obj is not None and best_tid is not None and best_iou >= iou_thr:
-                ambiguous = False
-                if cand_centroid is not None:
-                    for tid, obj_id, _hmask, hcentroid in healthy:
-                        if tid == best_tid or obj_id != best_obj or hcentroid is None:
-                            continue
-                        if float(np.linalg.norm(cand_centroid - hcentroid)) <= ambiguity_radius:
-                            ambiguous = True
-                            break
-                if ambiguous:
-                    remaining.append(cand)
-                    self.get_logger().info(
-                        f"[identity] DINO-skip blocked cam={cam_id} track={best_tid} "
-                        f"obj={best_obj}: nearby same-class track"
-                    )
-                    continue
-                inherited.append(CandidateSelection(
-                    object_id=best_obj,
-                    score=1.0,
-                    scores_by_object={best_obj: 1.0},
-                    candidate=cand,
-                    base_scores_by_object={best_obj: 1.0},
-                    score_source="tracker_health",
-                    track_id_hint=best_tid,
-                    dino_class_score=1.0,
-                    dino_margin=1.0,
-                ))
-                used_track_ids.add(best_tid)
-                dist_txt = (
-                    f"{best_centroid_dist:.3f}m"
-                    if best_centroid_dist is not None else "unknown"
-                )
-                self.get_logger().info(
-                    f"[identity] inherited cam={cam_id} track={best_tid} obj={best_obj} "
-                    f"iou={best_iou:.3f} centroid_dist={dist_txt}"
-                )
-            else:
-                remaining.append(cand)
-        return inherited, remaining
-
     def _generate_and_filter_masks(self, rgb: np.ndarray, cam_id: str) -> list[SAMMaskCandidate]:
         """Run SAM/GDINO inside the camera ROI, then apply cheap geometry filters."""
         if self.sam is None:
@@ -1852,41 +1602,36 @@ class FoundationPoseTrackerNode(Node):
 
         # --- Main proposal stage ---
         t1 = time.time()
-        if (self.args.mask_source == "gdino_sam"
-                and self.gdino_proposer is not None):
-            proposals = self.gdino_proposer.propose(rgb_crop_masked)
-            # Record how many box proposals SAM was handed this call
-            self._last_sam_n_boxes = len(proposals)
-            if proposals:
-                boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
-                box_scores = np.array([p.score for p in proposals], dtype=np.float32)
-                # [IMG-DBG] diagnostic: image + box sanity for the cam being processed
-                _img = rgb_crop_masked
-                _nan = int(np.isnan(_img).sum()) if np.issubdtype(_img.dtype, np.floating) else 0
-                _bw = boxes[:, 2] - boxes[:, 0]
-                _bh = boxes[:, 3] - boxes[:, 1]
-                _dprint(
-                    f"[IMG-DBG] {cam_id}: img shape={_img.shape} dtype={_img.dtype} "
-                    f"min={float(_img.min()):.1f} max={float(_img.max()):.1f} "
-                    f"mean={float(_img.mean()):.1f} nan={_nan} | "
-                    f"boxes n={len(boxes)} x=[{float(boxes[:,0].min()):.0f},{float(boxes[:,2].max()):.0f}] "
-                    f"y=[{float(boxes[:,1].min()):.0f},{float(boxes[:,3].max()):.0f}] "
-                    f"degenerate={int(((_bw<=0)|(_bh<=0)).sum())} "
-                    f"box_score[min,max]=[{float(box_scores.min()):.2f},{float(box_scores.max()):.2f}] "
-                    f"box_score_nan={int((~np.isfinite(box_scores)).sum())}"
-                )
-                masks_crop = sam.generate_from_boxes(
-                    rgb_crop_masked, boxes, box_scores=box_scores,
-                )
-            else:
-                masks_crop = []
+        proposals = self.gdino_proposer.propose(rgb_crop_masked)
+        # Record how many box proposals SAM was handed this call
+        self._last_sam_n_boxes = len(proposals)
+        if proposals:
+            boxes = np.array([p.bbox_xyxy for p in proposals], dtype=np.float32)
+            box_scores = np.array([p.score for p in proposals], dtype=np.float32)
+            # [IMG-DBG] diagnostic: image + box sanity for the cam being processed
+            _img = rgb_crop_masked
+            _nan = int(np.isnan(_img).sum()) if np.issubdtype(_img.dtype, np.floating) else 0
+            _bw = boxes[:, 2] - boxes[:, 0]
+            _bh = boxes[:, 3] - boxes[:, 1]
             _dprint(
-                f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
-                f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
+                f"[IMG-DBG] {cam_id}: img shape={_img.shape} dtype={_img.dtype} "
+                f"min={float(_img.min()):.1f} max={float(_img.max()):.1f} "
+                f"mean={float(_img.mean()):.1f} nan={_nan} | "
+                f"boxes n={len(boxes)} x=[{float(boxes[:,0].min()):.0f},{float(boxes[:,2].max()):.0f}] "
+                f"y=[{float(boxes[:,1].min()):.0f},{float(boxes[:,3].max()):.0f}] "
+                f"degenerate={int(((_bw<=0)|(_bh<=0)).sum())} "
+                f"box_score[min,max]=[{float(box_scores.min()):.2f},{float(box_scores.max()):.2f}] "
+                f"box_score_nan={int((~np.isfinite(box_scores)).sum())}"
+            )
+            masks_crop = sam.generate_from_boxes(
+                rgb_crop_masked, boxes, box_scores=box_scores,
             )
         else:
-            masks_crop = sam.generate_auto(rgb_crop_masked)
-            _dprint(f"[TIMING]   SAM generate_auto (main): {(time.time() - t1)*1000:.0f}ms -> {len(masks_crop)} raw masks")
+            masks_crop = []
+        _dprint(
+            f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
+            f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
+        )
 
         if not masks_crop:
             masks = []
@@ -1926,139 +1671,12 @@ class FoundationPoseTrackerNode(Node):
 
         return masks
 
-    # ── per-object appearance memory ─────────────────────────────────────
-    def _maybe_save_memory_crop(
-        self,
-        object_id: str,
-        track_id: str,
-        cam_id: str,
-        rgb_full: np.ndarray,
-        mask_full: np.ndarray,
-        bbox_xyxy: Optional[tuple[int, int, int, int]],
-        fitness: float,
-        ) -> bool:
-        """Snapshot a clean RGB crop into the per-object memory bank when the
-        fused ICP fitness is good. Returns True if a crop was saved."""
-        if not getattr(self.args, "memory_crop_enable", False):
-            return False
-        if self.dino is None:
-            return False
-        threshold = float(self.args.memory_crop_fitness_threshold)
-        if fitness < threshold:
-            return False
-
-        bank = self._memory_crops_by_object[object_id]
-        track_bank = self._memory_crops_by_track_id[track_id] if track_id else None
-        gap = int(self.args.memory_crop_min_frame_gap)
-        if gap > 0 and bank:
-            for entry in reversed(bank):
-                if entry.cam_id == cam_id and (not track_id or entry.track_id == track_id):
-                    if self.frame_counter - entry.frame_idx < gap:
-                        return False
-                    break
-
-        if bbox_xyxy is None:
-            ys, xs = np.where(mask_full.astype(bool))
-            if xs.size == 0:
-                return False
-            bbox_xyxy = (int(xs.min()), int(ys.min()),
-                         int(xs.max()) + 1, int(ys.max()) + 1)
-
-        try:
-            crop_rgb, crop_mask = bbox_crop_with_local_mask(
-                rgb_full, mask_full.astype(bool), bbox_xyxy,
-            )
-        except Exception as e:
-            self.get_logger().warn(f"memory-crop bbox crop failed: {e}")
-            return False
-        if crop_rgb.size == 0 or int(crop_mask.sum()) == 0:
-            return False
-
-        try:
-            embedding = self.dino.embed_image(crop_rgb, crop_mask)
-        except Exception as e:
-            self.get_logger().warn(f"memory-crop DINO embed failed: {e}")
-            return False
-
-        keep_rgb = bool(getattr(self.args, "memory_crop_keep_rgb", False))
-        entry = MemoryCrop(
-            object_id=object_id,
-            cam_id=cam_id,
-            frame_idx=self.frame_counter,
-            fitness=float(fitness),
-            embedding=np.asarray(embedding, dtype=np.float32),
-            track_id=str(track_id or ""),
-            rgb_crop=crop_rgb if keep_rgb else None,
-            mask_crop=crop_mask if keep_rgb else None,
-        )
-        bank.append(entry)
-        if track_bank is not None:
-            track_bank.append(entry)
-
-        save_dir = str(self.args.memory_crop_save_dir or "").strip()
-        if save_dir:
-            try:
-                out_dir = Path(save_dir) / object_id
-                out_dir.mkdir(parents=True, exist_ok=True)
-                fname = f"f{self.frame_counter:06d}_{cam_id}_fit{fitness:.2f}.png"
-                bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(str(out_dir / fname), bgr)
-            except Exception as e:
-                self.get_logger().warn(f"memory-crop save_dir write failed: {e}")
-
-        self.get_logger().info(
-            f"[memcrop] saved {object_id}[{track_id}] from {cam_id} fit={fitness:.3f} "
-            f"bank={len(bank)}/{bank.maxlen}"
-        )
-        return True
-
-    def _memory_similarity_by_object(
-        self,
-        query_embedding: np.ndarray,
-        matched_track_ids_by_object: Optional[dict[str, str]] = None,
-        ambiguous_objects: Optional[set[str]] = None,
-        ) -> dict[str, float]:
-        """Return max cosine similarity between the query embedding and each
-        object's memory bank. Assumes all embeddings are L2-normalised."""
-        out: dict[str, float] = {}
-        if query_embedding is None:
-            return out
-        q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
-        if q.size == 0:
-            return out
-        matched_track_ids_by_object = matched_track_ids_by_object or {}
-        ambiguous_objects = ambiguous_objects or set()
-        require_consistency = bool(
-            getattr(self.args, "memory_rerank_require_track_consistency", True)
-        )
-        for obj_id, bank in self._memory_crops_by_object.items():
-            if obj_id in ambiguous_objects:
-                continue
-            track_id = matched_track_ids_by_object.get(obj_id, "")
-            track_bank = self._memory_crops_by_track_id.get(track_id) if track_id else None
-            selected_bank = track_bank if track_bank else None
-            if selected_bank is None:
-                if require_consistency and not track_id:
-                    continue
-                selected_bank = bank
-            if not selected_bank:
-                continue
-            mat = np.stack([e.embedding.reshape(-1) for e in selected_bank], axis=0)
-            if mat.shape[1] != q.shape[0]:
-                continue
-            sims = mat @ q
-            out[obj_id] = float(np.max(sims))
-        return out
-
     def _classify_masks_batched(
         self,
         rgb: np.ndarray,
         masks: list[SAMMaskCandidate],
-        cam_id: str = "",
-        depth: np.ndarray | None = None,
-        K: np.ndarray | None = None,
         ) -> list[CandidateSelection]:
-        """Batch-classify SAM masks with DINO and optionally blend appearance memory."""
+        """Batch-classify SAM masks with DINO."""
         if not masks:
             return []
 
@@ -2104,17 +1722,6 @@ class FoundationPoseTrackerNode(Node):
         out: list[CandidateSelection] = []
         img_area = float(rgb.shape[0] * rgb.shape[1])
 
-        mem_weight = float(getattr(self.args, "memory_crop_weight", 0.0))
-        mem_floor = float(getattr(self.args, "memory_crop_min_score_floor", 0.0))
-        mem_enabled = (
-            bool(getattr(self.args, "memory_crop_enable", False))
-            and mem_weight > 0.0
-            and (
-                any(len(b) > 0 for b in self._memory_crops_by_object.values())
-                or any(len(b) > 0 for b in self._memory_crops_by_track_id.values())
-            )
-        )
-
         for j, res in enumerate(dino_results):
             mask_idx = valid_indices[j]
             cand = masks[mask_idx]
@@ -2131,55 +1738,6 @@ class FoundationPoseTrackerNode(Node):
                 continue
             decision_scores = dict(base_scores)
             score_source = "dino_base"
-
-            mem_sims: dict[str, float] = {}
-            matched_tracks: dict[str, str] = {}
-            ambiguous_objects: set[str] = set()
-            nearest_dists: dict[str, float] = {}
-            if mem_enabled and base_scores:
-                base_top = max(base_scores.values())
-                if base_top >= mem_floor:
-                    # Only let memory influence classes whose nearby track identity is unambiguous.
-                    cand_centroid = self._mask_base_centroid(cam_id, depth, K, cand.mask)
-                    matched_tracks, ambiguous_objects, nearest_dists = (
-                        self._track_matches_by_object(cand_centroid, base_scores.keys())
-                    )
-                    mem_sims = self._memory_similarity_by_object(
-                        res.embedding,
-                        matched_track_ids_by_object=matched_tracks,
-                        ambiguous_objects=ambiguous_objects,
-                    )
-                    if mem_sims:
-                        mem_sims = {
-                            k: float(v)
-                            for k, v in mem_sims.items()
-                            if np.isfinite(float(v))
-                        }
-                        blended: dict[str, float] = {}
-                        for k, v in base_scores.items():
-                            if k in mem_sims:
-                                blended[k] = (1.0 - mem_weight) * v + mem_weight * mem_sims[k]
-                            else:
-                                blended[k] = v
-                        base_top1 = max(base_scores, key=base_scores.get)
-                        new_top1 = max(blended, key=blended.get)
-                        if new_top1 != base_top1:
-                            tid = matched_tracks.get(new_top1, "")
-                            dist = nearest_dists.get(new_top1)
-                            dist_txt = f"{dist:.3f}m" if dist is not None else "unknown"
-                            self.get_logger().info(
-                                f"[memcrop] cand {j} flipped top1 {base_top1}->{new_top1} "
-                                f"track={tid or 'none'} dist={dist_txt} "
-                                f"(base={base_scores[base_top1]:.3f}->{base_scores.get(new_top1, 0.0):.3f}, "
-                                f"mem={mem_sims.get(base_top1, 0.0):.3f}->{mem_sims.get(new_top1, 0.0):.3f})"
-                            )
-                        decision_scores = blended
-                        score_source = "memory_blended"
-                    elif ambiguous_objects and bool(getattr(self.args, "debug_verbose_logs", False)):
-                        self.get_logger().info(
-                            f"[memcrop] cand {j} skipped: ambiguous nearby tracks "
-                            f"{sorted(ambiguous_objects)}"
-                        )
 
             decision_scores = {
                 k: float(v)
@@ -2263,7 +1821,6 @@ class FoundationPoseTrackerNode(Node):
                     candidate=cand,
                     base_scores_by_object={k: float(v) for k, v in base_scores.items()},
                     score_source=score_source,
-                    track_id_hint=matched_tracks.get(top1_name, ""),
                     dino_class_score=decision_best_score,
                     dino_margin=margin,
                 )
@@ -3391,20 +2948,7 @@ class FoundationPoseTrackerNode(Node):
             )
     
             survivor_pcds = [m["pcd"] for m in survivors if m["pcd"] is not None]
-            use_weighted = bool(getattr(self.args, 'use_weighted_cloud_merge', False))
-    
-            if use_weighted and len(survivor_pcds) >= 2:
-                cam_positions = [
-                    self._resolve_T_base_cam(m["cam_id"])[:3, 3]
-                    for m in survivors if m["pcd"] is not None
-                ]
-                fused_cloud = merge_point_clouds_weighted(
-                    survivor_pcds, cam_positions,
-                    voxel_size=0.002,
-                    distance_exponent=float(getattr(self.args, 'cloud_merge_distance_exponent', 2.0)),
-                )
-            else:
-                fused_cloud = merge_point_clouds(survivor_pcds, voxel_size=0.0)
+            fused_cloud = merge_point_clouds(survivor_pcds, voxel_size=0.0)
 
             if fused_cloud is None or len(fused_cloud.points) < int(self.args.fused_gate_min_cloud_points):
                 decision["reason"] = f"fused_cloud_too_small({0 if fused_cloud is None else len(fused_cloud.points)})"
@@ -3903,39 +3447,6 @@ class FoundationPoseTrackerNode(Node):
                         except Exception:
                             pass
 
-                    # remember healthy tracker masks so the next
-                    # init (if it fires) can skip DINO for these objects.
-                    occ = float(getattr(rt_result, "occlusion_score", 0.0)) if rt_result is not None else 0.0
-                    self._recent_tracker_health[(cam_id, state.track_id)] = {
-                        "object_id": state.object_id,
-                        "frame_idx": self.frame_counter,
-                        "mask": current_mask.copy(),
-                        "occlusion_score": occ,
-                        "T_object_camera": T_local.copy(),
-                        "centroid_base": np.asarray(T_base[:3, 3], dtype=np.float64).copy(),
-                    }
-                    # Per-object appearance memory: stash a clean RGB crop
-                    # while ICP fitness is high so the next reinit can
-                    # disambiguate the instance from look-alikes.
-                    cr_view = cr.get("view")
-                    is_warmup_obj = bool(decision.get("is_warmup", False))
-                    if (
-                        not is_warmup_obj
-                        and cr_view is not None
-                        and getattr(cr_view, "rgb", None) is not None
-                    ):
-                        fused_metrics_for_save = self._fused_icp_metrics.get(track_id, {})
-                        fitness_for_save = float(fused_metrics_for_save.get("fitness", 0.0))
-                        self._maybe_save_memory_crop(
-                            object_id=state.object_id,
-                            track_id=track_id,
-                            cam_id=cam_id,
-                            rgb_full=cr_view.rgb,
-                            mask_full=current_mask,
-                            bbox_xyxy=cr.get("bbox_xyxy"),
-                            fitness=fitness_for_save,
-                        )
-
                     # recovery_mask seeds the next reinit's RealtimeTracker.
                     state.recovery_mask = current_mask
                 else:
@@ -4123,24 +3634,12 @@ class FoundationPoseTrackerNode(Node):
                     self.pub_debug_frame[cam_id].publish(frame)
                 continue
 
-            inherited: list[CandidateSelection] = []
-            remaining_masks = masks
-            if bool(getattr(self.args, "skip_dino_when_tracker_healthy", False)):
-                inherited, remaining_masks = self._inherit_from_tracker_health(
-                    cam_id=cam_id, masks=masks, depth=view.depth, K=view.K,
-                )
-                if inherited:
-                    _dprint(f"[TIMING] DINO-skip {cam_id}: inherited {len(inherited)} masks from tracker (skipped DINO)")
-
             t_dino = time.time()
             ranked = (
-                self._classify_masks_batched(
-                    view.rgb, remaining_masks,
-                    cam_id=cam_id, depth=view.depth, K=view.K,
-                )
-                if remaining_masks else []
+                self._classify_masks_batched(view.rgb, masks)
+                if masks else []
             )
-            selected = self._select_top_candidates(inherited + ranked, view.depth)
+            selected = self._select_top_candidates(ranked, view.depth)
             _dprint(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
             selections_by_cam[cam_id] = selected
 
@@ -4149,7 +3648,7 @@ class FoundationPoseTrackerNode(Node):
                     cam_id=cam_id, stamp=stamp,
                     update_sam=True, update_dino=True,
                     sam_candidates=self._sam_candidates_to_msgs(masks),
-                    dino_candidates=self._dino_ranked_to_msgs(inherited + ranked),
+                    dino_candidates=self._dino_ranked_to_msgs(ranked),
                     pose_items=[],
                 )
                 self.pub_debug_frame[cam_id].publish(frame)
@@ -4820,9 +4319,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda")
     p.add_argument("--dino-device", choices=["", "cpu", "cuda"], default="",
                    help="Device for DINOv2 image embeddings. Empty reuses --device.")
-    p.add_argument("--mask-source",
-                   choices=["sam", "projected", "gdino_sam"],
-                   default="gdino_sam")
     # Grounding DINO + SAM (MUSE-style) proposal stage
     p.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base")
     p.add_argument("--gdino-box-threshold", type=float, default=0.20)
@@ -4839,16 +4335,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
     p.add_argument(
         "--tracking-profile",
-        choices=["default", "fast_cutie"],
-        default="default",
+        choices=["fast_cutie"],
+        default=None,
         action=_TrackingProfileAction,
-        help="Named tracking profile. fast_cutie keeps Cutie in the hot loop with tuned tracking gates.",
-    )
-    p.add_argument(
-        "--fast-cutie",
-        action=_FastCutieAction,
-        default=False,
-        help="Shortcut for --tracking-profile fast_cutie.",
+        help="Use the fast Cutie tracking profile.",
     )
 
     # Object reference images, CAD meshes, and output folders.
@@ -4866,29 +4356,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dino-min-margin", type=float, default=0.05)
     p.add_argument("--area-penalty-weight", type=float, default=1.5)
     p.add_argument("--fill-ratio-weight", type=float, default=0.15)
-    # Per-object appearance memory: snapshot a clean RGB crop whenever the
-    # fused ICP fitness is good, then use those embeddings to stabilize reinit.
-
-    p.add_argument("--memory-crop-enable", action="store_true", default=True,
-                   help="Save high-fitness crops and use them at reinit.")
-    p.add_argument("--no-memory-crop", dest="memory_crop_enable",
-                   action="store_false",
-                   help="Disable the appearance memory bank.")
-    p.add_argument("--memory-crop-fitness-threshold", type=float, default=0.5,
-                   help="Minimum fused ICP fitness required to save a crop.")
-    p.add_argument("--memory-crop-min-frame-gap", type=int, default=15,
-                   help="Frames to wait between consecutive crop saves per object/cam.")
-    p.add_argument("--memory-crop-max-per-object", type=int, default=8,
-                   help="Ring-buffer capacity per object.")
-    p.add_argument("--memory-crop-weight", type=float, default=0.35,
-                   help="Blend weight for memory similarity vs raw DINO score at reinit. 0 disables re-ranking.")
-    p.add_argument("--memory-crop-min-score-floor", type=float, default=0.0,
-
-                   help="Skip memory re-ranking when raw DINO top1 < this (avoids boosting garbage).")
-    p.add_argument("--memory-crop-keep-rgb", action="store_true", default=False,
-                   help="Keep the raw RGB+mask alongside the embedding (debug only).")
-    p.add_argument("--memory-crop-save-dir", default="",
-                   help="If set, dump saved crops to this directory for inspection.")
 
     # SAM2 and dead-session recovery.
     p.add_argument("--sam-repo-root", default="external/sam2")
@@ -5053,10 +4520,6 @@ def parse_args() -> argparse.Namespace:
                    help="Low-pass the (slew-limited) rotation toward the previous pose by "
                         "this factor in [0,1] to smooth jitter. 0.0 = off.")
 
-    # Distance-weighted cloud merging (mitigates depth bias at distance)
-    p.add_argument("--use-weighted-cloud-merge", action="store_true")
-    p.add_argument("--cloud-merge-distance-exponent", type=float, default=2.0)
-
     # Warmup frames after init relax gates while Cutie/ICP settle.
     p.add_argument("--fused-track-warmup-frames", type=int, default=5)
 
@@ -5186,21 +4649,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--table-plane-z-max", type=float, default=0.9)
 
 
-    p.add_argument("--skip-dino-when-tracker-healthy", action="store_true")
-    p.add_argument("--tracker-health-iou-threshold", type=float, default=0.5)
-    p.add_argument("--tracker-health-stale-frames", type=int, default=5)
-    p.add_argument("--tracker-health-max-occlusion", type=float, default=0.4)
-    p.add_argument("--identity-shortcut-max-centroid-dist-m", type=float, default=0.05)
-    p.add_argument("--identity-shortcut-ambiguity-radius-m", type=float, default=0.05)
-    p.add_argument("--memory-rerank-require-track-consistency", action="store_true", default=True)
-    p.add_argument("--no-memory-rerank-require-track-consistency",
-                   dest="memory_rerank_require_track_consistency",
-                   action="store_false")
-
     p.add_argument("--icp-mask-close-kernel", type=int, default=0)
     p.add_argument("--icp-mask-interior-erosion", type=int, default=0)
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.run_mode == "track" and args.tracking_profile is None:
+        p.error("--tracking-profile fast_cutie is required for --run-mode track")
+    return args
 
 
 def main() -> None:
