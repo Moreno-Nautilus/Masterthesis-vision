@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -68,6 +68,7 @@ def _K_from_camerainfo(msg: CameraInfo) -> np.ndarray:
     return np.array(msg.k, dtype=float).reshape(3, 3)
 
 
+# Decode a color Image message to an OpenCV BGR array (handles padding + alpha + rgb/bgr).
 def _img_to_numpy_color(msg: Image) -> np.ndarray:
     h, w = int(msg.height), int(msg.width)
     enc = msg.encoding.lower()
@@ -100,6 +101,7 @@ def _img_to_numpy_color(msg: Image) -> np.ndarray:
     return img
 
 
+# Roll/pitch/yaw (degrees) → rotation matrix using the Rz·Ry·Rx convention.
 def _rpy_deg_to_R(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
     r = np.deg2rad(roll_deg)
     p = np.deg2rad(pitch_deg)
@@ -126,6 +128,7 @@ def _rpy_deg_to_R(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarr
     return Rz @ Ry @ Rx
 
 
+# Read the board's known pose in the robot base frame from YAML.
 def _load_T_base_board(path: Path) -> SE3:
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
@@ -139,6 +142,7 @@ def _load_T_base_board(path: Path) -> SE3:
     return SE3(R, t)
 
 
+# 3D coordinates of the checkerboard's inner corners in the board frame (z=0 plane).
 def _make_objp() -> np.ndarray:
     objp = np.zeros((CHESS_ROWS * CHESS_COLS, 3), dtype=np.float32)
     grid = np.mgrid[0:CHESS_COLS, 0:CHESS_ROWS].T.reshape(-1, 2).astype(np.float32)
@@ -153,6 +157,7 @@ def _compute_reproj_err_px(
     rvec: np.ndarray,
     tvec: np.ndarray,
 ) -> float:
+    # Mean pixel distance between the detected corners and the reprojected model corners.
     dist = np.zeros((8, 1), dtype=np.float64)
     proj, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
     proj = proj.reshape(-1, 2)
@@ -162,6 +167,7 @@ def _compute_reproj_err_px(
 
 
 def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarray, float]:
+    # Find chessboard corners, refine to sub-pixel, then solve the board→camera pose.
     pattern_size = (CHESS_COLS, CHESS_ROWS)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -173,6 +179,7 @@ def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarr
     term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-4)
     corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), term)
 
+    # PnP from the known 3D corners to the detected 2D corners.
     objp = _make_objp()
     dist = np.zeros((8, 1), dtype=np.float64)
 
@@ -215,18 +222,22 @@ def _rotvec_to_rotation_matrix(rvec: np.ndarray) -> np.ndarray:
     return R
 
 
+# Average a list of SE3 poses; also return the translation/rotation spread for QA.
 def _average_se3(poses: list[SE3]) -> Tuple[SE3, float, float]:
     if len(poses) == 0:
         raise ValueError("No poses to average")
 
+    # Translation: plain mean + spread.
     ts = np.stack([p.t for p in poses], axis=0)
     t_mean = ts.mean(axis=0)
     t_std = float(np.linalg.norm(ts.std(axis=0)))
 
+    # Rotation: mean in rotation-vector space, then back to a matrix.
     rvecs = np.stack([_rotation_matrix_to_rotvec(p.R) for p in poses], axis=0)
     rvec_mean = rvecs.mean(axis=0)
     R_mean = _rotvec_to_rotation_matrix(rvec_mean)
 
+    # Rotation spread = std of each sample's geodesic angle from the mean.
     ang_devs = []
     for p in poses:
         R_rel = R_mean.T @ p.R
@@ -286,6 +297,7 @@ class CamState:
             )
 
     def has_fresh_pair(self) -> bool:
+        # True when this camera has an image + intrinsics with close timestamps.
         if self.img_msg is None or self.K is None or self.img_t is None or self.info_t is None:
             return False
         return abs(self.img_t - self.info_t) <= RGB_INFO_MAX_DT_S
@@ -311,6 +323,7 @@ class CheckerboardBaseCalib(Node):
             expected_info_frame_id=EXPECTED_CAM3_INFO_FRAME_ID,
         )
 
+        # Subscribe each camera's RGB image and CameraInfo.
         self.create_subscription(Image, CAM1_RGB, self._on_img1, 10)
         self.create_subscription(Image, CAM2_RGB, self._on_img2, 10)
         self.create_subscription(Image, CAM3_RGB, self._on_img3, 10)
@@ -373,12 +386,14 @@ class CheckerboardBaseCalib(Node):
         if not self.ready():
             return None
 
+        # Per-camera RGB↔info must be fresh.
         dt_cam1 = abs(self.cam1.img_t - self.cam1.info_t)
         dt_cam2 = abs(self.cam2.img_t - self.cam2.info_t)
         dt_cam3 = abs(self.cam3.img_t - self.cam3.info_t)
         if dt_cam1 > RGB_INFO_MAX_DT_S or dt_cam2 > RGB_INFO_MAX_DT_S or dt_cam3 > RGB_INFO_MAX_DT_S:
             return None
 
+        # And the three cameras' images must share a timestamp window.
         min_t = min(self.cam1.img_t, self.cam2.img_t, self.cam3.img_t)
         max_t = max(self.cam1.img_t, self.cam2.img_t, self.cam3.img_t)
         cross_dt = max_t - min_t
@@ -452,6 +467,7 @@ def main() -> None:
     debug_dir = Path(DEBUG_DIR)
     debug_dir.mkdir(parents=True, exist_ok=True)
 
+    # The board's known pose in the base frame anchors every camera solve.
     T_base_board = _load_T_base_board(Path(BASE_BOARD_YAML))
     print("Loaded T_base_board:")
     print(T_base_board)
@@ -469,6 +485,7 @@ def main() -> None:
     t_last_reject_print = 0.0
     last_accept_t = -1e9
 
+    # Collect NUM_SAMPLES good synced triples, solving the board pose in each.
     while len(accepted) < NUM_SAMPLES:
         rclpy.spin_once(node, timeout_sec=0.05)
 
@@ -485,11 +502,13 @@ def main() -> None:
         if triple is None:
             continue
 
+        # Space out samples so we don't average near-identical frames.
         if now - last_accept_t < INTER_SAMPLE_MIN_DT_S:
             continue
 
         img1, img2, img3, K1, K2, K3, dt1, dt2, dt3 = triple
 
+        # Solve the board pose per camera; any failed detection rejects the whole triple.
         try:
             T_cam1_board, corners1, reproj1 = _solve_board_pose(img1, K1)
         except RuntimeError as e:
@@ -514,6 +533,7 @@ def main() -> None:
                 t_last_reject_print = now
             continue
 
+        # Reject the triple if any camera's reprojection error is too high.
         if (
             reproj1 > MAX_REPROJ_ERR_PX
             or reproj2 > MAX_REPROJ_ERR_PX
@@ -526,6 +546,7 @@ def main() -> None:
             )
             continue
 
+        # T_base_cam = T_base_board · (T_cam_board)⁻¹ for each camera.
         T_base_cam1 = T_base_board @ T_cam1_board.inverse()
         T_base_cam2 = T_base_board @ T_cam2_board.inverse()
         T_base_cam3 = T_base_board @ T_cam3_board.inverse()
@@ -557,6 +578,7 @@ def main() -> None:
             f"reproj: cam1={reproj1:.3f}px cam2={reproj2:.3f}px cam3={reproj3:.3f}px"
         )
 
+        # Save annotated corner images for visual inspection.
         vis1 = _draw_chessboard(img1, corners1, f"{CAM1} sample {len(accepted)} reproj={reproj1:.3f}px")
         vis2 = _draw_chessboard(img2, corners2, f"{CAM2} sample {len(accepted)} reproj={reproj2:.3f}px")
         vis3 = _draw_chessboard(img3, corners3, f"{CAM3} sample {len(accepted)} reproj={reproj3:.3f}px")
@@ -567,6 +589,7 @@ def main() -> None:
     if len(accepted) < MIN_SAMPLES_TO_SOLVE:
         raise RuntimeError(f"Not enough accepted samples: {len(accepted)} < {MIN_SAMPLES_TO_SOLVE}")
 
+    # Average each camera's extrinsic across all accepted samples.
     base_cam1_poses = [s.T_base_cam1 for s in accepted]
     base_cam2_poses = [s.T_base_cam2 for s in accepted]
     base_cam3_poses = [s.T_base_cam3 for s in accepted]
@@ -579,6 +602,7 @@ def main() -> None:
     reproj2_mean = float(np.mean([s.reproj2_px for s in accepted]))
     reproj3_mean = float(np.mean([s.reproj3_px for s in accepted]))
 
+    # Relative camera transforms — a sanity check on inter-camera consistency.
     T_cam1_cam2_check = T_base_cam1_avg.inverse() @ T_base_cam2_avg
     T_cam1_cam3_check = T_base_cam1_avg.inverse() @ T_base_cam3_avg
 
@@ -609,6 +633,7 @@ def main() -> None:
     print(T_cam1_cam3_check)
     print("R det:", np.linalg.det(T_cam1_cam3_check.R), "valid:", T_cam1_cam3_check.is_valid())
 
+    # Refuse to write a result whose sample spread is too loose to trust.
     if (
         tstd1 > MAX_FINAL_TRANSLATION_STD_M
         or tstd2 > MAX_FINAL_TRANSLATION_STD_M
@@ -635,6 +660,7 @@ def main() -> None:
         CAM3: T_base_cam3_avg,
     }
 
+    # Back up any existing extrinsics before overwriting.
     out_path = Path(OUT_YAML)
     if out_path.exists():
         backup = out_path.with_suffix(".yaml.bak")

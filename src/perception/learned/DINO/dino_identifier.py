@@ -64,6 +64,7 @@ class DINOIdentifier:
         self.reference_object_ids: list[str] = []
 
     def _build_model(self) -> torch.nn.Module:
+        # Pull the requested DINOv2 backbone from torch.hub onto the device.
         model = torch.hub.load("facebookresearch/dinov2", self.cfg.model_name)
         model = model.to(self.device)
         model.eval()
@@ -71,11 +72,13 @@ class DINOIdentifier:
 
     @staticmethod
     def _ensure_rgb(img: np.ndarray) -> np.ndarray:
+        # Validate an (H,W,3) uint8 RGB image.
         if img.ndim != 3 or img.shape[2] != 3:
             raise ValueError(f"Expected (H, W, 3) RGB image, got {img.shape}")
         return np.ascontiguousarray(img.astype(np.uint8))
 
     def _apply_mask(self, rgb: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+        # Black out the background outside the mask (when enabled).
         if mask is None or not self.cfg.use_masked_background:
             return rgb
 
@@ -87,6 +90,7 @@ class DINOIdentifier:
         return out
 
     def _center_crop_square(self, rgb: np.ndarray) -> np.ndarray:
+        # Crop the largest centered square so the resize keeps aspect ratio.
         h, w = rgb.shape[:2]
         s = min(h, w)
         y0 = (h - s) // 2
@@ -94,6 +98,7 @@ class DINOIdentifier:
         return rgb[y0:y0 + s, x0:x0 + s]
 
     def _preprocess(self, rgb: np.ndarray) -> torch.Tensor:
+        # Square-crop, resize to the model input size, ImageNet-normalize → CHW tensor.
         rgb = self._center_crop_square(rgb)
         rgb = cv2.resize(rgb, (self.cfg.input_size, self.cfg.input_size), interpolation=cv2.INTER_AREA)
 
@@ -118,6 +123,7 @@ class DINOIdentifier:
 
         x = self._preprocess(rgb)
 
+        # One backbone forward giving both CLS and patch tokens.
         with torch.inference_mode():
             feats = self.model.forward_features(x)
         if not isinstance(feats, dict):
@@ -125,10 +131,12 @@ class DINOIdentifier:
                 f"forward_features returned {type(feats)}; expected dict for patch tokens"
             )
 
+        # Two streams: the global CLS token and the GeM-pooled patch tokens.
         cls_tok = feats["x_norm_clstoken"].reshape(1, -1)
         patch_toks = feats["x_norm_patchtokens"]  # (1, N, D)
         gem = self._gem_pool(patch_toks, p=float(self.cfg.gem_p)).reshape(1, -1)
 
+        # L2-normalize each stream and stack into the (2, D) MUSE embedding.
         cls_n = F.normalize(cls_tok, dim=1).squeeze(0)
         gem_n = F.normalize(gem, dim=1).squeeze(0)
         out = torch.stack([cls_n, gem_n], dim=0)  # (2, D)
@@ -139,6 +147,7 @@ class DINOIdentifier:
         cache_path: str | None = None,
         extra_dirs: list[str] | None = None,
     ) -> None:
+        # Collect the primary reference dir plus any extra render dirs.
         roots = [Path(self.cfg.reference_dir)]
         if extra_dirs:
             roots.extend(Path(d) for d in extra_dirs if d)
@@ -153,7 +162,8 @@ class DINOIdentifier:
 
         primary_root = roots[0]
 
-        # Default cache path next to primary reference dir. 
+        # Default cache path next to primary reference dir.
+        # Tag encodes everything that changes the embeddings, so stale caches miss.
         if cache_path is None:
             roots_tag = "_".join(sorted(r.name for r in roots))
             # gem_p affects patch-pool output; size affects raw token grid.
@@ -166,7 +176,7 @@ class DINOIdentifier:
             )
             cache_path = str(primary_root / f"_embedding_cache__{tag}.npz")
 
-        # Try to load from cache
+        # Try to load from cache (only reused if folder listing + shape still match).
         if Path(cache_path).exists():
             try:
                 cached = np.load(cache_path, allow_pickle=True)
@@ -188,6 +198,7 @@ class DINOIdentifier:
                             if img_path.suffix.lower() in self.cfg.allowed_exts:
                                 current_paths.append(str(img_path))
 
+                # Cache valid → rebuild the bank straight from the saved embeddings.
                 if cached_paths == current_paths and cache_shape_ok:
                     # Cache is valid, use it
                     bank = []
@@ -219,6 +230,7 @@ class DINOIdentifier:
         # Build from scratch (iterate across all reference roots).
         bank: list[ReferenceEmbedding] = []
 
+        # One subfolder per object_id; embed every image inside it.
         for r in roots:
           for object_dir in sorted(p for p in r.iterdir() if p.is_dir()):
             object_id = object_dir.name
@@ -245,11 +257,12 @@ class DINOIdentifier:
                 f"No valid reference images found under: {[str(r) for r in roots]}"
             )
 
+        # Stack all embeddings into one matrix for fast similarity queries.
         self.reference_bank = bank
         self.reference_matrix = np.stack([r.embedding for r in bank], axis=0)
         self.reference_object_ids = [r.object_id for r in bank]
 
-        # Save cache
+        # Save cache for next startup.
         try:
             np.savez(
                 cache_path,
@@ -264,11 +277,10 @@ class DINOIdentifier:
                 print(f"[DINO] Failed to save cache: {e}")
 
 
-
-
     @staticmethod
     def _pairwise_tanimoto(query: np.ndarray, bank: np.ndarray) -> np.ndarray:
         """Compute (N,) Tanimoto similarity row between query (1, D) and bank."""
+        # Tanimoto: <q,r> / (||q||² + ||r||² − <q,r>).
         qr = (query @ bank.T).reshape(-1)
         qq = float(np.sum(query * query))
         rr = np.sum(bank * bank, axis=1)
@@ -280,9 +292,11 @@ class DINOIdentifier:
         sims: np.ndarray,
         top_k: int = 3,
     ) -> dict[str, float]:
+        # Group the per-reference similarities by object id.
         scores_by_object: dict[str, list[float]] = {}
         for sim, obj_id in zip(sims, self.reference_object_ids):
             scores_by_object.setdefault(obj_id, []).append(float(sim))
+        # Each class score = mean of its top-k best-matching references.
         agg: dict[str, float] = {}
         for obj_id, vals in scores_by_object.items():
             vals_sorted = sorted(vals, reverse=True)
@@ -311,6 +325,7 @@ class DINOIdentifier:
                 "reference bank shape (N, 2, D)."
             )
 
+        # Split the query/bank into their CLS and patch streams.
         # Compute S_cls and S_patch independently and blend (MUSE Eq.4).
         q_cls = embedding[0:1, :]
         q_patch = embedding[1:2, :]
@@ -329,9 +344,11 @@ class DINOIdentifier:
         # (memory bank, debug viz). Use the CLS row.
         embedding_out = embedding[0]
 
+        # Per-class similarity (top-k mean per object).
         agg = self._aggregate_per_class(sims, top_k=3)
 
         # ── MUSE Eq.5/Eq.6: joint absolute + relative score ────────────────
+        # Blend the raw score with a softmax "relative" score across classes.
         beta = MUSE_JOINT_SCORE_ALPHA  # paper "beta"
         if beta > 0.0 and len(agg) >= 2:
             tau = max(1e-6, MUSE_TAU)
@@ -347,6 +364,7 @@ class DINOIdentifier:
             agg_for_decision = dict(agg)
 
         # ── MUSE Eq.8/Eq.10: per-proposal objectness prior ─────────────────
+        # Down-weight classes by the GDINO objectness (scalar) or a per-class dict.
         if isinstance(objectness_prior, (int, float)):
             gamma = MUSE_OBJECTNESS_PRIOR_GAMMA
             if gamma > 0.0:
@@ -361,6 +379,7 @@ class DINOIdentifier:
                 for k, v in agg_for_decision.items()
             }
 
+        # Winner = highest final score; return it plus the full per-class map.
         best_obj = max(agg_for_decision, key=agg_for_decision.get)
         best_score = agg_for_decision[best_obj]
 

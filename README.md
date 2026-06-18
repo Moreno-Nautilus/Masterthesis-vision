@@ -5,7 +5,7 @@ Three calibrated ZED 2i cameras feed a learned perception stack —
 **Grounding-DINO → SAM2 → DINOv2 → cross-camera fusion → FoundationPose → ICP** —
 that publishes a canonical pose per object in the **robot base frame**.
 
-> **For a micro-step-by-micro-step description of how the pipeline actually runs,
+> **For a step-by-step description of how the pipeline actually runs,
 > read [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).** This README
 > covers setup, how to launch things, and what each piece of code does; the
 > walkthrough explains the algorithm itself.
@@ -16,7 +16,7 @@ that publishes a canonical pose per object in the **robot base frame**.
 
 | Path | What it is |
 |------|------------|
-| [scripts/](scripts/) | Launch scripts (host stack, pipeline, supervised pipeline) — see §3 |
+| [scripts/](scripts/) | Launch scripts (host stack and pipeline) — see §3 |
 | [src/perception/ros/learn_runners/run_pipeline_track_multicam.py](src/perception/ros/learn_runners/run_pipeline_track_multicam.py) | **Main pipeline node.** Grabs synced views, runs the full detect→fuse→pose loop, publishes base-frame poses. This is what the launch files start. |
 | [src/perception/ros/learn_runners/visualize_pipeline.py](src/perception/ros/learn_runners/visualize_pipeline.py) | Standalone RViz/Foxglove visualizer node — subscribes to the pipeline's debug topics and draws SAM/DINO/pose overlays per camera. |
 | [src/perception/ros/multicam_grabber.py](src/perception/ros/multicam_grabber.py) | ROS subscriptions; returns time-synchronized `View`s (rgb + depth + `K`) per camera. |
@@ -27,9 +27,9 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/perception/learned/SAM/sam_segmentation.py](src/perception/learned/SAM/sam_segmentation.py) | SAM2 wrapper — segments the GDINO boxes into masks, with bf16/fp32 collapse recovery. |
 | [src/perception/learned/DINO/dino_identifier.py](src/perception/learned/DINO/dino_identifier.py) | DINOv2 MUSE identifier — embeds crops and classifies them against the reference bank. |
 | [src/perception/learned/FP/pose_foundation.py](src/perception/learned/FP/pose_foundation.py) | FoundationPose wrapper (one estimator, one nvdiffrast CUDA context, GPU worker thread). |
-| [src/perception/tracking/realtime_tracker.py](src/perception/tracking/realtime_tracker.py) | Real-time tracker state machine (Cutie mask tracking + ICP pose refinement) used in `track` mode. |
+| [src/perception/tracking/realtime_tracker.py](src/perception/tracking/realtime_tracker.py) | Per-object tracker state (pose + ICP refinement) used in `track` mode. In the multicam loop the runner drives one shared Cutie session per camera and feeds each object's mask into its own `RealtimeTracker`; the canonical pose comes from the fused multi-camera ICP. |
 | [src/perception/tracking/cutie_tracker.py](src/perception/tracking/cutie_tracker.py) | Cutie (video object segmentation) wrapper. |
-| [src/perception/tracking/icp_refiner.py](src/perception/tracking/icp_refiner.py) | ICP refinement in the base frame + symmetry rotation grid. |
+| [src/perception/tracking/icp_refiner.py](src/perception/tracking/icp_refiner.py) | Generic ICP refiner used by `RealtimeTracker`; the fused base-frame ICP and rotation grid live in the multicam runner/helpers. |
 | [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **3-camera extrinsic calibration** (checkerboard → base frame) — see §4. |
 | [src/calibration/io_extrinsics.py](src/calibration/io_extrinsics.py) | Load/save extrinsics YAML (`R` row-major + `t`) ↔ `SE3`. |
 | [src/utils/se3.py](src/utils/se3.py) | Minimal immutable `SE3` rigid-transform type. |
@@ -72,7 +72,7 @@ or the reference images. Create it with this layout before running anything:
 
 ```
 Data/
-├── CAD_Models/              # raw object meshes (.obj)
+├── CAD_Models/              # raw object meshes (.obj or .stl)
 ├── CAD_Models_centered/     # origin-centered meshes — USED BY THE PIPELINE (--cad-dir)
 ├── ZED_screens/             # REAL reference crops, one folder per object (--reference-dir)
 │   ├── pb_screw/  *.png
@@ -83,9 +83,10 @@ Data/
     └── <object_id>/ *.png
 ```
 
-- **`CAD_Models_centered/<object_id>.obj`** — the mesh FoundationPose registers
-  against. The default `--cad-dir` points here; the `object_id` is the filename
-  stem. Meshes are assumed to be in centimeters (`--mesh-scale 0.01`).
+- **`CAD_Models_centered/<object_id>.obj` or `<object_id>.stl`** — the mesh
+  FoundationPose registers against. The default `--cad-dir` points here; the
+  `object_id` is the filename stem. Meshes are assumed to be in centimeters
+  (`--mesh-scale 0.01`).
 - **`ZED_screens/<object_id>/`** — the **DINO reference bank**: a handful of
   cropped photos of each object. DINOv2 embeds these once at startup and every
   candidate crop is classified against them. This is the default reference source
@@ -95,7 +96,7 @@ Data/
   [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py).
   Used when `--reference-source renders` or `both`.
 
-The folder names under `ZED_screens/` / `reference_renders/` and the `.obj`
+The folder names under `ZED_screens/` / `reference_renders/` and the mesh
 filenames must use the **same `object_id`** so labels line up across detection
 and pose.
 
@@ -142,22 +143,11 @@ light damping preset for better settled screw-axis estimates. The exact pinned
 flags are listed in the launch file and the init-only baseline is explained in
 [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).
 
-### 3.3 Supervised run ([scripts/run_pipeline_supervised.sh](scripts/run_pipeline_supervised.sh))
-
-Wraps the runner and relaunches it **only** on exit code 42 (the rare
-"bad SAM session" that produces zero masks for the whole process and is only
-cured by a restart). Real crashes / Ctrl-C / clean exits are not looped.
-
-```bash
-LOG=outputs/logs/run.log MAX_RESTARTS=10 \
-  scripts/run_pipeline_supervised.sh --num-cameras 3 --mask-source gdino_sam ...
-```
-
 ### Output
 
 Per detected object the pipeline publishes a base-frame `PoseStamped` on
-`/perception/fp/pose_base/fused/<track_id>`, writes CSV rows
-(`init_pose_log.csv`, `outputs/logs/...csv`), and saves a render under
+`/perception/fp/pose_base/fused/<track_id>`; with logging flags, it writes CSV
+rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
 `init_renders/`.
 
 ---
@@ -211,7 +201,14 @@ consistency before trusting the result.
 ## 5. How the pipeline works
 
 See **[docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md)** for the full
-per-tick breakdown: model loading, GDINO proposal, SAM segmentation, DINO
-classification + candidate selection, cross-camera fusion, per-object
-FoundationPose + ICP (incl. the conditional symmetry rotation grid and the
-polishing ICP), and how `init_only` vs `track` mode differ.
+per-tick breakdown, in two halves:
+
+- **Init** (Stages 0–4) — model loading, GDINO proposal, SAM segmentation, DINO
+  classification + candidate selection, cross-camera fusion, per-object
+  FoundationPose + ICP (incl. the conditional symmetry rotation grid and the
+  polishing ICP).
+- **Tracking** (Stage 5) — once objects are initialized, `track` mode drops the
+  learned front-end and runs the cheap Cutie-mask → masked-depth → fused-ICP loop
+  with its accept/hold/lost gates; this section also covers the `fast-track` vs
+  `accurate-track` presets and the optional rotation fixes (rot-reseed, PCA
+  shaft-axis, rotation damping).

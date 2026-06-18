@@ -19,10 +19,12 @@ def mesh_to_pcd_cached(
     num_points: int = 5000,
 ) -> o3d.geometry.PointCloud:
     """Load mesh, sample surface points, cache result."""
+    # Cache keyed on (path, scale, point count) — sampling is the expensive part.
     key = f"{mesh_path}_{mesh_scale}_{num_points}"
     if key in _MESH_PCD_CACHE:
         return _MESH_PCD_CACHE[key]
 
+    # Sample a surface point cloud and scale it to meters.
     mesh = trimesh.load(mesh_path, force="mesh")
     pts, _ = trimesh.sample.sample_surface(mesh, num_points)
     pts = pts.astype(np.float64) * mesh_scale
@@ -46,6 +48,7 @@ def fill_depth_holes_in_mask(
     """
     import cv2
 
+    # Holes = zero/non-finite depth inside the mask; nothing to do if there are none.
     mask_b = np.asarray(mask).astype(bool)
     d = np.asarray(depth, dtype=np.float32)
     bad = ((~np.isfinite(d)) | (d <= 0.0)) & mask_b
@@ -56,12 +59,14 @@ def fill_depth_holes_in_mask(
     d_clean = np.where(np.isfinite(d) & (d > 0), d, 0.0)
     d_mm = np.clip(d_clean * 1000.0, 0.0, 65535.0).astype(np.uint16)
 
+    # Odd kernel in [3,5], median-blur, back to meters.
     k = max(3, min(int(kernel), 5))
     if k % 2 == 0:
         k += 1
     d_blurred_mm = cv2.medianBlur(d_mm, k)
     d_blurred = d_blurred_mm.astype(np.float32) / 1000.0
 
+    # Only overwrite the hole pixels; leave valid depth untouched.
     out = d.copy()
     out[bad] = d_blurred[bad]
     return out
@@ -88,6 +93,7 @@ def lift_masked_depth_to_base(
     if mask_bool.sum() < 10:
         return None
 
+    # Optional mask cleanup: close holes / erode the border inward.
     if mask_morph_close_kernel > 0 or mask_interior_erosion > 0:
         import cv2
         m_u8 = mask_bool.astype(np.uint8)
@@ -107,6 +113,7 @@ def lift_masked_depth_to_base(
         if mask_bool.sum() < 10:
             return None
 
+    # Keep only masked pixels whose depth is finite and within range.
     ys, xs = np.where(mask_bool)
     zs = depth[ys, xs].astype(np.float64)
 
@@ -118,6 +125,7 @@ def lift_masked_depth_to_base(
     ys = ys[valid].astype(np.float64)
     zs = zs[valid]
 
+    # Pinhole un-projection to camera-frame 3D points.
     fx = float(K[0, 0])
     fy = float(K[1, 1])
     cx = float(K[0, 2])
@@ -129,12 +137,14 @@ def lift_masked_depth_to_base(
         zs,
     ], axis=1)  # (N, 3) in camera frame
 
+    # Transform into the base frame via the camera extrinsic.
     T = np.asarray(T_base_cam, dtype=np.float64).reshape(4, 4)
     pts_base = (T[:3, :3] @ pts_cam.T).T + T[:3, 3]
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts_base)
 
+    # Voxel-downsample for a consistent density.
     if voxel_size > 0 and len(pcd.points) > 100:
         pcd = pcd.voxel_down_sample(voxel_size)
 
@@ -148,6 +158,7 @@ def merge_point_clouds(
     """Merge multiple point clouds and voxel-downsample (unweighted, original behavior)."""
     if not clouds:
         return None
+    # Concatenate all clouds, then optionally voxel-downsample.
     merged = o3d.geometry.PointCloud()
     for pcd in clouds:
         merged += pcd
@@ -174,6 +185,7 @@ def merge_point_clouds_weighted(
     all_points = []
     all_weights = []
 
+    # Weight each point by inverse distance to its camera (closer depth = more trusted).
     for pcd, cam_pos in zip(clouds, cam_positions_base):
         pts = np.asarray(pcd.points)
         if len(pts) == 0:
@@ -195,6 +207,7 @@ def merge_point_clouds_weighted(
     if len(all_points_arr) < 10:
         return None
 
+    # Weighted voxel merge: accumulate weighted points per voxel, then divide.
     if voxel_size > 0:
         voxel_indices = np.floor(all_points_arr / voxel_size).astype(np.int64)
 
@@ -243,6 +256,7 @@ def run_icp_in_base_frame(
     """
     T_init = np.asarray(T_base_object_init, dtype=np.float64).reshape(4, 4)
 
+    # Pick the cost function; point-to-plane needs scene normals.
     if variant == "point_to_plane":
         if not scene_pcd.has_normals() and len(scene_pcd.points) >= 10:
             scene_pcd.estimate_normals(
@@ -254,6 +268,7 @@ def run_icp_in_base_frame(
     else:
         raise ValueError(f"Unknown ICP variant: {variant!r} (expected point_to_point or point_to_plane)")
 
+    # Register model→scene from the init pose; returns the refined transform + metrics.
     result = o3d.pipelines.registration.registration_icp(
         source=model_pcd,
         target=scene_pcd,
@@ -280,6 +295,7 @@ def evaluate_icp_in_base_frame(
     """Return (fitness, inlier_rmse) for the given transform without running
     ICP iterations.
     """
+    # Score a fixed transform's fit (no iterations) — fitness + inlier RMSE.
     T = np.asarray(T_base_object, dtype=np.float64).reshape(4, 4)
     result = o3d.pipelines.registration.evaluate_registration(
         source=model_pcd,
@@ -301,6 +317,7 @@ def chamfer_distance_one_way(
     Compute mean nearest-neighbor distance from transformed model to scene.
     Lower = better alignment.
     """
+    # Transform the model by the pose, then average nearest-neighbour distance to the scene.
     T = np.asarray(T_base_object, dtype=np.float64).reshape(4, 4)
     model_pts = np.asarray(model_pcd.points)
     transformed = (T[:3, :3] @ model_pts.T).T + T[:3, 3]
@@ -339,6 +356,7 @@ class MedianPoseBuffer:
         if len(self._buffer) == 1:
             return self._buffer[0].copy()
 
+        # Component-wise median translation.
         translations = np.array([T[:3, 3] for T in self._buffer])
         median_t = np.median(translations, axis=0)
 
@@ -365,6 +383,7 @@ class MedianPoseBuffer:
 
 def rotation_matrix_to_quaternion_wxyz(R: np.ndarray) -> np.ndarray:
     """Convert 3x3 rotation to quaternion [w, x, y, z]."""
+    # Standard branchy R→quaternion (pick the largest diagonal term for stability).
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
     trace = np.trace(R)
     if trace > 0.0:
@@ -412,6 +431,7 @@ def slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
     q0 = q0 / (np.linalg.norm(q0) + 1e-12)
     q1 = q1 / (np.linalg.norm(q1) + 1e-12)
 
+    # Take the shorter arc.
     dot = np.dot(q0, q1)
     if dot < 0:
         q1 = -q1
@@ -419,10 +439,12 @@ def slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
 
     dot = min(dot, 1.0)
 
+    # Near-parallel: fall back to (normalized) linear interpolation.
     if dot > 0.9995:
         result = q0 + t * (q1 - q0)
         return result / (np.linalg.norm(result) + 1e-12)
 
+    # Otherwise interpolate along the great-circle arc.
     theta_0 = np.arccos(dot)
     theta = theta_0 * t
     sin_theta = np.sin(theta)
@@ -447,13 +469,16 @@ def weighted_average_poses(
     if len(poses) == 1:
         return poses[0].copy()
 
+    # Normalize the weights.
     w = np.array(weights, dtype=np.float64)
     w = w / (w.sum() + 1e-12)
 
+    # Translation = weighted mean.
     avg_t = np.zeros(3, dtype=np.float64)
     for T, wi in zip(poses, w):
         avg_t += wi * T[:3, 3].astype(np.float64)
 
+    # Rotation: SLERP for two poses, else just take the highest-weighted one.
     if len(poses) == 2:
         q0 = rotation_matrix_to_quaternion_wxyz(poses[0][:3, :3])
         q1 = rotation_matrix_to_quaternion_wxyz(poses[1][:3, :3])

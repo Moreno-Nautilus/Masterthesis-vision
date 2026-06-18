@@ -15,7 +15,7 @@ class FoundationPoseConfig:
     weights_dir: str = "external/FoundationPose/weights"
     debug_dir: str = "outputs/foundationpose/fp_internal_debug"
     debug: int = 0
-    mesh_scale: float = 0.01  # STL is in mm, convert to meters
+    mesh_scale: float = 0.01  # OBJ is in mm, convert to meters
 
 
 @dataclass
@@ -38,6 +38,7 @@ class FoundationPoseWrapper:
         self.debug_dir = Path(self.cfg.debug_dir).resolve()
         self.debug_dir.mkdir(parents=True, exist_ok=True)
 
+        # Nothing is imported or built until first use (lazy).
         self._imports_ready = False
 
         self._trimesh = None
@@ -51,12 +52,13 @@ class FoundationPoseWrapper:
         self._glctx = None
         self._scorer = None
 
-
+        # All GPU work runs on one dedicated thread so the CUDA/nvdiffrast context is single-owner.
         self._gpu_exec = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="fp-gpu"
         )
 
     def _ensure_repo_on_path(self) -> None:
+        # Put the FoundationPose repo on sys.path so its modules import.
         if not self.repo_root.exists():
             raise FileNotFoundError(f"FoundationPose repo_root does not exist: {self.repo_root}")
 
@@ -65,6 +67,7 @@ class FoundationPoseWrapper:
             sys.path.insert(0, repo_root_str)
 
     def _prepare_env(self) -> None:
+        # Point FoundationPose at the weights dir via the env vars it reads.
         if not self.weights_dir.exists():
             raise FileNotFoundError(f"FoundationPose weights_dir does not exist: {self.weights_dir}")
 
@@ -72,6 +75,7 @@ class FoundationPoseWrapper:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", os.environ.get("TORCH_CUDA_ARCH_LIST", ""))
 
     def _lazy_imports(self) -> None:
+        # Import the heavy FoundationPose / nvdiffrast deps exactly once.
         if self._imports_ready:
             return
 
@@ -93,12 +97,13 @@ class FoundationPoseWrapper:
         """Build the estimator once so first init is faster."""
         if object_id is None:
             object_id = Path(mesh_path).stem
-        
+
         mesh_file = Path(mesh_path)
         if not mesh_file.exists():
             print(f"[FoundationPose] Failed to pre-cache {object_id}: Mesh file does not exist: {mesh_path}")
             return
-        
+
+        # Build the estimator on the GPU thread and wait for it.
         try:
             self._gpu_exec.submit(
                 self._build_estimator, object_id=object_id, mesh_path=mesh_path
@@ -109,6 +114,7 @@ class FoundationPoseWrapper:
 
     @staticmethod
     def _sanitize_rgb(rgb: np.ndarray) -> np.ndarray:
+        # Force a contiguous (H,W,3) uint8 image.
         rgb = np.asarray(rgb)
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"Expected rgb shape (H, W, 3), got {rgb.shape}")
@@ -118,6 +124,7 @@ class FoundationPoseWrapper:
 
     @staticmethod
     def _sanitize_depth(depth: np.ndarray) -> np.ndarray:
+        # Single-channel float32 depth with NaNs/negatives zeroed out.
         depth = np.asarray(depth, dtype=np.float32)
         if depth.ndim == 3:
             depth = depth[..., 0]
@@ -128,6 +135,7 @@ class FoundationPoseWrapper:
 
     @staticmethod
     def _sanitize_K(K: np.ndarray) -> np.ndarray:
+        # Validate the 3x3 intrinsics matrix.
         K = np.asarray(K, dtype=np.float32)
         if K.shape != (3, 3):
             raise ValueError(f"Expected K shape (3, 3), got {K.shape}")
@@ -135,6 +143,7 @@ class FoundationPoseWrapper:
 
     @staticmethod
     def _sanitize_mask(mask: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
+        # Boolean mask matching the image size; reject empty masks.
         mask = np.asarray(mask).astype(bool)
         if mask.shape != hw:
             raise ValueError(f"Mask shape {mask.shape} does not match image shape {hw}")
@@ -149,9 +158,11 @@ class FoundationPoseWrapper:
         if not Path(mesh_path).exists():
             raise FileNotFoundError(f"Mesh file does not exist: {mesh_path}")
 
+        # Already built for this mesh → reuse it.
         if self._est is not None and self._mesh_path_loaded == mesh_path:
             return
 
+        # Load, center, and scale the mesh to meters.
         mesh = self._trimesh.load(mesh_path)
         mesh.vertices -= mesh.centroid
 
@@ -166,6 +177,7 @@ class FoundationPoseWrapper:
         model_pts = np.asarray(mesh.vertices, dtype=np.float32)
         model_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
 
+        # First object → build estimator + CUDA raster context; later objects just swap the mesh in.
         if self._est is None:
             scorer = self._ScorePredictor()
             if hasattr(scorer, "model") and scorer.model is not None:
@@ -206,6 +218,7 @@ class FoundationPoseWrapper:
         mask: np.ndarray,
     ) -> FoundationPoseResult:
     
+        # Validate/normalize all inputs, then run registration on the GPU thread and block for the result.
         rgb = self._sanitize_rgb(rgb)
         depth = self._sanitize_depth(depth).astype(np.float32)
         K = self._sanitize_K(K).astype(np.float32)
@@ -232,6 +245,7 @@ class FoundationPoseWrapper:
         mask: np.ndarray,
     ) -> FoundationPoseResult:
         """Runs ONLY on self._gpu_exec's single worker thread """
+        # Make sure the estimator is built/swapped to this object's mesh.
         try:
             self._build_estimator(object_id=object_id, mesh_path=mesh_path)
         except Exception as e:
@@ -240,6 +254,7 @@ class FoundationPoseWrapper:
                 f"(mesh={mesh_path}): {e}"
             ) from None
 
+        # Single-shot pose registration (iteration=0, no refinement loop).
         try:
             if hasattr(self._scorer, "model") and self._scorer.model is not None:
                 self._scorer.model = self._scorer.model.float().cuda().eval()
@@ -261,6 +276,7 @@ class FoundationPoseWrapper:
                 f"FoundationPose register() returned None for {object_id} "
                 f"(mask_area={int(mask.sum())})"
             )
+        # Return the 4x4 object→camera pose plus bookkeeping.
         pose = np.asarray(pose, dtype=np.float32).reshape(4, 4)
 
         return FoundationPoseResult(

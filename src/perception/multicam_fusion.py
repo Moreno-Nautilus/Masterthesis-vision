@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
-from typing import Optional
 
-import cv2
 import numpy as np
-import open3d as o3d
 
 
 # Data structures
@@ -33,11 +29,8 @@ class PerCamDetection:
 class FusedDetection:
     """Result of matching + fusing one object across cameras."""
     object_id: str
-    detections: list[PerCamDetection]  # 1 or 2 cams
-    fused_cloud_base: np.ndarray       # (N, 3) in base frame, voxel-downsampled
+    detections: list[PerCamDetection]
     ref_cam_idx: int                   # index into detections for reference camera
-    fused_depth: np.ndarray | None = None  # (H, W) rendered into ref cam
-    fused_mask: np.ndarray | None = None   # (H, W) bool, reprojected mask
 
 
 # Back-projection: masked depth → 3D points in base frame
@@ -54,6 +47,7 @@ def backproject_masked_depth(
 
     Returns (N, 3) float32 array. May be empty if no valid depth.
     """
+    # Masked pixel coordinates and their depths.
     mask_bool = mask.astype(bool)
     vs, us = np.where(mask_bool)
     if len(vs) == 0:
@@ -70,7 +64,7 @@ def backproject_masked_depth(
     us = us[valid].astype(np.float32)
     d = d[valid]
 
-    # Unproject to camera frame
+    # Unproject to camera frame (pinhole model)
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
 
@@ -80,7 +74,7 @@ def backproject_masked_depth(
 
     pts_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)  # (N, 3)
 
-    # Transform to base frame
+    # Transform to base frame via the camera extrinsic
     R = T_base_cam[:3, :3].astype(np.float32)
     t = T_base_cam[:3, 3].astype(np.float32)
     pts_base = (pts_cam @ R.T) + t  # (N, 3)
@@ -125,6 +119,7 @@ def _arbitrate_label(
     if not group:
         return "", False, 0.0, "", 0.0, 0.0
 
+    # Collect every label any member scored (plus each member's self-pick).
     candidate_labels: set[str] = set()
     for d in group:
         sbo = getattr(d, "scores_by_object", None) or {}
@@ -140,6 +135,7 @@ def _arbitrate_label(
             fallback = 0.0
         return group[0].object_id, False, fallback, "", 0.0, fallback
 
+    # Sum each label's score across all members (raw per-class, or self-pick fallback).
     sums: dict[str, float] = {lbl: 0.0 for lbl in candidate_labels}
     for d in group:
         sbo = getattr(d, "scores_by_object", None) or {}
@@ -153,6 +149,7 @@ def _arbitrate_label(
                 if np.isfinite(score):
                     sums[lbl] += score
 
+    # Winner = highest summed vote; flag ambiguous when top-2 are within the margin.
     ranked = sorted(sums.items(), key=lambda kv: (-kv[1], kv[0]))
     winner_lbl, winner_score = ranked[0]
     if len(ranked) > 1:
@@ -222,31 +219,8 @@ def match_detections_across_cameras(
     first), then arbitrate the class label per cluster by summed DINO-score
     voting.
 
-    Args:
-        detections_by_cam: cam_id -> list of detections (centroid_base populated)
-        max_centroid_distance: max base-frame distance to consider a match
-        match_ambiguity_margin: if a detection's two nearest candidate clusters
-            are within this margin of each other (both inside the gate), drop it
-            rather than risk fusing two distinct nearby objects. 0.0 disables.
-        label_match_penalty_weight: meters of extra matching cost added for a
-            full DINO label disagreement (scaled by 1 - cosine label agreement).
-            Effectively tightens the gate for label-disagreeing pairs so two
-            distinct nearby objects with different identities resist fusing.
-            0.0 disables (pure geometry). Keep small (<~0.03) so it never
-            rejects a true same-object/different-label fuse.
-        cloud_extent_gate_scale: per-pair gate is max(max_centroid_distance,
-            largest_cloud_diagonal * cloud_extent_gate_scale). Large objects
-            (e.g. cooling base, diagonal ~15cm) automatically get a wider gate
-            than small objects (e.g. screws, diagonal ~3cm) without raising the
-            global threshold. Set to 0.0 to disable and use a fixed global gate.
-
-    Returns:
-        List of matched groups. Each group is a list of 1..N PerCamDetections
-        representing the same physical object seen from different cameras.
-        Every fused detection's `object_id` is overwritten with the arbitrated
-        label so downstream code (mesh lookup, FP, tracking init) sees one
-        consistent class per cluster.
     """
+    # With one camera there is nothing to match across — each detection stands alone.
     cam_ids = list(detections_by_cam.keys())
     if len(cam_ids) < 2:
         # Single camera: every detection is its own group (label unchanged)
@@ -281,6 +255,7 @@ def match_detections_across_cameras(
             )
             for cl in clusters
         ]
+        # Build a (detection × cluster) cost matrix of gated centroid distances.
         m, k = len(dets), len(clusters)
         cost = np.full((m, k), np.inf, dtype=np.float32)
         for i, d in enumerate(dets):
@@ -309,6 +284,7 @@ def match_detections_across_cameras(
                     )
                 cost[i, j] = dist
 
+        # Greedily assign cheapest detection↔cluster pairs (≤1 det per cam per cluster).
         joined: set[int] = set()        # det idx -> joined an existing cluster
         used_cluster: set[int] = set()  # cluster idx -> already took a det
         dropped: set[int] = set()       # det idx -> dropped for ambiguity
@@ -359,6 +335,7 @@ def match_detections_across_cameras(
             matched_groups.append(group)
             continue
 
+        # Vote on the cluster's class label.
         winner, ambiguous, winner_score, runner, runner_score, margin = _arbitrate_label(
             group, min_margin=label_arbitration_min_margin,
         )
@@ -368,6 +345,8 @@ def match_detections_across_cameras(
         pos = _cluster_centroid(group)
         pos_str = tuple(np.round(pos, 3)) if pos is not None else None
 
+        # Ambiguous vote: keep only the winning-label members if the margin is
+        # at least the singleton threshold, otherwise drop the whole cluster.
         if ambiguous:
             if margin >= float(label_arbitration_singleton_margin):
                 winner_members = [d for d in group if d.object_id == winner]
@@ -398,6 +377,7 @@ def match_detections_across_cameras(
             )
             continue
 
+        # Clear winner: overwrite every member's label with the arbitrated class.
         loser_labels = {d.object_id for d in group if d.object_id != winner}
         if loser_labels:
             print(
@@ -412,179 +392,12 @@ def match_detections_across_cameras(
     return matched_groups
 
 
-# ICP alignment of per-object clouds
-
-def icp_align_clouds(
-    cloud_source: np.ndarray,
-    cloud_target: np.ndarray,
-    max_correspondence_distance: float = 0.025,
-    voxel_size: float = 0.001,
-) -> tuple[np.ndarray, float, float]:
-    
-    if len(cloud_source) < 10 or len(cloud_target) < 10:
-        # Not enough points for ICP, return as-is
-        return cloud_source, 0.0, float('inf')
-
-    pcd_src = o3d.geometry.PointCloud()
-    pcd_src.points = o3d.utility.Vector3dVector(cloud_source.astype(np.float64))
-
-    pcd_tgt = o3d.geometry.PointCloud()
-    pcd_tgt.points = o3d.utility.Vector3dVector(cloud_target.astype(np.float64))
-
-    # Downsample for ICP speed
-    if voxel_size > 0:
-        pcd_src_ds = pcd_src.voxel_down_sample(voxel_size)
-        pcd_tgt_ds = pcd_tgt.voxel_down_sample(voxel_size)
-    else:
-        pcd_src_ds = pcd_src
-        pcd_tgt_ds = pcd_tgt
-
-    # Estimate normals for point-to-plane if enough points
-    if len(pcd_src_ds.points) > 30 and len(pcd_tgt_ds.points) > 30:
-        pcd_src_ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=20))
-        pcd_tgt_ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=20))
-        icp_method = o3d.pipelines.registration.TransformationEstimationPointToPlane()
-    else:
-        icp_method = o3d.pipelines.registration.TransformationEstimationPointToPoint()
-
-    # Identity init (clouds are already approximately aligned via extrinsics)
-    init_transform = np.eye(4, dtype=np.float64)
-
-    result = o3d.pipelines.registration.registration_icp(
-        source=pcd_src_ds,
-        target=pcd_tgt_ds,
-        max_correspondence_distance=max_correspondence_distance,
-        init=init_transform,
-        estimation_method=icp_method,
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            max_iteration=50,
-        ),
-    )
-
-    T_icp = np.asarray(result.transformation, dtype=np.float64)
-    fitness = float(result.fitness)
-    rmse = float(result.inlier_rmse)
-
-    # Apply ICP transform to the FULL (non-downsampled) source
-    R_icp = T_icp[:3, :3]
-    t_icp = T_icp[:3, 3]
-    aligned = (cloud_source.astype(np.float64) @ R_icp.T + t_icp).astype(np.float32)
-
-    return aligned, fitness, rmse
-
-
-# Cloud fusion: concatenate + voxel downsample
-
-def fuse_and_downsample(
-    clouds: list[np.ndarray],
-    voxel_size: float = 0.001,
-) -> np.ndarray:
-    """
-    Concatenate multiple point clouds and voxel-downsample.
-
-    Args:
-        clouds: list of (N_i, 3) arrays
-        voxel_size: voxel size in meters (0.001 = 1mm)
-
-    Returns:
-        (M, 3) fused and downsampled points
-    """
-    valid = [c for c in clouds if len(c) > 0]
-    if not valid:
-        return np.zeros((0, 3), dtype=np.float32)
-
-    merged = np.concatenate(valid, axis=0)
-
-    if voxel_size <= 0 or len(merged) < 10:
-        return merged.astype(np.float32)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(merged.astype(np.float64))
-    pcd_ds = pcd.voxel_down_sample(voxel_size)
-
-    return np.asarray(pcd_ds.points, dtype=np.float32)
-
-
-# Render fused cloud back into a camera's depth image
-
-def render_fused_depth(
-    cloud_base: np.ndarray,
-    K: np.ndarray,
-    T_base_cam: np.ndarray,
-    image_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Project fused point cloud (in base frame) into a camera to create
-    a synthetic depth image and mask.
-    """
-    H, W = image_shape
-
-    if len(cloud_base) == 0:
-        return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=bool)
-
-    # Transform from base to camera frame
-    # T_base_cam is cam-to-base, so we need its inverse: base-to-cam
-    T_cam_base = np.linalg.inv(T_base_cam.astype(np.float64))
-    R_cb = T_cam_base[:3, :3]
-    t_cb = T_cam_base[:3, 3]
-
-    pts_cam = (cloud_base.astype(np.float64) @ R_cb.T + t_cb).astype(np.float32)
-
-    # Filter points behind camera
-    valid = pts_cam[:, 2] > 0.01
-    pts_cam = pts_cam[valid]
-
-    if len(pts_cam) == 0:
-        return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=bool)
-
-    # Project to pixel coordinates
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-
-    u = (pts_cam[:, 0] * fx / pts_cam[:, 2] + cx).astype(np.float32)
-    v = (pts_cam[:, 1] * fy / pts_cam[:, 2] + cy).astype(np.float32)
-    z = pts_cam[:, 2]
-
-    # Round to pixel indices
-    ui = np.round(u).astype(np.int32)
-    vi = np.round(v).astype(np.int32)
-
-    # Filter out-of-bounds
-    in_bounds = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
-    ui = ui[in_bounds]
-    vi = vi[in_bounds]
-    z = z[in_bounds]
-
-    if len(ui) == 0:
-        return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=bool)
-
-    # Z-buffer: keep closest point per pixel
-    depth_img = np.zeros((H, W), dtype=np.float32)
-    mask_img = np.zeros((H, W), dtype=bool)
-
-    # Sort by depth (farthest first, so closest overwrites)
-    order = np.argsort(-z)
-    ui = ui[order]
-    vi = vi[order]
-    z = z[order]
-
-    depth_img[vi, ui] = z
-    mask_img[vi, ui] = True
-
-    return depth_img, mask_img
-
-
 # 
 # Top-level fusion pipeline
 
 @dataclass
 class FusionConfig:
     max_centroid_distance: float = 0.08     # meters, for cross-cam matching
-    icp_max_correspondence: float = 0.025   # meters
-    icp_voxel_size: float = 0.001           # meters, downsample before ICP
-    fusion_voxel_size: float = 0.001        # meters, final downsample
-    min_cloud_points: int = 50              # skip fusion if too few points
-    icp_min_fitness: float = 0.10           # below this, skip ICP correction
     min_depth: float = 0.05
     max_depth: float = 3.0
   
@@ -596,70 +409,6 @@ class FusionConfig:
     label_match_penalty_weight: float = 0.0
    
     cloud_extent_gate_scale: float = 0.5
-    debug_dir: str = ""                     # set to a path to dump debug PLY/PNG
-    debug_enabled: bool = False
-
-
-# Debug visualization
-
-def _save_debug_cloud(
-    path: str,
-    cloud: np.ndarray,
-    color: tuple[int, int, int] = (128, 128, 128),
-) -> None:
-    """Save point cloud as PLY with uniform color."""
-    if len(cloud) == 0:
-        return
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(cloud.astype(np.float64))
-    colors = np.tile(np.array(color, dtype=np.float64) / 255.0, (len(cloud), 1))
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    o3d.io.write_point_cloud(path, pcd)
-
-
-def _save_debug_clouds_colored(
-    path: str,
-    clouds_with_colors: list[tuple[np.ndarray, tuple[int, int, int]]],
-) -> None:
-    """Save multiple point clouds as a single PLY, each with its own color."""
-    all_pts = []
-    all_colors = []
-    for cloud, color in clouds_with_colors:
-        if len(cloud) == 0:
-            continue
-        all_pts.append(cloud)
-        c = np.array(color, dtype=np.float64) / 255.0
-        all_colors.append(np.tile(c, (len(cloud), 1)))
-
-    if not all_pts:
-        return
-
-    pts = np.concatenate(all_pts, axis=0)
-    cols = np.concatenate(all_colors, axis=0)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(cols)
-    o3d.io.write_point_cloud(path, pcd)
-
-
-def _save_debug_depth_image(path: str, depth: np.ndarray) -> None:
-    """Save depth map as a colorized PNG for visual inspection."""
-    valid = depth[depth > 0]
-    if len(valid) == 0:
-        cv2.imwrite(path, np.zeros_like(depth, dtype=np.uint8))
-        return
-    d_min, d_max = float(valid.min()), float(valid.max())
-    if d_max - d_min < 1e-6:
-        d_max = d_min + 0.1
-
-    norm = np.zeros_like(depth, dtype=np.uint8)
-    mask = depth > 0
-    norm[mask] = np.clip(
-        ((depth[mask] - d_min) / (d_max - d_min) * 255), 0, 255
-    ).astype(np.uint8)
-    colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-    colored[~mask] = 0
-    cv2.imwrite(path, colored)
 
 
 def build_per_cam_detections(
@@ -679,7 +428,7 @@ def build_per_cam_detections(
         view = views_by_cam[cam_id]
         T_bc = T_base_cam_map[cam_id]
 
-        # Convert SE3 to matrix if needed
+        # Accept either an SE3 object or a raw 4x4 for the extrinsic.
         if hasattr(T_bc, 'as_matrix'):
             T_bc = T_bc.as_matrix()
         elif hasattr(T_bc, 'matrix'):
@@ -689,6 +438,7 @@ def build_per_cam_detections(
         K = np.asarray(view.K, dtype=np.float32).reshape(3, 3)
         dets = []
 
+        # Turn each accepted DINO selection into a PerCamDetection with its cloud.
         for sel in selections:
             if sel.object_id == "unknown":
                 continue
@@ -737,177 +487,6 @@ def build_per_cam_detections(
     return result
 
 
-def fuse_matched_group(
-    group: list[PerCamDetection],
-    cfg: FusionConfig | None = None,
-) -> FusedDetection | None:
-    """
-    Given a matched group of detections (1 or 2 cameras for same object),
-    fuse their point clouds and render back into the reference camera.
-
-    Returns None if fusion fails (too few points, etc.)
-    """
-    cfg = cfg or FusionConfig()
-
-    if not group:
-        return None
-
-    # Pick reference camera: the one with the larger mask
-    ref_idx = max(range(len(group)), key=lambda i: group[i].mask_area)
-    ref = group[ref_idx]
-
-    if len(group) == 1:
-        # Single camera, no fusion needed — just pass through
-        cloud = group[0].cloud_base
-        if cloud is None or len(cloud) < cfg.min_cloud_points:
-            return None
-
-        return FusedDetection(
-            object_id=ref.object_id,
-            detections=group,
-            fused_cloud_base=cloud,
-            ref_cam_idx=ref_idx,
-            fused_depth=None,   # will use original depth
-            fused_mask=None,    # will use original mask
-        )
-
-    # Multi-camera fusion
-    clouds = []
-    for det in group:
-        if det.cloud_base is not None and len(det.cloud_base) >= cfg.min_cloud_points:
-            clouds.append((det, det.cloud_base))
-
-    if len(clouds) < 2:
-        # Only one camera had enough points, treat as single-cam
-        cloud = clouds[0][1] if clouds else ref.cloud_base
-        if cloud is None or len(cloud) < cfg.min_cloud_points:
-            return None
-        return FusedDetection(
-            object_id=ref.object_id,
-            detections=group,
-            fused_cloud_base=cloud,
-            ref_cam_idx=ref_idx,
-            fused_depth=None,
-            fused_mask=None,
-        )
-
-    # ICP: align non-reference clouds to reference cloud
-    ref_cloud = group[ref_idx].cloud_base
-    aligned_clouds = [ref_cloud]
-
-    for i, det in enumerate(group):
-        if i == ref_idx:
-            continue
-
-        t0 = time.time()
-        aligned, fitness, rmse = icp_align_clouds(
-            cloud_source=det.cloud_base,
-            cloud_target=ref_cloud,
-            max_correspondence_distance=cfg.icp_max_correspondence,
-            voxel_size=cfg.icp_voxel_size,
-        )
-        elapsed_ms = (time.time() - t0) * 1000
-
-        if fitness >= cfg.icp_min_fitness:
-            aligned_clouds.append(aligned)
-            print(
-                f"[FUSION] ICP {det.object_id} {det.cam_id}->{group[ref_idx].cam_id}: "
-                f"fitness={fitness:.3f} rmse={rmse*1000:.1f}mm time={elapsed_ms:.0f}ms"
-            )
-        else:
-            # ICP failed — still include the raw cloud (better than nothing)
-            aligned_clouds.append(det.cloud_base)
-            print(
-                f"[FUSION] ICP POOR {det.object_id} {det.cam_id}: "
-                f"fitness={fitness:.3f}, using raw cloud"
-            )
-
-    # Fuse and downsample
-    fused = fuse_and_downsample(aligned_clouds, voxel_size=cfg.fusion_voxel_size)
-
-    if len(fused) < cfg.min_cloud_points:
-        return None
-
-    # Render fused cloud back into reference camera
-    fused_depth, fused_mask = render_fused_depth(
-        cloud_base=fused,
-        K=ref.K,
-        T_base_cam=ref.T_base_cam,
-        image_shape=ref.depth.shape[:2],
-    )
-
-    # --- Debug saves ---
-    if cfg.debug_enabled and cfg.debug_dir:
-        import os
-        ts = int(time.time() * 1000)
-        obj_dir = os.path.join(cfg.debug_dir, ref.object_id)
-        os.makedirs(obj_dir, exist_ok=True)
-
-        # Per-camera clouds (different colors) + fused result
-        cam_colors = [(255, 80, 80), (80, 80, 255), (80, 255, 80)]
-        pre_icp_parts = []
-        for ci, det in enumerate(group):
-            c = cam_colors[ci % len(cam_colors)]
-            if det.cloud_base is not None and len(det.cloud_base) > 0:
-                pre_icp_parts.append((det.cloud_base, c))
-                _save_debug_cloud(
-                    os.path.join(obj_dir, f"{ts}_{det.cam_id}_raw.ply"),
-                    det.cloud_base, c,
-                )
-
-        # Pre-ICP overlay (both cameras raw)
-        if len(pre_icp_parts) > 1:
-            _save_debug_clouds_colored(
-                os.path.join(obj_dir, f"{ts}_pre_icp_overlay.ply"),
-                pre_icp_parts,
-            )
-
-        # Post-ICP / fused cloud
-        _save_debug_cloud(
-            os.path.join(obj_dir, f"{ts}_fused.ply"),
-            fused, (0, 200, 0),
-        )
-
-        # Post-ICP overlay (ref + aligned)
-        post_icp_parts = []
-        post_icp_parts.append((ref_cloud, cam_colors[0]))
-        for ci, ac in enumerate(aligned_clouds[1:], 1):
-            post_icp_parts.append((ac, cam_colors[ci % len(cam_colors)]))
-        _save_debug_clouds_colored(
-            os.path.join(obj_dir, f"{ts}_post_icp_overlay.ply"),
-            post_icp_parts,
-        )
-
-        # Rendered depth
-        if fused_depth is not None:
-            _save_debug_depth_image(
-                os.path.join(obj_dir, f"{ts}_fused_depth.png"),
-                fused_depth,
-            )
-
-        # Original depth from ref cam (for comparison)
-        _save_debug_depth_image(
-            os.path.join(obj_dir, f"{ts}_ref_original_depth.png"),
-            ref.depth,
-        )
-
-        # Fused mask
-        if fused_mask is not None:
-            mask_vis = (fused_mask.astype(np.uint8) * 255)
-            cv2.imwrite(os.path.join(obj_dir, f"{ts}_fused_mask.png"), mask_vis)
-
-        print(f"[FUSION DEBUG] Saved debug for {ref.object_id} -> {obj_dir}")
-
-    return FusedDetection(
-        object_id=ref.object_id,
-        detections=group,
-        fused_cloud_base=fused,
-        ref_cam_idx=ref_idx,
-        fused_depth=fused_depth,
-        fused_mask=fused_mask,
-    )
-
-
 def run_multicam_fusion(
     selections_by_cam: dict[str, list],
     views_by_cam: dict[str, object],
@@ -929,6 +508,7 @@ def run_multicam_fusion(
     """
     cfg = cfg or FusionConfig()
 
+    # 1) Per-camera detections + clouds → 2) cross-camera match/label → 3) FusedDetections.
     dets_by_cam = build_per_cam_detections(
         selections_by_cam, views_by_cam, T_base_cam_map, cfg,
     )
@@ -943,6 +523,7 @@ def run_multicam_fusion(
         cloud_extent_gate_scale=cfg.cloud_extent_gate_scale,
     )
 
+    # Reference camera per object = the one with the largest mask.
     results = []
     for group in matched_groups:
         if not group:
@@ -951,7 +532,6 @@ def run_multicam_fusion(
         results.append(FusedDetection(
             object_id=group[ref_idx].object_id,
             detections=group,
-            fused_cloud_base=np.zeros((0, 3), dtype=np.float32),
             ref_cam_idx=ref_idx,
         ))
     return results

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +14,7 @@ DEFAULT_COLOR = [0.65, 0.65, 0.7]
 
 
 def pick_color(obj_id: str) -> list[float]:
+    # Map the object family (by name prefix) to its printed-plastic color.
     if obj_id.startswith("cooling"):
         return COOLING_COLOR
     if obj_id.startswith("pb"):
@@ -35,28 +35,6 @@ def fibonacci_sphere(n: int) -> np.ndarray:
     return np.stack([x, y, z], axis=1)
 
 
-def look_at(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> np.ndarray:
-    """Build a camera-from-world extrinsic. Open3D wants the world->camera
-    transform with +Z forward (into the scene), +Y down (image convention)."""
-    forward = target - eye
-    forward /= np.linalg.norm(forward) + 1e-12
-    # Build a stable right vector
-    up = up_hint / (np.linalg.norm(up_hint) + 1e-12)
-    if abs(np.dot(forward, up)) > 0.99:
-        up = np.array([1.0, 0.0, 0.0])
-    right = np.cross(forward, up)
-    right /= np.linalg.norm(right) + 1e-12
-    new_up = np.cross(right, forward)
-
-    # World->camera basis (rows = camera axes)
-    R = np.stack([right, -new_up, forward], axis=0)
-    t = -R @ eye
-    extr = np.eye(4)
-    extr[:3, :3] = R
-    extr[:3, 3] = t
-    return extr
-
-
 def render_object_views(
     mesh_path: Path,
     out_dir: Path,
@@ -68,13 +46,14 @@ def render_object_views(
     color: list[float] | None = None,
 ) -> int:
     """Render `n_views` viewpoints of the mesh; returns count written."""
+    # Load the mesh; bail early if the file held no geometry.
     mesh = o3d.io.read_triangle_mesh(str(mesh_path))
     if mesh.is_empty():
         print(f"[render] empty mesh: {mesh_path}")
         return 0
 
     mesh.compute_vertex_normals()
-    # Match the runner's mesh-scale convention
+    # Match the runner's mesh-scale convention, then center at the origin.
     mesh.scale(mesh_scale, center=(0.0, 0.0, 0.0))
     mesh.translate(-mesh.get_center())
 
@@ -83,17 +62,19 @@ def render_object_views(
     # carry colors that don't reflect the printed plastic.
     mesh.paint_uniform_color(color if color is not None else DEFAULT_COLOR)
 
+    # Place the camera a few mesh-diagonals away so the whole part stays in frame.
     aabb = mesh.get_axis_aligned_bounding_box()
     extent = float(np.linalg.norm(aabb.get_extent()))
     cam_dist = max(0.05, distance_scale * extent)
 
-    # Offscreen renderer
+    # Offscreen renderer with a black background and a single overhead sun light.
     renderer = o3d.visualization.rendering.OffscreenRenderer(image_size, image_size)
     scene = renderer.scene
     scene.set_background([0.0, 0.0, 0.0, 1.0])
     scene.scene.set_sun_light([0.0, 0.0, -1.0], [1.0, 1.0, 1.0], 75000.0)
     scene.scene.enable_sun_light(True)
 
+    # Matte material so renders look like the diffuse printed plastic.
     mat = o3d.visualization.rendering.MaterialRecord()
     mat.shader = "defaultLit"
     mat.base_roughness = 1.0
@@ -103,6 +84,7 @@ def render_object_views(
     fov_deg = 60.0
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
+    # Walk the evenly-spread viewpoints and render one image per direction.
     for i, dir_vec in enumerate(fibonacci_sphere(n_views)):
         eye = dir_vec * cam_dist
         # Use mesh centroid (already at origin after recentre).
@@ -116,10 +98,11 @@ def render_object_views(
         img = renderer.render_to_image()
         rgb = np.asarray(img)  # (H, W, 3) uint8
 
-
+        # Skip blank renders (object fell entirely off-screen).
         non_bg = rgb.max(axis=2) > 15
         if not non_bg.any():
             continue
+        # Tight-crop to the rendered object plus a small padding margin.
         ys, xs = np.where(non_bg)
         y0, y1 = int(ys.min()), int(ys.max()) + 1
         x0, x1 = int(xs.min()), int(xs.max()) + 1
@@ -160,10 +143,12 @@ def main() -> None:
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    # Gather every mesh in the CAD dir across the supported formats.
     mesh_files = []
     for ext in ("*.obj", "*.stl", "*.ply"):
         mesh_files.extend(sorted(cad_root.glob(ext)))
 
+    # Optionally restrict to a caller-named subset of objects.
     if args.object_ids:
         wanted = set(args.object_ids)
         mesh_files = [m for m in mesh_files if m.stem in wanted]
@@ -171,6 +156,7 @@ def main() -> None:
     if not mesh_files:
         raise SystemExit(f"No mesh files found in {cad_root}")
 
+    # Render each object into its own subfolder and tally the views written.
     total = 0
     for mesh_path in mesh_files:
         obj_id = mesh_path.stem

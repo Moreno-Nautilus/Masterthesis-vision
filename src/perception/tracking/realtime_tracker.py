@@ -3,8 +3,6 @@ Real-time 6DoF object tracker combining:
 - CuteVOS for mask tracking (handles motion, occlusion)
 - Colored ICP for pose refinement (6DoF from depth)
 
-Target: 10Hz tracking for robot manipulation feedback.
-
 """
 
 from __future__ import annotations
@@ -96,11 +94,12 @@ class RealtimeTracker:
     def __init__(self, cfg: Optional[RealtimeTrackerConfig] = None):
         self.cfg = cfg or RealtimeTrackerConfig()
 
+        # Mask source (own Cutie session) + pose refiner (ICP).
         self._cutie = CutieTracker(self.cfg.cutie_cfg)
         self._mask_backend = "cutie"
 
         self._icp = ICPRefiner(self.cfg.icp_cfg)
-        
+
         # State
         self._state = TrackingState.UNINITIALIZED
         self._T_current: Optional[np.ndarray] = None
@@ -114,14 +113,6 @@ class RealtimeTracker:
     @property
     def state(self) -> TrackingState:
         return self._state
-        
-    @property
-    def is_tracking(self) -> bool:
-        return self._state == TrackingState.TRACKING
-        
-    @property
-    def needs_reinit(self) -> bool:
-        return self._state == TrackingState.NEEDS_REINIT
     
     def initialize(
         self,
@@ -152,18 +143,19 @@ class RealtimeTracker:
                 session (shared across all objects) owns mask propagation and
                 masks are fed in via track_with_mask().
         """
+        # Optionally seed this tracker's own Cutie (skipped when the runner owns a shared session).
         if init_cutie:
             self._cutie.initialize(rgb, mask.astype(np.uint8))
 
-        # Initialize ICP with model
+        # Load the model cloud ICP registers against (from mesh or vertices).
         if mesh_path is not None:
             self._icp.set_model_from_mesh(mesh_path,  scale=0.01)
         elif model_vertices is not None:
             self._icp.set_model_cloud(model_vertices)
         else:
             raise ValueError("Must provide mesh_path or model_vertices")
-        
-        # Store state
+
+        # Store the initial pose and mark tracking active.
         self._T_current = T_init.copy()
         self._T_prev = T_init.copy()
         self._K = K.copy()
@@ -209,6 +201,7 @@ class RealtimeTracker:
             self._handle_lost(f"{backend_used} failed: {e}")
             return self._make_invalid_result(f"{backend_used} failed: {e}")
 
+        # Hand the propagated mask to the shared ICP path.
         return self.track_with_mask(cutie_result, depth, K=K, skip_icp=skip_icp, rgb=rgb)
 
     def track_with_mask(
@@ -248,7 +241,7 @@ class RealtimeTracker:
         backend_used = self._mask_backend
         cutie_ms = cutie_result.elapsed_ms
 
-        # Check mask validity
+        # Too few mask pixels → treat as lost.
         if cutie_result.area < self.cfg.min_mask_area:
             self._handle_lost(f"Mask too small: {cutie_result.area} < {self.cfg.min_mask_area}")
             return self._make_invalid_result(
@@ -282,9 +275,7 @@ class RealtimeTracker:
                 mask_backend=backend_used,
             )
         
-        # Stage 2: Pose refinement with ICP
-        t1 = time.time()
-        
+        # Stage 2: Pose refinement with ICP (model cloud → masked depth, seeded from current pose).
         try:
             icp_result = self._icp.refine(
                 depth=depth,
@@ -305,8 +296,8 @@ class RealtimeTracker:
         icp_ms = icp_result.elapsed_ms
         
         # Stage 3: Quality checks
-        
-        # Check ICP quality
+
+        # Reject if ICP overlap is too poor to trust.
         if icp_result.fitness < self.cfg.min_icp_fitness:
             self._handle_lost(f"ICP fitness too low: {icp_result.fitness:.3f}")
             return self._make_invalid_result(
@@ -319,7 +310,7 @@ class RealtimeTracker:
                 icp_rmse=icp_result.inlier_rmse,
             )
         
-        # Check motion sanity
+        # Reject implausibly large jumps vs the previous pose.
         T_new = icp_result.T_refined
         if self._frame_count == 1:
             pass
@@ -335,7 +326,7 @@ class RealtimeTracker:
                 icp_rmse=icp_result.inlier_rmse,
             )
         
-        # Success: Update state
+        # Accepted: advance the pose and clear the lost counter.
         self._T_prev = self._T_current.copy()
         self._T_current = T_new.copy()
         self._lost_count = 0
@@ -367,42 +358,45 @@ class RealtimeTracker:
         )
     
     def _check_motion_sanity(self, T_new: np.ndarray) -> bool:
+        # Reject the update if translation or rotation vs prev exceeds the per-frame caps.
         if self._T_prev is None:
             return True
-            
+
+        # Translation jump.
         t_prev = self._T_prev[:3, 3]
         t_new = T_new[:3, 3]
         translation = np.linalg.norm(t_new - t_prev)
-        
+
         # print(f"[Motion DEBUG] t_prev={t_prev}, t_new={t_new}")
         #print(f"[Motion DEBUG] delta={translation*1000:.1f}mm, threshold={self.cfg.max_translation_per_frame*1000:.1f}mm")
-        
+
         if translation > self.cfg.max_translation_per_frame:
             return False
-        
-        # Rotation check
+
+        # Rotation jump (geodesic angle of the relative rotation).
         R_prev = self._T_prev[:3, :3]
         R_new = T_new[:3, :3]
         R_rel = R_prev.T @ R_new
-        
+
         cos_angle = (np.trace(R_rel) - 1) / 2
         cos_angle = np.clip(cos_angle, -1, 1)
         angle_deg = np.degrees(np.arccos(cos_angle))
-        
+
         # print(f"[Motion DEBUG] rotation delta={angle_deg:.1f}°, threshold={self.cfg.max_rotation_per_frame_deg:.1f}°")
-        
+
         if angle_deg > self.cfg.max_rotation_per_frame_deg:
             return False
-        
+
         return True
-    
+
     def _handle_lost(self, reason: str) -> None:
         """Handle lost tracking."""
+        # Count consecutive losses; escalate to a re-init request past the threshold.
         self._lost_count += 1
-        
+
         if self.cfg.verbose:
             print(f"[Lost #{self._lost_count}] {reason}")
-        
+
         if self._lost_count >= self.cfg.lost_frames_before_reinit:
             self._state = TrackingState.NEEDS_REINIT
             if self.cfg.verbose:
@@ -421,6 +415,7 @@ class RealtimeTracker:
         icp_rmse: float = float('inf'),
     ) -> TrackingResult:
         """Create an invalid tracking result."""
+        # Carry the last known pose so callers can still hold position when invalid.
         return TrackingResult(
             valid=False,
             state=self._state,
@@ -438,6 +433,7 @@ class RealtimeTracker:
     
     def reset(self) -> None:
         """Reset tracker state."""
+        # Clear Cutie memory and drop all pose/lost state back to uninitialized.
         if self._cutie is not None:
             self._cutie.reset()
         self._state = TrackingState.UNINITIALIZED
@@ -446,15 +442,12 @@ class RealtimeTracker:
         self._lost_count = 0
         self._frame_count = 0
     
-    def get_last_pose(self) -> Optional[np.ndarray]:
-        """Get last known pose (even if tracking is lost)."""
-        return self._T_current.copy() if self._T_current is not None else None
-    
     def force_pose_update(self, T_new: np.ndarray) -> None:
         """
         Force update pose from external source (e.g., after re-init).
         Also updates Cutie memory if needed.
         """
+        # Overwrite the internal pose (used to sync with the fused-cloud result).
         self._T_prev = self._T_current.copy() if self._T_current is not None else T_new.copy()
         self._T_current = T_new.copy()
         self._lost_count = 0

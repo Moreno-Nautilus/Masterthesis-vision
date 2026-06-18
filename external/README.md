@@ -12,7 +12,6 @@ versus upstream.
 | `external/FoundationPose`| https://github.com/NVlabs/FoundationPose.git      | Pinned commit + local thesis patch (see below) |
 | `external/dinov2`        | https://github.com/facebookresearch/dinov2.git    | Clean, pinned to upstream commit |
 | `external/sam2`          | https://github.com/facebookresearch/sam2.git      | Clean, pinned to upstream commit |
-| `external/sam3`          | https://github.com/facebookresearch/sam3.git      | Clean, pinned to upstream commit |
 
 ### Setup
 

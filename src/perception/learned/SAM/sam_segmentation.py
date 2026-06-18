@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,20 +28,20 @@ def _force_math_sdp_attention():
     try:
         # torch >= 2.1 preferred API
         from torch.nn.attention import sdpa_kernel, SDPBackend
-        with sdpa_kernel([SDPBackend.MATH]):
-            yield
-        return
+        ctx = sdpa_kernel([SDPBackend.MATH])
     except Exception:
-        pass
-    try:
-        # older torch fallback
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=False, enable_mem_efficient=False, enable_math=True
-        ):
-            yield
-        return
-    except Exception:
-        # SDPA backend control unavailable — run unguarded rather than break.
+        try:
+            # older torch fallback
+            ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            )
+        except Exception:
+            # SDPA backend control unavailable: run unguarded rather than break.
+            ctx = nullcontext()
+
+    with ctx:
         yield
 
 
@@ -120,6 +120,7 @@ class SAMSegmenter:
             self.cfg.device if self.cfg.device == "cuda" and torch.cuda.is_available() else "cpu"
         )
 
+        # Build the model plus both inference frontends (box predictor + auto generator).
         model = self._build_model()
         self._model = model
         self._predictor = self._build_predictor(model)
@@ -143,6 +144,7 @@ class SAMSegmenter:
         the old (still-usable) predictor on failure means the worst case is one
         skipped frame, not a dead camera."""
         print("[SAM-REBUILD] rebuilding SAM model after persistent mask collapse")
+        # Build the replacement into locals first; only commit if all three succeed.
         try:
             new_model = self._build_model()
             new_predictor = self._build_predictor(new_model)
@@ -151,6 +153,7 @@ class SAMSegmenter:
             print(f"[SAM-REBUILD] rebuild failed, keeping existing model: {e}")
             return False
 
+        # Swap the new stack in and free the old one.
         old_model = getattr(self, "_model", None)
         old_predictor = getattr(self, "_predictor", None)
         old_amg = getattr(self, "_auto_mask_generator", None)
@@ -194,6 +197,7 @@ class SAMSegmenter:
             print(f"[SAM-WEIGHTS:{tag}] check failed: {e}")
 
     def warmup(self, max_iters: int = 6) -> bool:
+        # Run a synthetic red-square-on-grey box prompt until SAM returns a valid mask.
         dummy = np.full((512, 512, 3), 30, dtype=np.uint8)
         dummy[208:304, 208:304] = (220, 40, 40)
         box = np.array([[208, 208, 304, 304]], dtype=np.float32)
@@ -222,6 +226,7 @@ class SAMSegmenter:
         so this normally costs at most one extra ~1s build. Meant to run at
         startup, where rebuilds are cheap and Hydra still resolves the sam2
         config (and _build_model re-asserts it regardless)."""
+        # Warm first; only rebuild fresh models if it stays cold ("cursed" builds).
         if self.warmup(max_iters=warmup_iters):
             return True
         for attempt in range(1, max_rebuilds + 1):
@@ -246,6 +251,7 @@ class SAMSegmenter:
             sys.path.insert(0, str(repo_root))
 
     def _build_model(self) -> Any:
+        # Build the SAM2 model from its config + checkpoint (Hydra config re-pointed first).
         ckpt = Path(self.cfg.checkpoint).resolve()
         if not ckpt.exists():
             raise FileNotFoundError(f"SAM2 checkpoint does not exist: {ckpt}")
@@ -304,6 +310,7 @@ class SAMSegmenter:
 
     @staticmethod
     def _resize_if_needed(rgb: np.ndarray, max_side: int | None) -> tuple[np.ndarray, float]:
+        # Downscale so the longest side ≤ max_side; return the image and the scale used.
         if max_side is None:
             return rgb, 1.0
 
@@ -320,6 +327,7 @@ class SAMSegmenter:
 
     @staticmethod
     def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int]:
+        # Tight xyxy bounding box around the mask's set pixels.
         ys, xs = np.nonzero(mask)
         if len(xs) == 0 or len(ys) == 0:
             return (0, 0, 0, 0)
@@ -343,6 +351,7 @@ class SAMSegmenter:
     ) -> str:
         """Return "" if the mask passes, else a short reason code for why it was
         rejected (used by the [SAM-REJECT] diagnostic in generate_*)."""
+        # Area must be within [min, ratio·image] — reject specks and whole-frame masks.
         h, w = image_shape
         area = int(mask.sum())
         if area < self.cfg.min_mask_area:
@@ -351,6 +360,7 @@ class SAMSegmenter:
         if area > int(self.cfg.max_mask_area_ratio * h * w):
             return "area_large"
 
+        # Reject too-thin boxes and non-finite scores.
         x0, y0, x1, y1 = self._bbox_from_mask(mask)
         bw = x1 - x0
         bh = y1 - y0
@@ -360,16 +370,19 @@ class SAMSegmenter:
         if not np.isfinite(score):
             return "bad_score"
 
+        # Reject extreme aspect ratios (sliver masks).
         aspect_ratio = max(bw, bh) / (min(bw, bh) + 1e-6)
         if aspect_ratio > self.cfg.max_aspect_ratio:
             return "aspect"
 
+        # Reject masks that barely fill their bounding box.
         bbox_area = bw * bh
         if bbox_area > 0:
             fill_ratio = area / bbox_area
             if fill_ratio < 0.20:
                 return "fill_ratio"
 
+        # Optional HSV check: drop low-saturation mid-value blobs (shadows).
         if self.cfg.shadow_filter_enabled and rgb is not None:
             import cv2
             mask_bool = mask.astype(bool)
@@ -387,6 +400,7 @@ class SAMSegmenter:
                     if mean_value > self.cfg.min_value and mean_value < self.cfg.max_value_for_low_sat:
                         return "shadow"
 
+        # For large masks, reject if they split into multiple blobs (now or after erosion).
         if area > 5000 and rgb is not None:
             import cv2
             from scipy import ndimage
@@ -426,6 +440,7 @@ class SAMSegmenter:
             self._health_logged = True
             self._log_param_health("first-forward")
 
+        # Resize the image and scale the boxes to match.
         rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
         boxes_scaled = boxes * scale if scale != 1.0 else boxes
         n_boxes = len(boxes)
@@ -446,7 +461,7 @@ class SAMSegmenter:
                 use_bf16=self.cfg.use_bfloat16,
             )
             if self._is_mask_collapse(out, n_boxes, _reject):
-                print(f"[SAM-RETRY] from_boxes: still collapsed; falling back to fp32")
+                print("[SAM-RETRY] from_boxes: still collapsed; falling back to fp32")
                 out, _reject = self._predict_boxes_once(
                     rgb, rgb_small, boxes_scaled, scale, box_scores,
                     use_bf16=False,
@@ -458,6 +473,7 @@ class SAMSegmenter:
         if _reject:
             print(f"[SAM-REJECT] from_boxes: {n_boxes} boxes -> {len(out)} kept "
                   f"| rejected: {dict(sorted(_reject.items(), key=lambda kv: -kv[1]))}")
+        # Best (score, area) first.
         out.sort(key=lambda x: (x.score, x.area), reverse=True)
         return out
 
@@ -491,6 +507,7 @@ class SAMSegmenter:
         actual fix for a collapse)."""
         import cv2
 
+        # Precision context (bf16 autocast on CUDA, else plain) + math-SDPA guard.
         with torch.inference_mode():
             if self.device.type == "cuda" and use_bf16:
                 ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -498,11 +515,13 @@ class SAMSegmenter:
                 from contextlib import nullcontext
                 ctx = nullcontext()
             with ctx, _force_math_sdp_attention():
+                # Encode the image once for all box prompts.
                 with _suppress_sam_info_logs():
                     self._predictor.set_image(rgb_small)
                 out: list[SAMMaskCandidate] = []
                 _reject: dict[str, int] = {}  # [SAM-REJECT] diagnostic
                 h0, w0 = rgb.shape[:2]
+                # One mask per box; upscale to full res, filter, and keep the survivors.
                 for idx, box in enumerate(boxes_scaled):
                     masks, scores, _ = self._predictor.predict(
                         box=box, multimask_output=False,
@@ -540,6 +559,7 @@ class SAMSegmenter:
         rgb_small, scale = self._resize_if_needed(rgb, self.cfg.max_image_side)
         h0, w0 = rgb.shape[:2]
 
+        # Let SAM propose masks across a point grid (no prompts).
         with torch.inference_mode():
             if self.device.type == "cuda" and self.cfg.use_bfloat16:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -549,6 +569,7 @@ class SAMSegmenter:
 
         import cv2
 
+        # Upscale, filter, and collect each proposed mask.
         out: list[SAMMaskCandidate] = []
         _reject: dict[str, int] = {}  # [SAM-REJECT] diagnostic
         for item in raw_masks:

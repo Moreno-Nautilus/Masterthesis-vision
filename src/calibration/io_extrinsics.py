@@ -17,6 +17,7 @@ def load_extrinsics_yaml(path: str | Path) -> dict[str, SE3]:
     path = Path(path)
     data = yaml.safe_load(path.read_text())
 
+    # Rebuild one SE3 per camera from its flat row-major R + translation t.
     out: dict[str, SE3] = {}
     for cam_id, d in data.items():
         R = np.array(d["R"], dtype=float).reshape(3, 3)
@@ -32,6 +33,7 @@ def save_extrinsics_yaml(path: str | Path, extr: dict[str, SE3]) -> None:
       t: [tx,ty,tz]
     """
     path = Path(path)
+    # Flatten each camera's SE3 into the row-major R + t YAML layout.
     data = {}
     for cam_id, T in extr.items():
         R = np.asarray(T.R, dtype=float).reshape(3, 3)

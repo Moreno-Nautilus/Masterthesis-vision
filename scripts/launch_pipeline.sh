@@ -42,12 +42,9 @@ COMMON_ARGS=(
 INIT_ONLY_ARGS=(
     "${COMMON_ARGS[@]}"
     --run-mode init_only
-    --tracking-backend cutie
-    --tracking-profile default
     --debug-logging
     --debug-verbose-logs
     --log-init-poses
-    --track-pose-log-path outputs/logs/multicam_init_final_baseline.csv
 )
 
 TRACK_BASE_ARGS=(

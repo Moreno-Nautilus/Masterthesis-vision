@@ -38,6 +38,7 @@ class GroundingDINOProposer:
 
     @staticmethod
     def _build_prompt_string(text_prompts: Iterable[str]) -> str:
+        # Normalize the class phrases into GDINO's expected prompt format.
         cleaned = [p.strip().lower() for p in text_prompts if p and p.strip()]
         if not cleaned:
             return ""
@@ -45,6 +46,7 @@ class GroundingDINOProposer:
         return ". ".join(cleaned) + "."
 
     def _lazy_load(self) -> None:
+        # Load processor + model once, on first use.
         if self._model is not None:
             return
         try:
@@ -59,6 +61,7 @@ class GroundingDINOProposer:
                 "  pip install 'transformers>=4.40' "
             ) from e
 
+        # Honor the requested device, but fall back to CPU if CUDA isn't there.
         self._device = torch.device(
             self.cfg.device if (self.cfg.device == "cuda" and torch.cuda.is_available()) else "cpu"
         )
@@ -67,11 +70,8 @@ class GroundingDINOProposer:
             self.cfg.model_id
         ).to(self._device).eval()
 
-    def set_text_prompts(self, text_prompts: list[str]) -> None:
-        self.cfg.text_prompts = list(text_prompts)
-        self._prompt_string = self._build_prompt_string(self.cfg.text_prompts)
-
     def propose(self, rgb: np.ndarray) -> list[GDINOProposal]:
+        # No prompt → nothing to detect.
         if not self._prompt_string:
             return []
         self._lazy_load()
@@ -82,6 +82,7 @@ class GroundingDINOProposer:
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"rgb must be (H, W, 3), got {rgb.shape}")
 
+        # Preprocess image + text and run a single forward pass.
         pil = Image.fromarray(rgb.astype(np.uint8))
         inputs = self._processor(
             images=pil, text=self._prompt_string, return_tensors="pt"
@@ -90,6 +91,7 @@ class GroundingDINOProposer:
         with torch.inference_mode():
             outputs = self._model(**inputs)
 
+        # Decode boxes from logits; older/newer transformers name the arg differently.
         try:
             results = self._processor.post_process_grounded_object_detection(
                 outputs,
@@ -118,6 +120,7 @@ class GroundingDINOProposer:
         if boxes is None or len(boxes) == 0:
             return []
 
+        # Pack each detection into a GDINOProposal with integer pixel coords.
         proposals: list[GDINOProposal] = []
         for box, score, label in zip(boxes, scores, labels):
             x0, y0, x1, y1 = [int(round(float(v))) for v in box.tolist()]
@@ -129,5 +132,6 @@ class GroundingDINOProposer:
                 )
             )
 
+        # Keep the highest-scoring boxes up to the per-image cap.
         proposals.sort(key=lambda p: p.score, reverse=True)
         return proposals[: self.cfg.max_boxes_per_image]

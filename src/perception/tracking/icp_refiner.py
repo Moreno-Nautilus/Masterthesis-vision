@@ -90,17 +90,19 @@ class ICPRefiner:
         """
         self._lazy_import()
         o3d = self._o3d
-        
+
+        # Wrap the model vertices in an Open3D cloud.
         self._model_cloud = o3d.geometry.PointCloud()
         self._model_cloud.points = o3d.utility.Vector3dVector(vertices.astype(np.float64))
 
+        # Use supplied normals, or estimate them (needed for point-to-plane).
         if normals is not None:
             self._model_cloud.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
         else:
             self._model_cloud.estimate_normals(
                 search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
             )
-            
+
         # Pre-compute downsampled version for speed
         if self.cfg.voxel_size is not None:
             self._model_cloud_down = self._model_cloud.voxel_down_sample(self.cfg.voxel_size)
@@ -117,33 +119,36 @@ class ICPRefiner:
         o3d = self._o3d
         
         mesh = o3d.io.read_triangle_mesh(mesh_path)
-        
+
         # Center the mesh (same as FP does)
         mesh.translate(-mesh.get_center())
-        
+
         # Scale from mm to meters (same as FP)
         mesh.scale(scale, center=(0, 0, 0))
-        
+
         mesh.compute_vertex_normals()
-        
-        # Sample points
+
+        # Sample a uniform point cloud off the mesh surface.
         cloud = mesh.sample_points_uniformly(number_of_points=num_points)
-        
+
+        # Re-center on the sampled points' centroid.
         pts = np.asarray(cloud.points)
         center_of_mass = pts.mean(axis=0)
         cloud.translate(-center_of_mass)
-        
+
         vertices = np.asarray(cloud.points, dtype=np.float32)
         normals = np.asarray(cloud.normals, dtype=np.float32)
         
         self.set_model_cloud(vertices, normals=normals)
 
     def _depth_to_cloud(self, depth, rgb, mask, K):
+        # Back-project masked depth pixels into a camera-frame point cloud.
         o3d = self._o3d
         H, W = depth.shape
 
         mask_bool = mask.astype(bool, copy=False)
 
+        # Optionally clean the mask: close small holes / erode the border inward.
         close_k = int(self.cfg.mask_morph_close_kernel)
         erode_k = int(self.cfg.mask_interior_erosion)
         if close_k > 0 or erode_k > 0:
@@ -180,16 +185,19 @@ class ICPRefiner:
         vv = np.arange(y0, y1)
         grid_u, grid_v = np.meshgrid(uu, vv)
 
+        # Pull the masked pixels' depth and image coordinates.
         z = depth_c[mask_c]
         u = grid_u[mask_c]
         v = grid_v[mask_c]
 
+        # Keep only finite depths in a sane range.
         valid = (z > 0.01) & (z < 2.0) & np.isfinite(z)
         z, u, v = z[valid], u[valid], v[valid]
 
         if len(z) < 10:
             return o3d.geometry.PointCloud()
 
+        # Pinhole un-projection to 3D camera coordinates.
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
         points = np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], axis=1).astype(np.float64)
@@ -227,15 +235,16 @@ class ICPRefiner:
         ) -> ICPResult:
             if self._model_cloud is None:
                 raise RuntimeError("Call set_model_cloud() first")
-                
+
             self._lazy_import()
             o3d = self._o3d
-            
+
             t0 = time.time()
-            
+
             # Extract observed point cloud from depth + mask
             observed_cloud = self._depth_to_cloud(depth, rgb, mask, K)
-            
+
+            # Too few points to register reliably → return the init pose unchanged.
             if len(observed_cloud.points) < 50:
                 return ICPResult(
                     T_refined=T_init.copy(),
@@ -246,6 +255,7 @@ class ICPRefiner:
                     elapsed_ms=(time.time() - t0) * 1000,
                 )
             
+            # Register the model cloud onto the observed cloud, seeded from T_init.
             source_model = self._model_cloud_down
             T_init64 = T_init.astype(np.float64)
 
@@ -281,10 +291,11 @@ class ICPRefiner:
             # `init` was applied internally; result.transformation is already
             # the full T_refined.
             T_refined = np.asarray(result.transformation, dtype=np.float64)
-            
+
+            # Call it converged when overlap is high and inlier error is small.
             elapsed_ms = (time.time() - t0) * 1000
             converged = result.fitness > 0.3 and result.inlier_rmse < 0.005
-            
+
             return ICPResult(
                 T_refined=T_refined.astype(np.float32),
                 fitness=float(result.fitness),

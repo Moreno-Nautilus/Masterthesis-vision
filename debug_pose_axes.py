@@ -130,7 +130,7 @@ class BasePoseAxesDebug(Node):
         self.pub_timer = self.create_timer(1.0 / hz, self.publish_markers)
 
         self.get_logger().info("Base pose axes debug started")
-        self.get_logger().info(f"Publishing MarkerArray: /debug/base_pose_axes")
+        self.get_logger().info("Publishing MarkerArray: /debug/base_pose_axes")
         self.get_logger().info(f"Marker frame_id: {self.base_frame}")
         self.get_logger().info("Subscribing to /perception/fp/pose_base* topics with BEST_EFFORT QoS")
 

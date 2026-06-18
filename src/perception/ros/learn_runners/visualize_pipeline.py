@@ -29,6 +29,7 @@ FAST_QOS = QoSProfile(
 )
 
 
+# Wrap an RGB array as a ROS Image message.
 def rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
     rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
     msg = Image()
@@ -42,6 +43,7 @@ def rgb_numpy_to_imgmsg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
     return msg
 
 
+# Decode a ROS Image message to an RGB array across the common encodings.
 def imgmsg_to_rgb_numpy(msg: Image) -> np.ndarray:
     if msg.encoding == "rgb8":
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
@@ -62,6 +64,7 @@ def imgmsg_to_rgb_numpy(msg: Image) -> np.ndarray:
     raise ValueError(f"Unsupported image encoding: {msg.encoding}")
 
 
+# Quaternion [x,y,z,w] → 3x3 rotation matrix.
 def quaternion_xyzw_to_rotation_matrix(q_xyzw: np.ndarray) -> np.ndarray:
     q = np.asarray(q_xyzw, dtype=np.float64).reshape(4)
     x, y, z, w = q
@@ -85,6 +88,7 @@ def quaternion_xyzw_to_rotation_matrix(q_xyzw: np.ndarray) -> np.ndarray:
     )
 
 
+# ROS Pose message → 4x4 homogeneous transform.
 def pose_msg_to_T(p: Pose) -> np.ndarray:
     T = np.eye(4, dtype=np.float32)
     T[:3, 3] = np.array(
@@ -99,6 +103,7 @@ def pose_msg_to_T(p: Pose) -> np.ndarray:
     return T
 
 
+# Project camera-frame 3D points to pixels; returns uv plus an in-front-of-camera mask.
 def project_points(K: np.ndarray, pts_cam: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     z = pts_cam[:, 2]
     valid = z > 1e-6
@@ -127,6 +132,7 @@ def draw_bbox_label_inplace(
     color: tuple[int, int, int],
     font_scale: float = 0.6,
 ) -> None:
+    # Draw a labeled bounding box.
     x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
 
     cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
@@ -150,6 +156,7 @@ def draw_pose_text_inplace(
     mode: str,
     obj_idx: int,
 ) -> None:
+    # Draw a per-object text block (id, score, translation) stacked by index.
     t = T_display[:3, 3]
     lines = [
         f"[{obj_idx}] {mode}: {object_id}",
@@ -189,6 +196,7 @@ def draw_roi_polygon_inplace(
     thickness: int = 2,
     label: str = "ROI",
 ) -> None:
+    # Draw the closed ROI polygon plus a label at its first vertex.
     if not polygon_flat:
         return
 
@@ -247,6 +255,7 @@ def draw_axes_from_pose_inplace(
         dtype=np.float32,
     )
 
+    # Project the object-frame origin + unit axis tips into the image.
     pts_cam = (T_camera_object[:3, :3] @ pts_obj.T).T + T_camera_object[:3, 3]
     uv, valid = project_points(K, pts_cam)
 
@@ -298,6 +307,7 @@ def draw_axes_from_pose_inplace(
         )
 
 
+# Angle (deg) between the object's z-axis and the base-frame vertical.
 def object_z_vs_base_z_deg(T_base_object: np.ndarray) -> float:
     T_base_object = np.asarray(T_base_object, dtype=np.float64).reshape(4, 4)
 
@@ -331,6 +341,7 @@ def draw_base_axes_at_object_origin_inplace(
     # For image projection we need camera <- base.
     T_cam_base = np.linalg.inv(T_base_cam)
 
+    # Axis tips offset from the object origin along the base x/y/z directions.
     p0_base = T_base_object[:3, 3]
 
     pts_base = np.array(
@@ -406,6 +417,7 @@ def overlay_mask_crop_in_bbox(
     color: tuple[int, int, int],
     alpha: float,
 ) -> None:
+    # Alpha-blend a (resized) mask crop as a colored overlay inside its bbox.
     if mask_msg.width == 0 or mask_msg.height == 0 or len(mask_msg.data) == 0:
         return
 
@@ -444,11 +456,13 @@ class FrameData:
     rgb: np.ndarray
 
 
+# Standalone node: subscribes to the pipeline's debug frames and republishes annotated overlays.
 class FoundationPoseExternalVisualizer(Node):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args.node_name)
         self.args = args
 
+        # Distinct colors cycled per object/candidate index.
         self.palette = [
             (255, 0, 0),
             (0, 255, 0),
@@ -468,6 +482,7 @@ class FoundationPoseExternalVisualizer(Node):
         self.cached_sam: list[DebugCandidate] = []
         self.cached_dino: list[DebugCandidate] = []
 
+        # Subscribe to the camera's RGB, intrinsics, and the pipeline's debug frame.
         self.create_subscription(Image, self.args.rgb_topic, self._on_rgb, FAST_QOS)
         self.create_subscription(
             CameraInfo,
@@ -477,6 +492,7 @@ class FoundationPoseExternalVisualizer(Node):
         )
         self.create_subscription(DebugFrame, self.args.debug_topic, self._on_debug, FAST_QOS)
 
+        # One output topic per overlay (raw / SAM / DINO / pose / track).
         self.pub_raw = self.create_publisher(Image, self.args.raw_out_topic, FAST_QOS)
         self.pub_sam = self.create_publisher(Image, self.args.sam_out_topic, FAST_QOS)
         self.pub_dino = self.create_publisher(Image, self.args.dino_out_topic, FAST_QOS)
@@ -491,6 +507,7 @@ class FoundationPoseExternalVisualizer(Node):
         )
 
     def _load_T_base_cam(self) -> Optional[np.ndarray]:
+        # Load this camera's base extrinsic for the base-axes overlay; None disables it.
         if self.args.extrinsics_yaml is None or self.args.extrinsics_yaml == "":
             self.get_logger().warn("No --extrinsics-yaml given, base axes overlay disabled")
             return None
@@ -539,6 +556,7 @@ class FoundationPoseExternalVisualizer(Node):
             self.get_logger().warn(f"Failed to load extrinsics YAML: {e}")
             return None
 
+    # Subscription callbacks: keep the latest RGB frame, intrinsics, and debug frame.
     def _on_rgb(self, msg: Image) -> None:
         rgb = imgmsg_to_rgb_numpy(msg)
         stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
@@ -554,6 +572,7 @@ class FoundationPoseExternalVisualizer(Node):
     def _on_debug(self, msg: DebugFrame) -> None:
         self.latest_debug = msg
 
+        # SAM/DINO candidates only refresh on their update flags (they lag the RGB).
         if msg.update_sam:
             self.cached_sam = list(msg.sam_candidates)
 
@@ -561,6 +580,7 @@ class FoundationPoseExternalVisualizer(Node):
             self.cached_dino = list(msg.dino_ranked_candidates)
 
     def _make_sam_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
+        # ROI + each SAM candidate's mask/box with its score.
         out = rgb.copy()
         draw_roi_polygon_inplace(out, list(dbg.roi_polygon_xy_flat), label=f"ROI {dbg.cam_id}")
 
@@ -596,6 +616,7 @@ class FoundationPoseExternalVisualizer(Node):
         return out
 
     def _make_dino_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
+        # Each DINO-ranked candidate's mask/box labeled with its class + score.
         out = rgb.copy()
 
         for i, cand in enumerate(self.cached_dino[: dbg.max_candidate_draw]):
@@ -623,6 +644,7 @@ class FoundationPoseExternalVisualizer(Node):
         text_y: int,
         overlay_name: str,
     ) -> None:
+        # Draw the object's own axes plus the base-frame axes at its origin.
         if self.K is None:
             return
 
@@ -691,6 +713,7 @@ class FoundationPoseExternalVisualizer(Node):
             print(f"[{overlay_name}_VIZ] {err_text}")
 
     def _make_pose_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
+        # Per-object box/mask, pose text, and (optionally) the 3D axes.
         out = rgb.copy()
 
         for i, item in enumerate(dbg.pose_items):
@@ -724,6 +747,7 @@ class FoundationPoseExternalVisualizer(Node):
         return out
 
     def _make_track_overlay(self, rgb: np.ndarray, dbg: DebugFrame) -> np.ndarray:
+        # Tracking view: live mask + ICP metrics, or an INIT/SEARCH banner when not tracking.
         out = rgb.copy()
 
         # Tracking mask overlay.
@@ -845,12 +869,14 @@ class FoundationPoseExternalVisualizer(Node):
         return out
 
     def _tick(self) -> None:
+        # Periodically build and publish all overlays for the latest synced (rgb, debug) pair.
         if self.latest_frame is None or self.latest_debug is None:
             return
 
         dbg = self.latest_debug
         frame = self.latest_frame
 
+        # Skip if the RGB frame and the debug frame are too far apart in time.
         dbg_ns = int(dbg.stamp.sec) * 1_000_000_000 + int(dbg.stamp.nanosec)
 
         if abs(frame.stamp_ns - dbg_ns) > int(self.args.max_sync_dt_s * 1e9):
@@ -905,6 +931,7 @@ class FoundationPoseExternalVisualizer(Node):
                 2,
             )
 
+        # Optionally downscale every overlay before publishing to save bandwidth.
         if self.args.output_scale != 1.0:
             new_w = max(1, int(round(rgb.shape[1] * self.args.output_scale)))
             new_h = max(1, int(round(rgb.shape[0] * self.args.output_scale)))
@@ -915,6 +942,7 @@ class FoundationPoseExternalVisualizer(Node):
             pose_overlay = cv2.resize(pose_overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
             track_overlay = cv2.resize(track_overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+        # Publish all five views.
         self.pub_raw.publish(rgb_numpy_to_imgmsg(rgb, self.args.cam_id, stamp))
         self.pub_sam.publish(rgb_numpy_to_imgmsg(sam_overlay, self.args.cam_id, stamp))
         self.pub_dino.publish(rgb_numpy_to_imgmsg(dino_overlay, self.args.cam_id, stamp))
