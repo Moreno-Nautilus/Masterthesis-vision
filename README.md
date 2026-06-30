@@ -5,6 +5,11 @@ Three calibrated ZED 2i cameras feed a learned perception stack —
 **Grounding-DINO → SAM2 → DINOv2 → cross-camera fusion → FoundationPose → ICP** —
 that publishes a canonical pose per object in the **robot base frame**.
 
+> **New here / just want to calibrate and run it?** Start with
+> **[docs/getting_started.md](docs/getting_started.md)** — a linear, student-facing
+> calibrate → run → view guide for the lab rig. There's also a one-page
+> **[cheat sheet](docs/cheatsheet.md)** (commands only) to print and tape to the rig.
+>
 > **For a step-by-step description of how the pipeline actually runs,
 > read [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).** This README
 > covers setup, how to launch things, and what each piece of code does; the
