@@ -1,0 +1,23 @@
+# Grasp + transport one assembly step, executed by Colleague C's grasp node
+# (grasping, path planning, collision avoidance — NOT our scope).
+#
+# GOAL fields: names/types agreed with Colleague C on 2026-07-15.
+# "left"/"right" are from the ROBOT ARMS' perspective (not operator/camera view).
+# The state machine decides the arm assignment; the grasp node just executes.
+string assembly_name
+int32 base_part_id        # the HELD part
+int32 insertion_part_id   # the MOVE part
+string holder_robot       # "left" | "right"
+string inserter_robot     # "left" | "right"
+---
+# RESULT — DRAFT (proposed 2026-07-15, not yet agreed with Colleague C)
+bool success
+string error_code         # empty on success; e.g. "PLANNING_FAILED", "GRASP_FAILED", "TRANSPORT_FAILED"
+string message
+# Where the insertion part actually ended up (pre-insertion hover pose, robot
+# base frame) — lets the insertion policy start from reality, not the command.
+geometry_msgs/PoseStamped achieved_part_pose
+---
+# FEEDBACK — DRAFT (proposed 2026-07-15, not yet agreed with Colleague C)
+string phase              # e.g. "PLANNING" | "GRASPING_BASE" | "GRASPING_PART" | "TRANSPORTING"
+float32 progress          # 0..1 within the current phase

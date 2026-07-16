@@ -1,0 +1,17 @@
+# RL insertion of one part pair — served by our rl_insertion_node (Stream C policy).
+# Preconditions: grasp node has both arms in place (holder holding the base part,
+# inserter hovering the plug at the pre-insertion pose).
+string assembly_name
+int32 plug_part_id        # the part being inserted (= move part)
+int32 socket_part_id      # the part it inserts into (precedence parent; may differ from the held part)
+string inserter_robot     # "left" | "right", arms' perspective
+# Detected socket pose at INSERT entry, robot base frame. Once the tracking
+# contract with Colleague M exists, live tracking may supersede this snapshot.
+geometry_msgs/PoseStamped socket_pose
+---
+bool success
+string message
+float32 final_error_m     # path-frame position error at termination (success threshold 5mm, per Stream C)
+---
+string phase              # "APPROACHING" | "INSERTING"
+float32 current_error_m
