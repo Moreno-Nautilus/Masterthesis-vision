@@ -14,6 +14,12 @@ that publishes a canonical pose per object in the **robot base frame**.
 > read [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).** This README
 > covers setup, how to launch things, and what each piece of code does; the
 > walkthrough explains the algorithm itself.
+>
+> **Experimenting with the 1-ZED + 2-RealSense (end-effector) variant?** See
+> **[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**
+> for the full step-by-step run sequence, or [§6 below](#6-realsense-trio-variant)
+> for a quick reference — a separate, parallel pipeline (own
+> scripts/config/launch files); nothing above is affected by it.
 
 ---
 
@@ -217,3 +223,29 @@ per-tick breakdown, in two halves:
   with its accept/hold/lost gates; this section also covers the `fast-track` vs
   `accurate-track` presets and the optional rotation fixes (rot-reseed, PCA
   shaft-axis, rotation damping).
+
+---
+
+## 6. RealSense trio variant
+
+Experimental parallel pipeline: `zed2i_1` (static) + 2 end-effector-mounted Intel
+RealSense D405 cameras — a separate set of scripts/config/launch files that don't
+touch anything above.
+
+**For the full start-to-finish run sequence** (tested and verified working —
+tf2/robot setup, host stack, pipeline, what a healthy run looks like, and every
+bug already hit and fixed along the way), see
+**[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**.
+
+Quick reference once you've read that once:
+
+```bash
+# terminal 1 — tf2 for the flange pose (real robot, or identity placeholder — see docs §1 Step 1)
+ros2 launch lbr_bringup hardware.launch.py model:=iiwa7
+
+# terminal 2 — host camera stack (ZED + both RealSense + flange_pose_publisher)
+scripts/launch_host_realsense.sh
+
+# terminal 3 — the pipeline itself (needs a real terminal, not a backgrounded/piped shell)
+scripts/launch_pipeline_realsense.sh init-only
+```

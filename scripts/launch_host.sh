@@ -25,7 +25,7 @@ SESSION="${SESSION:-mv_host}"
 NUM_CAMERAS="${NUM_CAMERAS:-3}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-SRC_HOST="export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros/humble/setup.bash && source \"\$HOME/zed_ros2_ws/install/setup.bash\" && source \"$REPO_DIR/install/setup.bash\" && if [ -f \"\$HOME/franka_ros2_ws/install/setup.bash\" ]; then source \"\$HOME/franka_ros2_ws/install/setup.bash\"; fi"
+SRC_HOST="export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros/humble/setup.bash && source \"\$HOME/franka_ros2_ws/install/setup.bash\" && source \"$REPO_DIR/install/setup.bash\" && if [ -f \"\$HOME/franka_ros2_ws/install/setup.bash\" ]; then source \"\$HOME/franka_ros2_ws/install/setup.bash\"; fi"
 SRC_ROS="$SRC_HOST"
 
 CAM_CMD='ros2 launch mv_launch zed2i_pair.launch.py'
