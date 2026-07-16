@@ -334,3 +334,4 @@ scripts/launch_pipeline.sh accurate-track --fused-track-rot-lowpass 0.3  # smoot
 - **[Franka_Perception.json](Franka_Perception.json)** — the shared Foxglove layout (import via *Layouts → Import from file…*).
 - **[README](../README.md)** — full repo layout, every launch flag, and from-scratch setup.
 - **[docs/pipeline_walkthrough.md](pipeline_walkthrough.md)** — how the algorithm works, stage by stage (GDINO → SAM → DINO → fusion → FoundationPose → ICP, then tracking).
+- **[docs/getting_started_realsense.md](getting_started_realsense.md)** — the experimental 1-ZED + 2-RealSense (end-effector-mounted) variant; a separate, parallel pipeline.
