@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import rclpy
+from fp_debug_msgs.msg import DebugPoseItem
 from geometry_msgs.msg import Point, Pose, PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -25,6 +26,7 @@ class StoredPose:
     topic: str
     pose: Pose
     stamp_sec: float
+    label: str = ""
 
 
 def quat_xyzw_to_R(q):
@@ -171,6 +173,20 @@ class BasePoseAxesDebug(Node):
                 self.subscribed.add(topic)
                 self.get_logger().info(f"Subscribed PoseStamped: {topic}")
 
+            elif "fp_debug_msgs/msg/DebugPoseItem" in types:
+                # Fused/assembly topic: many parts share one topic, one
+                # DebugPoseItem message per part, keyed by assembly/part_id.
+                self.subs.append(
+                    self.create_subscription(
+                        DebugPoseItem,
+                        topic,
+                        lambda msg, topic=topic: self.on_debug_pose_item(topic, msg),
+                        self.pose_qos,
+                    )
+                )
+                self.subscribed.add(topic)
+                self.get_logger().info(f"Subscribed DebugPoseItem: {topic}")
+
     def now_sec(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
@@ -186,6 +202,18 @@ class BasePoseAxesDebug(Node):
             topic=topic,
             pose=msg.pose,
             stamp_sec=self.now_sec(),
+        )
+
+    def on_debug_pose_item(self, topic: str, msg: DebugPoseItem):
+        # Many parts share one topic (fused/assembly); key each part
+        # separately so they don't overwrite each other in self.latest.
+        label = f"{msg.assembly_name}/{msg.part_id}" if msg.assembly_name else str(msg.part_id)
+        key = f"{topic}/{label}"
+        self.latest[key] = StoredPose(
+            topic=topic,
+            pose=msg.pose_base.pose,
+            stamp_sec=self.now_sec(),
+            label=label,
         )
 
     def make_arrow(self, topic, axis_id, origin, end, color, stamp):
@@ -233,7 +261,7 @@ class BasePoseAxesDebug(Node):
         m.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.8)
         return m
 
-    def make_text(self, topic, origin, R, stamp):
+    def make_text(self, topic, origin, R, stamp, display_name=None):
         rpy = R_to_rpy_deg(R)
 
         m = Marker()
@@ -254,7 +282,7 @@ class BasePoseAxesDebug(Node):
         m.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
 
         m.text = (
-            f"{short_name(topic)}\n"
+            f"{display_name or short_name(topic)}\n"
             f"xyz [{origin[0]:+.3f}, {origin[1]:+.3f}, {origin[2]:+.3f}]\n"
             f"rpy [{rpy[0]:+.1f}, {rpy[1]:+.1f}, {rpy[2]:+.1f}] deg"
         )
@@ -304,7 +332,8 @@ class BasePoseAxesDebug(Node):
             arr.markers.append(self.make_origin_sphere(topic, origin, stamp))
 
             if self.show_text:
-                arr.markers.append(self.make_text(topic, origin, R, stamp))
+                display_name = stored.label or short_name(stored.topic)
+                arr.markers.append(self.make_text(topic, origin, R, stamp, display_name))
 
             active_count += 1
 

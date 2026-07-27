@@ -4,13 +4,19 @@ CuteVOS (Cutie) wrapper for real-time video object segmentation.
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 import torch
+
+_CUTIE_REPO_ROOT = Path("external/Cutie").resolve()
+if str(_CUTIE_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CUTIE_REPO_ROOT))
 
 
 @dataclass

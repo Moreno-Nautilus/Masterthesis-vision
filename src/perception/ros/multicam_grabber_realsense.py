@@ -124,6 +124,7 @@ class MultiCamGrabberRealsense(Node):
         rgb_depth_max_dt_s: float = 0.10,
         flange_pose_topic: str = "/iiwa/ee_pose",
         flange_pose_max_age_s: float = 0.25,
+        T_robotA_activeRobot: Optional[SE3] = None,
     ):
         super().__init__("multicam_grabber_realsense")
 
@@ -132,9 +133,23 @@ class MultiCamGrabberRealsense(Node):
         self.use_best_effort_if_unsynced = bool(use_best_effort_if_unsynced)
         self.rgb_depth_max_dt_s = float(rgb_depth_max_dt_s)
         self.flange_pose_max_age_s = float(flange_pose_max_age_s)
+        # None = leave everything in whichever robot is physically connected's
+        # frame (old behavior). If given, static (non-dynamic) entries -- true
+        # base-frame poses -- are shifted into robot_a's frame at load time,
+        # and the live flange pose is shifted the same way on receipt
+        # (_on_flange_pose), so the static zed2i_1 lookup and the live
+        # T_base_flange(t) @ T_flange_cam composition stay in the same frame.
+        # T_flange_cam entries (dynamic cams) are camera-to-FLANGE, not
+        # base-frame, so they must NOT be converted.
+        self._T_robotA_activeRobot = T_robotA_activeRobot
 
         dynamic_ids = {c.cam_id for c in cameras if c.is_dynamic}
         raw_static_map = static_extrinsics_base_cam or {}
+        if T_robotA_activeRobot is not None:
+            raw_static_map = {
+                cam_id: (T_robotA_activeRobot.compose(T) if cam_id not in dynamic_ids else T)
+                for cam_id, T in raw_static_map.items()
+            }
 
         self._latest_flange_pose: Optional[SE3] = None
         self._latest_flange_pose_wall_t: float = 0.0
@@ -209,7 +224,10 @@ class MultiCamGrabberRealsense(Node):
             )
 
     def _on_flange_pose(self, msg: PoseStamped) -> None:
-        self._latest_flange_pose = _pose_msg_to_se3(msg)
+        T = _pose_msg_to_se3(msg)
+        if self._T_robotA_activeRobot is not None:
+            T = self._T_robotA_activeRobot.compose(T)
+        self._latest_flange_pose = T
         self._latest_flange_pose_wall_t = time.time()
 
     def _get_flange_pose(self) -> Optional[SE3]:

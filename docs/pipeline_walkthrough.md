@@ -333,8 +333,9 @@ onto the fused cloud. This is the last refinement.
 - Back-project the canonical base pose into each contributing camera frame
   (`T_cam_base · T_canonical`), sanity-check it, and build an `ObjectTrackState`
   per camera.
-- Publish the canonical pose as a `PoseStamped` on
-  `/perception/fp/pose_base/fused/<track_id>` (base frame); log `INIT` lines.
+- Publish the canonical pose as a `fp_debug_msgs/DebugPoseItem` (base frame,
+  identified by `assembly_name`/`part_id`) on the shared
+  `/perception/fp/pose_base/fused/assembly` topic; log `INIT` lines.
 
 ### Phase 4 — Finalize the tick
 
@@ -355,8 +356,9 @@ onto the fused cloud. This is the last refinement.
 ## "Init done" — what you have at the end
 
 For every detected object:
-- a **canonical 6-DoF pose in the base frame**, published on
-  `/perception/fp/pose_base/fused/<track_id>`,
+- a **canonical 6-DoF pose in the base frame**, published as one
+  `DebugPoseItem` message (identified by `assembly_name`/`part_id`) on the
+  shared `/perception/fp/pose_base/fused/assembly` topic,
 - Chamfer/fitness diagnostics in the logs,
 - CSV rows in `init_pose_log.csv`, plus a render under `init_renders/`,
 - in `track` mode, a persisted `ObjectTrackState` per camera (pose + recovery
@@ -555,9 +557,10 @@ without a global re-init on that tick.
 
 ### Stage 5.7 — Output
 
-Same topics as init: per object a base-frame `PoseStamped` on
-`/perception/fp/pose_base/fused/<track_id>` (published on accept, or from memory
-while `held`). With `--log-track-poses` a compact per-tick CSV row (pose
+Same topic as init: per object a base-frame `DebugPoseItem` (identified by
+`assembly_name`/`part_id`) on `/perception/fp/pose_base/fused/assembly`
+(published on accept, or from memory while `held`). With `--log-track-poses` a
+compact per-tick CSV row (pose
 quaternion + metrics) is written to `--track-pose-log-path`
 (`outputs/logs/live_fast_track_q.csv` / `live_accurate_track_q.csv`). A `[STAGE]`
 latency line (percam / icp / post split) is printed every 20 ticks regardless of

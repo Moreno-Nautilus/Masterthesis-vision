@@ -85,31 +85,52 @@ or the reference images. Create it with this layout before running anything:
 Data/
 ├── CAD_Models/              # raw object meshes (.obj or .stl)
 ├── CAD_Models_centered/     # origin-centered meshes — USED BY THE PIPELINE (--cad-dir)
+│   ├── cooling_manifold/    # one subfolder per assembly
+│   │   ├── cooling_base.obj
+│   │   ├── cooling_f.obj
+│   │   └── cooling_screw.obj
+│   └── plumbers_block/
+│       ├── pb_base.obj
+│       ├── pb_pipe.obj
+│       ├── pb_screw.obj
+│       └── pb_top.obj
 ├── ZED_screens/             # REAL reference crops, one folder per object (--reference-dir)
-│   ├── pb_screw/  *.png
-│   ├── pb_pipe/   *.png
-│   ├── cooling_f/ *.png
-│   └── ... (one subfolder per object_id)
+│   ├── cooling_manifold/
+│   │   ├── cooling_base/ *.png
+│   │   ├── cooling_f/    *.png
+│   │   └── cooling_screw/ *.png
+│   ├── plumbers_block/
+│   │   ├── pb_base/ *.png
+│   │   ├── pb_pipe/ *.png
+│   │   ├── pb_screw/ *.png
+│   │   └── pb_top/  *.png
+│   └── blue_cube/ *.png   # objects with no assembly stay directly under the root
 └── reference_renders/       # OPTIONAL synthetic renders (--reference-renders-dir)
-    └── <object_id>/ *.png
+    ├── cooling_manifold/<object_id>/ *.png
+    └── plumbers_block/<object_id>/ *.png
 ```
 
-- **`CAD_Models_centered/<object_id>.obj` or `<object_id>.stl`** — the mesh
+- **`CAD_Models_centered/<assembly_name>/<object_id>.obj` or `.stl`** — the mesh
   FoundationPose registers against. The default `--cad-dir` points here; the
-  `object_id` is the filename stem. Meshes are assumed to be in centimeters
+  `object_id` is the filename stem. Meshes belonging to a known assembly
+  (`cooling_manifold`, `plumbers_block`) live in that assembly's subfolder;
+  objects with no assembly (cubes, screwdrivers) may sit directly under
+  `CAD_Models_centered/`. Meshes are assumed to be in centimeters
   (`--mesh-scale 0.01`).
-- **`ZED_screens/<object_id>/`** — the **DINO reference bank**: a handful of
-  cropped photos of each object. DINOv2 embeds these once at startup and every
-  candidate crop is classified against them. This is the default reference source
-  (`--reference-source real`).
-- **`reference_renders/<object_id>/`** — optional CAD-rendered alternative/extra
-  reference views, produced by
+- **`ZED_screens/<assembly_name>/<object_id>/`** — the **DINO reference bank**:
+  a handful of cropped photos of each object. DINOv2 embeds these once at
+  startup and every candidate crop is classified against them. This is the
+  default reference source (`--reference-source real`).
+- **`reference_renders/<assembly_name>/<object_id>/`** — optional CAD-rendered
+  alternative/extra reference views, produced by
   [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py).
   Used when `--reference-source renders` or `both`.
 
 The folder names under `ZED_screens/` / `reference_renders/` and the mesh
 filenames must use the **same `object_id`** so labels line up across detection
-and pose.
+and pose. The assembly-name grouping (`cooling_manifold`, `plumbers_block`) is
+optional structure for organizing parts on disk — objects without a known
+assembly prefix are read directly from the `Data/*` root instead.
 
 ---
 
@@ -156,9 +177,10 @@ flags are listed in the launch file and the init-only baseline is explained in
 
 ### Output
 
-Per detected object the pipeline publishes a base-frame `PoseStamped` on
-`/perception/fp/pose_base/fused/<track_id>`; with logging flags, it writes CSV
-rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
+Per detected object the pipeline publishes a base-frame `fp_debug_msgs/DebugPoseItem`
+(identified by `assembly_name`/`part_id`) on the shared
+`/perception/fp/pose_base/fused/assembly` topic; with logging flags, it writes
+CSV rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
 `init_renders/`.
 
 ---
@@ -249,3 +271,79 @@ scripts/launch_host_realsense.sh
 # terminal 3 — the pipeline itself (needs a real terminal, not a backgrounded/piped shell)
 scripts/launch_pipeline_realsense.sh init-only
 ```
+
+**Hand-eye calibration for the two RealSense cameras** (camera-to-flange
+offset, currently identity placeholders) is a separate two-stage routine —
+see **[docs/getting_started_realsense.md §4](docs/getting_started_realsense.md#4-hand-eye-calibration-camera-to-flange-offset)**.
+It requires jogging the arm interactively via MoveIt between samples; see
+**[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for that part.
+
+---
+
+## 7. MoveIt2 planning scene visualization
+
+Both pipeline runners (`run_pipeline_track_multicam.py` and the RealSense
+variant) publish each tracked part as a `moveit_msgs/CollisionObject` on
+`/planning_scene`, in addition to the existing pose topics. The mesh geometry
+(from `Data/CAD_Models_centered/`) is embedded directly in the message — a
+subscriber (RViz, `move_group`, ...) needs no filesystem access to the CAD
+files at all.
+
+- **Identity**: each object is keyed `"{assembly_name}/{part_id}"` (e.g.
+  `plumbers_block/0`), matching the same identity already used for the
+  `pub_fused_assembly` pose topic. Repeated same-mesh parts (e.g. multiple
+  `pb_screw` instances) get one distinct `CollisionObject` per slot, all
+  sharing the same mesh geometry.
+- **Frame**: every `CollisionObject` header uses a fixed frame name from
+  `--planning-scene-frame-id` (default `world`) — **not** a tf2 lookup. Set
+  this to whatever frame your robot/world is actually spawned under if it
+  isn't `world`.
+- **Non-blocking, fail-soft**: publishing is a plain topic publish (never a
+  blocking service call), and `_publish_planning_scene_object`/
+  `_remove_planning_scene_objects` swallow all failures internally (missing
+  mesh, bad pose, publish error) after logging once — a problem here never
+  slows or crashes the detection/tracking loop.
+- **Removal**: when a track's `pose_status` transitions to `lost` (see
+  `_tick()`'s `_force_reinit_tracks` handling), its `CollisionObject` is
+  retracted from the scene with a `REMOVE` op.
+
+### Viewing it in RViz
+
+RViz's `PlanningScene`/`MotionPlanning` display needs a `robot_description`
+to initialize against, and needs a `move_group` (or similar) already
+maintaining a base scene before it can apply our `is_diff:=true` updates —
+otherwise it reports "no planning scene loaded" even though the topic is
+publishing correctly. There's no need for the real robot hardware for any of
+this — a mock robot is enough.
+
+[scripts/launch_moveit_scene_viewer.launch.py](scripts/launch_moveit_scene_viewer.launch.py)
+bundles a mock `iiwa7`, `move_group`, and RViz together for exactly this:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/franka_ros2_ws/install/setup.bash   # wherever the lbr_fri_ros2_stack workspace lives
+ros2 launch /path/to/Masterthesis-vision/scripts/launch_moveit_scene_viewer.launch.py
+```
+
+Then in RViz: **Add → By display type → moveit_ros_visualization →
+PlanningScene**, and set its **Planning Scene Topic** to `/planning_scene`.
+Fixed Frame is already `world` in the bundled RViz config, matching
+`--planning-scene-frame-id`'s default.
+
+Notes/quirks (already hit and fixed once, so no need to rediscover them):
+- `lbr_bringup`'s own `move_group.launch.py`/`rviz.launch.py` don't expose a
+  namespace argument, but the mock robot (`lbr_bringup mock.launch.py`) runs
+  everything under `/lbr` — the bundled launch file builds `move_group`/RViz
+  as raw `Node` actions with `namespace="lbr"` instead of including those
+  launch files directly.
+- Namespacing `move_group` under `/lbr` also remaps its `/planning_scene`
+  subscription to `/lbr/planning_scene` by default, disconnecting it from the
+  bare `/planning_scene` topic the pipeline publishes on — the bundled launch
+  file remaps it back explicitly (`("/lbr/planning_scene", "/planning_scene")`,
+  same for `monitored_planning_scene`/`planning_scene_world`/
+  `collision_object`/`attached_collision_object`).
+- Collision meshes render with flat per-triangle shading that shifts as you
+  orbit the camera (`shape_msgs/Mesh` carries no vertex normals) — this is a
+  cosmetic limitation of RViz's collision-object rendering, not a sign of bad
+  geometry or a wrong pose; it doesn't affect MoveIt's actual collision
+  checking, which uses the raw triangle mesh directly.

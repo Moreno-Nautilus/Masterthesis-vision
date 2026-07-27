@@ -2,23 +2,10 @@
 # computed by src/calibration/board_pose_from_flange_realsense.py from
 # 4 samples via cam_id=realsense_2. Replaces the previous
 # hand-measured value -- see config/robot_bases.yaml for the active robot.
-#
-# base_board_robot_a_frame is the SAME checkerboard pose, re-expressed in
-# robot_a's base frame (the global reference -- see config/robot_bases.yaml
-# for the per-robot offsets used to convert between the two).
 base_board:
   translation_xyz_m:
   - 0.388479
   - -0.641858
-  - -0.018811
-  rotation_rpy_deg:
-  - -179.5043
-  - -0.1241
-  - 179.9683
-base_board_robot_a_frame:
-  translation_xyz_m:
-  - 0.388479
-  - 0.198142
   - -0.018811
   rotation_rpy_deg:
   - -179.5043
