@@ -14,6 +14,7 @@ import yaml
 
 from src.utils.se3 import SE3
 from src.calibration.io_extrinsics import save_extrinsics_yaml
+from src.utils.robot_bases import get_active_robot_base
 
 
 # ---------------- USER SETTINGS ----------------
@@ -56,6 +57,17 @@ EXPECTED_CAM3_INFO_FRAME_ID = None
 
 BASE_BOARD_YAML = "config/base_board_pose.yaml"
 OUT_YAML = "config/camera_extrinsics_base.yaml"
+# Same poses, re-expressed in robot_a's frame (global reference) -- written
+# as a separate sibling file (not extra keys in OUT_YAML) because OUT_YAML
+# uses the flat cam_id -> {R,t} format that load_extrinsics_yaml() reads
+# every top-level key from; mixing in "_robot_a_frame" keys there would get
+# silently picked up as if they were extra cameras. Reference/documentation
+# only -- the live pipeline computes this same conversion itself at runtime
+# from OUT_YAML + config/robot_bases.yaml (see run_pipeline_track_multicam.py
+# and run_pipeline_track_multicam_realsense.py), so this file is not read by
+# anything; it exists so the robot_a-frame numbers are on disk, not just
+# printed to a terminal that may not be saved.
+OUT_YAML_ROBOT_A_FRAME = "config/camera_extrinsics_base_robot_a_frame.yaml"
 DEBUG_DIR = "outputs/calibration_debug"
 # ------------------------------------------------
 
@@ -607,12 +619,22 @@ def main() -> None:
     T_cam1_cam3_check = T_base_cam1_avg.inverse() @ T_base_cam3_avg
 
     print("\n=== FINAL RESULTS ===")
-    print("\nT_base_cam1 (averaged):")
+    active_robot, T_robotA_activeRobot = get_active_robot_base()
+    T_robotA_cam1 = T_robotA_activeRobot.compose(T_base_cam1_avg)
+    T_robotA_cam2 = T_robotA_activeRobot.compose(T_base_cam2_avg)
+    T_robotA_cam3 = T_robotA_activeRobot.compose(T_base_cam3_avg)
+
+    print(f"\nT_base_cam1 (averaged, base = {active_robot}'s lbr_link_0):")
     print(T_base_cam1_avg)
-    print("\nT_base_cam2 (averaged):")
+    print(f"\nT_base_cam2 (averaged, base = {active_robot}'s lbr_link_0):")
     print(T_base_cam2_avg)
-    print("\nT_base_cam3 (averaged):")
+    print(f"\nT_base_cam3 (averaged, base = {active_robot}'s lbr_link_0):")
     print(T_base_cam3_avg)
+
+    print("\nSame poses in robot_a's frame (global reference):")
+    print(f"T_robotA_cam1:\n{T_robotA_cam1}")
+    print(f"T_robotA_cam2:\n{T_robotA_cam2}")
+    print(f"T_robotA_cam3:\n{T_robotA_cam3}")
 
     print("\nQuality metrics:")
     print(f"cam1 mean reproj error: {reproj1_mean:.4f} px")
@@ -669,6 +691,20 @@ def main() -> None:
 
     save_extrinsics_yaml(out_path, out)
     print(f"\nWrote base-referenced camera extrinsics to: {out_path}")
+
+    out_robot_a = {
+        CAM1: T_robotA_cam1,
+        CAM2: T_robotA_cam2,
+        CAM3: T_robotA_cam3,
+    }
+    out_path_robot_a = Path(OUT_YAML_ROBOT_A_FRAME)
+    if out_path_robot_a.exists():
+        backup_a = out_path_robot_a.with_suffix(".yaml.bak")
+        backup_a.write_text(out_path_robot_a.read_text())
+        print(f"Backed up existing YAML to: {backup_a}")
+    save_extrinsics_yaml(out_path_robot_a, out_robot_a)
+    print(f"Wrote robot_a-frame camera extrinsics (reference only) to: {out_path_robot_a}")
+
     print(f"Saved debug corner images to: {debug_dir}")
 
     node.destroy_node()

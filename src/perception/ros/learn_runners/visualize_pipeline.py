@@ -652,7 +652,7 @@ class FoundationPoseExternalVisualizer(Node):
             # Object axes from the camera-frame pose.
             # IMPORTANT: pose_camera is already camera <- object.
             # Do NOT invert it.
-            T_cam_obj = pose_msg_to_T(item.pose_camera)
+            T_cam_obj = pose_msg_to_T(item.pose_camera.pose)
 
             draw_axes_from_pose_inplace(
                 out,
@@ -664,7 +664,7 @@ class FoundationPoseExternalVisualizer(Node):
             )
 
             if self.T_base_cam is not None:
-                T_base_obj = pose_msg_to_T(item.pose_base)
+                T_base_obj = pose_msg_to_T(item.pose_base.pose)
 
                 draw_base_axes_at_object_origin_inplace(
                     out,
@@ -718,13 +718,16 @@ class FoundationPoseExternalVisualizer(Node):
 
         for i, item in enumerate(dbg.pose_items):
             color = self.palette[i % len(self.palette)]
+            # part_id disambiguates multiple instances of the same part within
+            # an assembly (e.g. plumbers_block screw slots 1 vs 4).
+            label = f"{item.assembly_name}/{item.part_id}" if item.assembly_name else str(item.part_id)
 
             if item.has_bbox:
                 bbox = tuple(int(v) for v in item.bbox_xyxy)
                 draw_bbox_label_inplace(
                     out,
                     bbox,
-                    f"{item.object_id} {item.mode}",
+                    f"{label} {item.mode}",
                     color,
                     font_scale=0.6,
                 )
@@ -732,8 +735,8 @@ class FoundationPoseExternalVisualizer(Node):
                 if item.has_mask:
                     overlay_mask_crop_in_bbox(out, bbox, item.mask, color, alpha=0.18)
 
-            T_base = pose_msg_to_T(item.pose_base)
-            draw_pose_text_inplace(out, item.object_id, item.score, T_base, item.mode, i)
+            T_base = pose_msg_to_T(item.pose_base.pose)
+            draw_pose_text_inplace(out, label, item.score, T_base, item.mode, i)
 
             if dbg.show_axes:
                 self._draw_object_and_base_axes(
@@ -824,13 +827,14 @@ class FoundationPoseExternalVisualizer(Node):
 
         # Pose axes + text for each tracked object.
         for i, item in enumerate(dbg.pose_items):
-            T_base = pose_msg_to_T(item.pose_base)
+            T_base = pose_msg_to_T(item.pose_base.pose)
             t = T_base[:3, 3]
 
             y_start = 100 + i * 96
+            label = f"{item.assembly_name}/{item.part_id}" if item.assembly_name else str(item.part_id)
 
             text_lines = [
-                f"[{i}] {item.mode}: {item.object_id}",
+                f"[{i}] {item.mode}: {label}",
                 f"  base: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]",
             ]
 

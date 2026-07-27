@@ -17,6 +17,28 @@ MUSE_JOINT_SCORE_ALPHA = 0.8
 MUSE_TAU = 0.02
 MUSE_OBJECTNESS_PRIOR_GAMMA = 0.1
 
+# Known assembly subfolder names under a reference root (e.g. Data/ZED_screens).
+# Objects belonging to an assembly are one level deeper than standalone objects:
+#   Data/ZED_screens/cooling_manifold/cooling_screw/*.png   (assembly-grouped)
+#   Data/ZED_screens/blue_cube/*.png                        (standalone)
+ASSEMBLY_DIR_NAMES = {"cooling_manifold", "plumbers_block"}
+
+
+def _iter_object_dirs(root: Path):
+    """Yield (object_id, object_dir) pairs directly under root.
+
+    Descends one extra level into known assembly subfolders so that objects
+    grouped by assembly (e.g. root/cooling_manifold/cooling_screw) are
+    reported with their part-level object_id ("cooling_screw"), not the
+    assembly folder name.
+    """
+    for p in sorted(child for child in root.iterdir() if child.is_dir()):
+        if p.name in ASSEMBLY_DIR_NAMES:
+            for object_dir in sorted(child for child in p.iterdir() if child.is_dir()):
+                yield object_dir.name, object_dir
+        else:
+            yield p.name, p
+
 
 @dataclass
 class DINOIdentifierConfig:
@@ -193,7 +215,7 @@ class DINOIdentifier:
                 # Verify cache matches current folder structure (across all roots).
                 current_paths = []
                 for r in roots:
-                    for object_dir in sorted(p for p in r.iterdir() if p.is_dir()):
+                    for _object_id, object_dir in _iter_object_dirs(r):
                         for img_path in sorted(object_dir.iterdir()):
                             if img_path.suffix.lower() in self.cfg.allowed_exts:
                                 current_paths.append(str(img_path))
@@ -232,8 +254,7 @@ class DINOIdentifier:
 
         # One subfolder per object_id; embed every image inside it.
         for r in roots:
-          for object_dir in sorted(p for p in r.iterdir() if p.is_dir()):
-            object_id = object_dir.name
+          for object_id, object_dir in _iter_object_dirs(r):
             for img_path in sorted(object_dir.iterdir()):
                 if img_path.suffix.lower() not in self.cfg.allowed_exts:
                     continue

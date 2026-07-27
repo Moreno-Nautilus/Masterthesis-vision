@@ -203,19 +203,27 @@ tees the log to `outputs/logs/`.
 
 ### The output — the live ROS pose stream
 
-**This is the part other students consume.** For every tracked object the node
-publishes a base-frame `geometry_msgs/PoseStamped` (frame `base`) on:
+**This is the part other students consume.** For every tracked/detected part
+the node publishes a base-frame `fp_debug_msgs/DebugPoseItem` (its
+`pose_base` field is a `geometry_msgs/PoseStamped`, frame `base`) on one
+shared topic:
 
 ```
-/perception/fp/pose_base/fused/<track_id>
+/perception/fp/pose_base/fused/assembly
 ```
+
+Every part gets its own message on this topic — there is no per-object topic
+name to look up. A message is identified by its `assembly_name` (e.g.
+`plumbers_block`) and `part_id` (an int matching the Fabrica part-slot
+convention in `Data/assembly_part_ids.json`, e.g. `pb_screw` might be part_id
+`1` or `4` depending on which physical screw it is). Subscribe once and filter
+by `assembly_name`/`part_id` in your callback.
 
 Subscribe to it from your own ROS node, or inspect it from a sourced ROS shell:
 
 ```bash
 source /opt/ros/humble/setup.bash
-ros2 topic list | grep /perception/fp/pose_base     # list the per-object topics
-ros2 topic echo /perception/fp/pose_base/fused/<track_id>
+ros2 topic echo /perception/fp/pose_base/fused/assembly
 ```
 
 Visual confirmation (not the interface, just for checking):

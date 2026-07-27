@@ -34,10 +34,10 @@
         "/debug/base_pose_axes": {
           "visible": true,
           "namespaces": {
-            "perception/fp/pose_base/fused/cooling_screw_inst0": {
+            "perception/fp/pose_base/fused/assembly/cooling_manifold/2": {
               "visible": true
             },
-            "perception/fp/pose_base/fused/cooling_screw_inst1": {
+            "perception/fp/pose_base/fused/assembly/cooling_manifold/3": {
               "visible": true
             }
           }

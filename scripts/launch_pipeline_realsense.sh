@@ -18,6 +18,10 @@
 #   scripts/launch_pipeline_realsense.sh baseline          # alias for init-only
 #   scripts/launch_pipeline_realsense.sh --debug-logging   # runs pipeline runner with given args
 #
+# Pass --disable-debug-frames after a track preset to skip building/publishing
+# fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/* topics),
+# e.g. scripts/launch_pipeline_realsense.sh fast-track --disable-debug-frames
+#
 # Override the container name via env var:
 #   CONTAINER=other-container scripts/launch_pipeline_realsense.sh
 
@@ -25,7 +29,7 @@ set -euo pipefail
 
 CONTAINER="${CONTAINER:-vision}"
 
-SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros-thesis-venv/bin/activate && source /workspace/Masterthesis-vision/install/setup.bash && cd /workspace/Masterthesis-vision'
+SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/thesis-venv/bin/activate && source /workspace/MasterThesis/install/setup.bash && cd /workspace/MasterThesis'
 
 COMMON_ARGS=(
     --num-cameras 3
@@ -108,6 +112,17 @@ usage() {
     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
+DISABLE_DEBUG_FRAMES=0
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--disable-debug-frames" ]; then
+        DISABLE_DEBUG_FRAMES=1
+    else
+        ARGS+=("$arg")
+    fi
+done
+set -- "${ARGS[@]}"
+
 MODE_NAME=""
 MODE_LOG=""
 case "${1:-}" in
@@ -134,6 +149,10 @@ case "${1:-}" in
         set -- "${ACCURATE_TRACK_ARGS[@]}" "$@"
         ;;
 esac
+
+if (( DISABLE_DEBUG_FRAMES )); then
+    set -- "$@" --no-debug-frame-publish
+fi
 
 echo "[*] restarting container: $CONTAINER"
 docker stop "$CONTAINER" >/dev/null

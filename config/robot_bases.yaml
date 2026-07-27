@@ -1,0 +1,26 @@
+# Named robot bases, all expressed in a common reference frame (robot_a's
+# base frame, taken as the world/reference origin).
+#
+# Robot A and Robot B share the same base coordinate-frame convention (same
+# axis orientation), but Robot B's base is physically offset from Robot A's
+# by a fixed, hand-measured translation.
+#
+# `active_robot` selects which entry the calibration scripts in
+# src/calibration/ operate against: whatever robot is physically connected
+# and streaming tf (lbr_link_0 / lbr_link_ee) is the one you should point
+# this at. Every calibration output (config/base_board_pose.yaml,
+# config/camera_extrinsics_realsense.yaml) is expressed directly in that
+# active robot's own lbr_link_0 frame — this file's role is only to record
+# how that frame relates to the other robot's, for when results need to be
+# compared/transformed across robots.
+
+active_robot: robot_b
+
+bases:
+  robot_a:
+    translation_xyz_m: [0.0, 0.0, 0.0]
+    rotation_rpy_deg: [0.0, 0.0, 0.0]
+
+  robot_b:
+    translation_xyz_m: [0.0, 0.84, 0.0]
+    rotation_rpy_deg: [0.0, 0.0, 0.0]
