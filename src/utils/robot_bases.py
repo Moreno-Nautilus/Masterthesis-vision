@@ -62,3 +62,18 @@ def get_active_robot_base(path: str | Path = ROBOT_BASES_YAML) -> tuple[str, SE3
     active = str(cfg["active_robot"])
     bases = load_robot_bases(path)
     return active, bases[active]
+
+
+def get_dual_arm_base_link(path: str | Path = ROBOT_BASES_YAML) -> SE3:
+    """Returns T_robotA_baseLink: the dual-arm bringup's `base_link` frame
+    (the physical midpoint between robot_a's and robot_b's bases, oriented
+    the same as both -- see lbr_dual_arm.xacro, which mounts each arm at
+    +/-0.42 m in Y off a shared `base_link`), expressed in robot_a's frame.
+
+    Computed as the midpoint of robot_a and robot_b rather than hard-coded,
+    so it stays correct if robot_bases.yaml's measured offset is ever
+    recalibrated.
+    """
+    bases = load_robot_bases(path)
+    t_mid = 0.5 * (bases["robot_a"].t + bases["robot_b"].t)
+    return SE3(bases["robot_a"].R, t_mid)

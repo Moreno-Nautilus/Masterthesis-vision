@@ -22,11 +22,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Header
+from std_srvs.srv import SetBool, Trigger
 from fp_debug_msgs.msg import DebugCandidate, DebugFrame, DebugMaskCrop, DebugPoseItem
 from concurrent.futures import ThreadPoolExecutor
 
 from src.calibration.io_extrinsics import load_extrinsics_yaml
-from src.utils.robot_bases import get_active_robot_base
+from src.utils.robot_bases import get_active_robot_base, get_dual_arm_base_link
 from src.perception.learned.DINO.dino_identifier import (
     DINOIdentifier,
     DINOIdentifierConfig,
@@ -1113,11 +1114,23 @@ class FoundationPoseTrackerNode(Node):
                     DebugFrame, f"/perception/fp/debug_frame/{cid}", FAST_QOS
                 )
 
+        # All models are loaded above and stay resident for the node's lifetime.
+        # `_tracking_active` gates only the tick's detect/track work, so start/stop
+        # via the services below never touches SAM/DINO/GDINO/FoundationPose/Cutie.
+        self._tracking_active = not bool(getattr(args, "start_paused", False))
+        self._set_tracking_active_srv = self.create_service(
+            SetBool, "~/set_tracking_active", self._on_set_tracking_active
+        )
+        self._reset_tracking_srv = self.create_service(
+            Trigger, "~/reset_tracking", self._on_reset_tracking
+        )
+
         # Timer drives the init/track state machine; the grabber runs in the same executor.
         self.timer = self.create_timer(args.timer_period_s, self._tick)
         self.get_logger().info(
             f"FoundationPoseTrackerNode started | run_mode={self.args.run_mode} "
-            f"profile={getattr(self.args, 'tracking_profile', None) or 'none'}"
+            f"profile={getattr(self.args, 'tracking_profile', None) or 'none'} "
+            f"tracking_active={self._tracking_active}"
         )
         self._fused_warmup_count = {}       # track_id -> frames since init
         self._median_pose_buffers = {}      # track_id -> MedianPoseBuffer
@@ -4482,8 +4495,58 @@ class FoundationPoseTrackerNode(Node):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _clear_all_tracking_state(self, stamp) -> None:
+        """Drop every track's state/memory/planning-scene entry without touching
+        any loaded model (SAM/DINO/GDINO/FoundationPose/Cutie weights stay resident)."""
+        all_track_ids = {
+            s.track_id
+            for states in self.track_states.values()
+            for s in states
+            if getattr(s, "track_id", "")
+        }
+        for cid in list(self.track_states.keys()):
+            self.track_states[cid] = []
+        self._drop_realtime_trackers_for_track_ids(all_track_ids)
+        self._remove_planning_scene_objects(all_track_ids, stamp)
+        for tid in all_track_ids:
+            self._fused_lost_count.pop(tid, None)
+            self._fused_pose_status.pop(tid, None)
+            self._fused_last_drop_reasons.pop(tid, None)
+            self._fused_warmup_count.pop(tid, None)
+            self._fused_track_memory.pop(tid, None)
+            self._median_pose_buffers.pop(tid, None)
+            self._fused_translation_kalman.pop(tid, None)
+            self._part_id_assigner.release(tid)
+            self._track_id_to_object_id.pop(tid, None)
+        self._force_reinit_tracks.clear()
+
+    def _on_set_tracking_active(self, request, response):
+        """SetBool service: start (True) or stop (False) the tick's detect/track
+        work in place. Models stay loaded, so restarting is instant."""
+        was_active = self._tracking_active
+        self._tracking_active = bool(request.data)
+        if was_active and not self._tracking_active:
+            self._clear_all_tracking_state(self.get_clock().now().to_msg())
+            self.get_logger().info("Tracking stopped (models kept resident)")
+        elif not was_active and self._tracking_active:
+            self.get_logger().info("Tracking (re)started")
+        response.success = True
+        response.message = f"tracking_active={self._tracking_active}"
+        return response
+
+    def _on_reset_tracking(self, request, response):
+        """Trigger service: clear all track state/identities without changing
+        the start/stop flag, so the next active tick re-runs multicam init."""
+        self._clear_all_tracking_state(self.get_clock().now().to_msg())
+        self.get_logger().info("Tracking state reset")
+        response.success = True
+        response.message = "tracking state cleared"
+        return response
+
     def _tick(self) -> None:
         """Timer callback: choose tracking vs reinit for the latest synchronized views."""
+        if not self._tracking_active:
+            return
         if self.busy:
             return
         views = self.grabber.get_latest_views()
@@ -4594,6 +4657,11 @@ def parse_args() -> argparse.Namespace:
         default="cooling base,cooling f,cooling screw,pb base,pb pipe,pb screw,pb top",
     )
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
+    p.add_argument(
+        "--start-paused", action="store_true",
+        help="Load all models but don't start ticking; call the "
+             "~/set_tracking_active service (std_srvs/SetBool) to begin.",
+    )
     p.add_argument(
         "--tracking-profile",
         choices=["fast_cutie"],
@@ -4730,12 +4798,12 @@ def parse_args() -> argparse.Namespace:
     # Soft DINO label penalty (meters of extra matching cost for a full label
     # disagreement)
     p.add_argument("--fusion-match-label-penalty-m", type=float, default=0.0)
-    p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.18)
-    p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.015)
+    p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.1)
+    p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.1)
 
     # Fused pose acceptance gates after ICP.
-    p.add_argument("--fused-track-min-fused-icp-fitness", type=float, default=0.12)
-    p.add_argument("--fused-track-max-fused-icp-rmse-m", type=float, default=0.012)
+    p.add_argument("--fused-track-min-fused-icp-fitness", type=float, default=0.1)
+    p.add_argument("--fused-track-max-fused-icp-rmse-m", type=float, default=0.15)
     p.add_argument("--fused-track-nominal-dt-s", type=float, default=0.15)
     p.add_argument("--fused-track-min-dt-s", type=float, default=0.10)
     p.add_argument("--fused-track-max-dt-s", type=float, default=0.30)
@@ -4752,8 +4820,8 @@ def parse_args() -> argparse.Namespace:
     # Tracking uses a tight init from the previous frame
     p.add_argument("--fused-track-icp-max-iteration", type=int, default=15)
     # Adaptive early-stop tolerances for tracking ICP
-    p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
-    p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
+    p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-1)
+    p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-1)
 
     # Optional fast-motion recovery: translate the ICP seed from agreeing cloud centroids.
     p.add_argument("--fused-track-centroid-recovery", action="store_true",
@@ -4871,7 +4939,7 @@ def parse_args() -> argparse.Namespace:
     # Conditional chamfer thresholds. Skip chamfer when both fitness/rmse are
     # already clean and motion is small.
     p.add_argument("--chamfer-skip-fitness-min", type=float, default=0.30)
-    p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.005)
+    p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.15)
     p.add_argument("--chamfer-skip-motion-max-m", type=float, default=0.010)
     p.add_argument("--chamfer-every-n-frames", type=int, default=1,
                    help="Run non-clean tracking Chamfer gate every N frames. 1 checks every eligible frame.")
@@ -4949,14 +5017,18 @@ def main() -> None:
     T_map = load_extrinsics_yaml("config/camera_extrinsics_base.yaml")
     # camera_extrinsics_base.yaml is calibrated in whichever robot was active
     # at calibration time (config/robot_bases.yaml); shift every static
-    # camera-to-base pose into robot_a's frame (global reference) here, once,
-    # before either the grabber or the tracker node reads T_map.
+    # camera-to-base pose into the dual-arm bringup's base_link frame (the
+    # midpoint between robot_a and robot_b, oriented like robot_a -- see
+    # get_dual_arm_base_link()) here, once, before either the grabber or the
+    # tracker node reads T_map.
     active_robot, T_robotA_activeRobot = get_active_robot_base()
+    T_robotA_baseLink = get_dual_arm_base_link()
+    T_baseLink_activeRobot = T_robotA_baseLink.inverse().compose(T_robotA_activeRobot)
     print(
         f"[PIPELINE] active_robot={active_robot} (config/robot_bases.yaml) -- "
-        f"static extrinsics shifted to robot_a's frame (global reference)"
+        f"static extrinsics shifted to the dual-arm base_link frame (global reference)"
     )
-    T_map = {cam_id: T_robotA_activeRobot.compose(T) for cam_id, T in T_map.items()}
+    T_map = {cam_id: T_baseLink_activeRobot.compose(T) for cam_id, T in T_map.items()}
     cameras = select_cameras(args.num_cameras)
     print(f"[PIPELINE] Using {len(cameras)} cameras: {[c.cam_id for c in cameras]}")
     grabber = MultiCamGrabber(

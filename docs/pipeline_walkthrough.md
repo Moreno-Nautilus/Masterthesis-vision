@@ -123,6 +123,76 @@ From [scripts/launch_pipeline.sh](../scripts/launch_pipeline.sh):
 5. **One shared FoundationPose wrapper** (one estimator, one nvdiffrast CUDA
    context, one GPU worker thread); the first mesh is pre-cached.
 6. A ROS **timer** at `--timer-period-s = 0.05 s` fires `_tick`.
+7. Two **control services** are advertised (see [Start/stop control](#startstop-control-without-reloading-models) below)
+   so tracking can be stopped and restarted without repeating Stages 0–1.
+
+## Start/stop control without reloading models
+
+Stages 0–1 above (process launch + model loading) are the expensive part — SAM,
+DINO, Grounding-DINO, and FoundationPose all load and warm up on the GPU once,
+in `FoundationPoseTrackerNode.__init__`. Ctrl-C-ing the process throws all of
+that away and pays for it again on the next launch.
+
+Instead, the node stays running and exposes two ROS2 services (`std_srvs`,
+no custom message types) that only touch the per-tick state, never the
+loaded models:
+
+| Service | Type | Effect |
+|---|---|---|
+| `/foundationpose_tracker/set_tracking_active` | `std_srvs/srv/SetBool` | `data: false` stops `_tick` from doing any detect/track work and clears all track state (Cutie/ICP memory, planning-scene objects, part-id claims). `data: true` resumes — the next tick re-runs multicam init since all state was cleared. |
+| `/foundationpose_tracker/reset_tracking` | `std_srvs/srv/Trigger` | Clears all track state (same cleanup as stopping) without changing whether ticking is active. Useful to force a fresh re-init while staying "running". |
+
+```bash
+# stop tracking, keep all models resident
+ros2 service call /foundationpose_tracker/set_tracking_active std_srvs/srv/SetBool "{data: false}"
+
+# resume — instant, no model reload
+ros2 service call /foundationpose_tracker/set_tracking_active std_srvs/srv/SetBool "{data: true}"
+
+# force a re-init without stopping
+ros2 service call /foundationpose_tracker/reset_tracking std_srvs/srv/Trigger {}
+```
+
+Pass `--start-paused` on launch to load everything but leave `_tracking_active`
+`False` until the first `set_tracking_active` call.
+
+### Keyboard control (local debugging)
+
+Instead of typing `ros2 service call` each time, a small helper node maps
+single keypresses to the services above:
+
+```
+s   start tracking   (set_tracking_active: true)
+x   stop tracking    (set_tracking_active: false)
+r   reset tracking   (reset_tracking, clears state without stopping)
+q   quit this tool (pipeline keeps running)
+```
+
+`scripts/launch_pipeline.sh` starts this automatically: any named preset
+(`init-only`/`fast-track`/`accurate-track`/`baseline`) launches inside a tmux
+session with two windows — `run` (the pipeline, same as before) and `keys`
+(the keyboard helper, already running). Switch with `Ctrl+b` then `0`/`1`;
+detach without killing anything with `Ctrl+b d`. Reattach later with
+`scripts/launch_pipeline.sh attach`; tear the whole session down with
+`scripts/launch_pipeline.sh stop`.
+
+To run it by hand instead (e.g. against a node not launched via the script):
+
+```bash
+python3 -m src.perception.ros.tracking_keyboard_control
+# add --node-name <name> if the tracker was launched under a different node name
+```
+
+It only calls the same two services — no shared state, no effect on the
+pipeline process if you kill it. Needs a real interactive terminal (raw
+keypress mode via `termios`/`tty`), same caveat as `docker exec -it`.
+
+Implementation: `_tracking_active` flag checked at the top of `_tick`
+(Stage 2), `_on_set_tracking_active` / `_on_reset_tracking` service callbacks,
+and `_clear_all_tracking_state` for the shared cleanup — all in
+[run_pipeline_track_multicam.py](../src/perception/ros/learn_runners/run_pipeline_track_multicam.py).
+Keyboard helper:
+[tracking_keyboard_control.py](../src/perception/ros/tracking_keyboard_control.py).
 
 ## Stage 2 — Per-tick dispatch (`_tick`)
 

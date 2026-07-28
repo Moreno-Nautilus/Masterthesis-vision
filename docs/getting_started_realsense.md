@@ -140,6 +140,11 @@ scripts/launch_pipeline_realsense.sh init-only
 tracking complexity, easiest to sanity-check. (`fast-track` / `accurate-track`
 are available the same as the 3-ZED pipeline once this works — see §6.)
 
+This opens a tmux session (`mv_pipeline_realsense` by default) with two windows:
+`run` (the pipeline, attached by default) and `keys` (a keyboard helper for
+pausing/resuming tracking without reloading models — see §6). Switch windows
+with `Ctrl+b` then `0`/`1`; detach without killing anything with `Ctrl+b d`.
+
 ### Step 4 — confirm it's actually working
 
 A healthy startup log looks like this, in order:
@@ -180,9 +185,14 @@ Watch it in Foxglove the same way as the 3-ZED pipeline
 per-camera overlay topics exist for `zed2i_1`, `realsense_1`, `realsense_2` under
 the same `/perception/fp/...` naming pattern.
 
-**To stop**: `Ctrl+C` in the pipeline terminal, then
-`scripts/launch_host_realsense.sh stop` for the host stack. If you started a
-placeholder `static_transform_publisher` in Step 1, `Ctrl+C` that too.
+**To stop for good**: `scripts/launch_pipeline_realsense.sh stop` (kills the
+whole tmux session, both windows), then `scripts/launch_host_realsense.sh stop`
+for the host stack. If you started a placeholder `static_transform_publisher`
+in Step 1, `Ctrl+C` that too.
+
+**To pause/resume without reloading models** (SAM/DINO/GDINO/FoundationPose/Cutie
+all take a while to load and warm up): switch to the `keys` tmux window (`Ctrl+b
+1`) and press `x`/`s` instead of stopping the session — see §6 below.
 
 ---
 
@@ -569,7 +579,10 @@ scripts/launch_pipeline_realsense.sh accurate-track    # detect once, then accur
 These restart the same `vision` container as the 3-ZED scripts (same `CONTAINER`
 env var override applies) and run
 `src.perception.ros.learn_runners.run_pipeline_track_multicam_realsense` instead of
-the original module. Logs land in `outputs/logs/*_realsense*`.
+the original module. Logs land in `outputs/logs/*_realsense*`. Each opens a tmux
+session (default name `mv_pipeline_realsense`, override with `SESSION=...`) with
+a `run` window (the pipeline) and a `keys` window (keyboard start/stop/reset
+control, see below); `... stop` / `... attach` manage that session.
 
 Extra flags specific to this variant (on top of everything in
 [getting_started.md §6](getting_started.md#6-experimenting-with-flags)):
@@ -581,6 +594,41 @@ Extra flags specific to this variant (on top of everything in
 
 `--num-cameras` is fixed to `3` for this variant (1 ZED + 2 RealSense, always all
 three) — passing anything else raises an error at startup.
+
+### Start/stop control without reloading models
+
+Same as the 3-ZED pipeline (see
+[pipeline_walkthrough.md](pipeline_walkthrough.md#startstop-control-without-reloading-models)):
+model loading (SAM, DINO, GDINO, FoundationPose, Cutie) happens once at startup
+and is the expensive part, so prefer these services over `Ctrl+C` when you just
+want to pause/resume tracking.
+
+| Service | Type | Effect |
+|---|---|---|
+| `/foundationpose_tracker/set_tracking_active` | `std_srvs/srv/SetBool` | `data: false` stops ticking and clears all track state. `data: true` resumes (re-runs multicam init on the next tick). |
+| `/foundationpose_tracker/reset_tracking` | `std_srvs/srv/Trigger` | Clears all track state without stopping — forces a fresh re-init while staying "running". |
+
+```bash
+# stop tracking, keep all models resident
+ros2 service call /foundationpose_tracker/set_tracking_active std_srvs/srv/SetBool "{data: false}"
+
+# resume — instant, no model reload
+ros2 service call /foundationpose_tracker/set_tracking_active std_srvs/srv/SetBool "{data: true}"
+
+# force a re-init without stopping
+ros2 service call /foundationpose_tracker/reset_tracking std_srvs/srv/Trigger {}
+```
+
+Pass `--start-paused` to load everything but leave tracking inactive until the
+first `set_tracking_active` call.
+
+`scripts/launch_pipeline_realsense.sh` already starts
+`src.perception.ros.tracking_keyboard_control` for you in the `keys` tmux
+window (mapping `s`/`x`/`r` to these same services — see
+[pipeline_walkthrough.md](pipeline_walkthrough.md#keyboard-control-local-debugging)).
+Switch to it with `Ctrl+b 1`. To run it by hand elsewhere it works unchanged
+against this variant (same node name, `foundationpose_tracker`); no
+`--node-name` override needed.
 
 ---
 
