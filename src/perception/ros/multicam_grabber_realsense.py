@@ -45,9 +45,20 @@ class DynamicCameraTopics(CameraTopics):
     is_dynamic=True means the YAML entry for this cam_id holds a
     camera-to-FLANGE offset instead of a camera-to-base transform; the
     live camera-to-base extrinsic is computed each frame from the most
-    recent flange PoseStamped message.
+    recent flange PoseStamped message on this camera's own
+    flange_pose_topic (each dynamic camera is mounted on a different arm
+    in the dual-LBR rig, so each needs its own flange pose stream -- see
+    ALL_CAMERAS in run_pipeline_track_multicam_realsense.py).
+
+    robot_base_key selects which entry of config/robot_bases.yaml this
+    camera's flange pose (published in ITS OWN arm's lbr_*_link_0 frame)
+    must be shifted by to land in robot_a's frame, matching how the static
+    T_map entries are shifted by the active robot's base in
+    get_active_robot_base().
     """
     is_dynamic: bool = False
+    flange_pose_topic: Optional[str] = None
+    robot_base_key: Optional[str] = None
 
 
 def _pose_msg_to_se3(msg: PoseStamped) -> SE3:
@@ -81,12 +92,13 @@ class _FlangeComposedExtrinsicsMap:
     ):
         self._static_map = static_map
         self._dynamic_cam_ids = set(dynamic_cam_ids)
-        # Callable[[], Optional[SE3]] returning the latest T_base_flange.
+        # Callable[[str], Optional[SE3]] returning the latest T_base_flange
+        # for a given cam_id (each dynamic camera has its own flange pose).
         self._flange_pose_provider = flange_pose_provider
 
     def _resolve(self, cam_id: str) -> Optional[SE3]:
         if cam_id in self._dynamic_cam_ids:
-            T_base_flange = self._flange_pose_provider()
+            T_base_flange = self._flange_pose_provider(cam_id)
             if T_base_flange is None:
                 return None
             T_flange_cam = self._static_map[cam_id]
@@ -122,9 +134,9 @@ class MultiCamGrabberRealsense(Node):
         use_best_effort_if_unsynced: bool = True,
         static_extrinsics_base_cam: Optional[dict[str, SE3]] = None,
         rgb_depth_max_dt_s: float = 0.10,
-        flange_pose_topic: str = "/iiwa/ee_pose",
         flange_pose_max_age_s: float = 0.25,
         T_robotA_activeRobot: Optional[SE3] = None,
+        robot_bases: Optional[dict[str, SE3]] = None,
     ):
         super().__init__("multicam_grabber_realsense")
 
@@ -136,12 +148,19 @@ class MultiCamGrabberRealsense(Node):
         # None = leave everything in whichever robot is physically connected's
         # frame (old behavior). If given, static (non-dynamic) entries -- true
         # base-frame poses -- are shifted into robot_a's frame at load time,
-        # and the live flange pose is shifted the same way on receipt
-        # (_on_flange_pose), so the static zed2i_1 lookup and the live
-        # T_base_flange(t) @ T_flange_cam composition stay in the same frame.
+        # so the static zed2i_1 lookup and the live T_base_flange(t) @
+        # T_flange_cam composition stay in the same frame.
         # T_flange_cam entries (dynamic cams) are camera-to-FLANGE, not
         # base-frame, so they must NOT be converted.
         self._T_robotA_activeRobot = T_robotA_activeRobot
+        # Per-dynamic-camera shift: each end-effector-mounted camera is
+        # bolted to a different arm (lbr_one/lbr_two in the dual-arm rig),
+        # so its live flange pose arrives already expressed in THAT arm's
+        # own lbr_*_link_0 frame and needs its own robot_bases.yaml entry
+        # (DynamicCameraTopics.robot_base_key) to land in robot_a's frame --
+        # a single global T_robotA_activeRobot is not enough once more than
+        # one arm is streaming flange poses at once.
+        self._robot_bases = robot_bases or {}
 
         dynamic_ids = {c.cam_id for c in cameras if c.is_dynamic}
         raw_static_map = static_extrinsics_base_cam or {}
@@ -151,8 +170,8 @@ class MultiCamGrabberRealsense(Node):
                 for cam_id, T in raw_static_map.items()
             }
 
-        self._latest_flange_pose: Optional[SE3] = None
-        self._latest_flange_pose_wall_t: float = 0.0
+        self._latest_flange_pose: dict[str, SE3] = {}
+        self._latest_flange_pose_wall_t: dict[str, float] = {}
 
         self.T_base_cam_map = _FlangeComposedExtrinsicsMap(
             static_map=raw_static_map,
@@ -160,16 +179,30 @@ class MultiCamGrabberRealsense(Node):
             flange_pose_provider=self._get_flange_pose,
         )
 
-        if dynamic_ids:
+        self._flange_subs = []
+        for c in cameras:
+            if not c.is_dynamic:
+                continue
+            if not c.flange_pose_topic:
+                raise ValueError(
+                    f"cam_id={c.cam_id} is_dynamic=True but has no flange_pose_topic set"
+                )
+            if c.robot_base_key and c.robot_base_key not in self._robot_bases:
+                raise ValueError(
+                    f"cam_id={c.cam_id} robot_base_key={c.robot_base_key!r} not found in "
+                    f"robot_bases ({sorted(self._robot_bases)})"
+                )
             self.get_logger().info(
-                f"Subscribing flange pose topic={flange_pose_topic} "
-                f"for dynamic cameras={sorted(dynamic_ids)}"
+                f"Subscribing cam_id={c.cam_id} flange pose topic={c.flange_pose_topic} "
+                f"robot_base_key={c.robot_base_key}"
             )
-            self._flange_sub = self.create_subscription(
-                PoseStamped,
-                flange_pose_topic,
-                self._on_flange_pose,
-                qos_profile_sensor_data,
+            self._flange_subs.append(
+                self.create_subscription(
+                    PoseStamped,
+                    c.flange_pose_topic,
+                    lambda msg, cam_id=c.cam_id, key=c.robot_base_key: self._on_flange_pose(cam_id, key, msg),
+                    qos_profile_sensor_data,
+                )
             )
 
         # Buffers
@@ -223,20 +256,20 @@ class MultiCamGrabberRealsense(Node):
                 )
             )
 
-    def _on_flange_pose(self, msg: PoseStamped) -> None:
+    def _on_flange_pose(self, cam_id: str, robot_base_key: Optional[str], msg: PoseStamped) -> None:
         T = _pose_msg_to_se3(msg)
-        if self._T_robotA_activeRobot is not None:
-            T = self._T_robotA_activeRobot.compose(T)
-        self._latest_flange_pose = T
-        self._latest_flange_pose_wall_t = time.time()
+        if robot_base_key is not None:
+            T = self._robot_bases[robot_base_key].compose(T)
+        self._latest_flange_pose[cam_id] = T
+        self._latest_flange_pose_wall_t[cam_id] = time.time()
 
-    def _get_flange_pose(self) -> Optional[SE3]:
-        if self._latest_flange_pose is None:
+    def _get_flange_pose(self, cam_id: str) -> Optional[SE3]:
+        if cam_id not in self._latest_flange_pose:
             return None
-        age = time.time() - self._latest_flange_pose_wall_t
+        age = time.time() - self._latest_flange_pose_wall_t[cam_id]
         if age > self.flange_pose_max_age_s:
             return None
-        return self._latest_flange_pose
+        return self._latest_flange_pose[cam_id]
 
     # Subscription callbacks: stash each latest message (and its stamp / intrinsics) per camera.
     def _on_depth(self, cam_id: str, msg: Image) -> None:
@@ -265,7 +298,7 @@ class MultiCamGrabberRealsense(Node):
                 return False
             if c.cam_id not in self._K_rgb:
                 return False
-            if c.is_dynamic and self._get_flange_pose() is None:
+            if c.is_dynamic and self._get_flange_pose(c.cam_id) is None:
                 return False
         return True
 

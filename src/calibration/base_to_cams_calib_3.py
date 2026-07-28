@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,20 +15,25 @@ import yaml
 
 from src.utils.se3 import SE3
 from src.calibration.io_extrinsics import save_extrinsics_yaml
+from src.calibration.calibration_log import log_camera_transform
 from src.utils.robot_bases import get_active_robot_base
 
 
 # ---------------- USER SETTINGS ----------------
-CAM1 = "zed2i_1"
-CAM2 = "zed2i_2"
-CAM3 = "zed2i_3"
+# Default camera set: the original 3-ZED trio. --cam-ids on the CLI
+# overrides this with an arbitrary N>=1 list (e.g. --cam-ids zed2i_1 for the
+# 1-ZED rig in the RealSense-trio variant, see
+# scripts/calibrate_zed_from_board_pose.sh) -- ZED topic naming is
+# regular (zed_node/rgb/color/rect/...) so topics are derived from cam_id,
+# not hand-listed per camera like the old CAM1/CAM2/CAM3 constants were.
+DEFAULT_CAM_IDS = ["zed2i_1", "zed2i_2", "zed2i_3"]
 
-CAM1_RGB = "/zed2i_1/zed_node/rgb/color/rect/image"
-CAM2_RGB = "/zed2i_2/zed_node/rgb/color/rect/image"
-CAM3_RGB = "/zed2i_3/zed_node/rgb/color/rect/image"
-CAM1_INFO = "/zed2i_1/zed_node/rgb/color/rect/camera_info"
-CAM2_INFO = "/zed2i_2/zed_node/rgb/color/rect/camera_info"
-CAM3_INFO = "/zed2i_3/zed_node/rgb/color/rect/camera_info"
+
+def _zed_topics(cam_id: str) -> tuple[str, str]:
+    return (
+        f"/{cam_id}/zed_node/rgb/color/rect/image",
+        f"/{cam_id}/zed_node/rgb/color/rect/camera_info",
+    )
 
 CHESS_COLS = 8   # number of INNER corners along x
 CHESS_ROWS = 11  # number of INNER corners along y
@@ -46,14 +52,6 @@ INTER_SAMPLE_MIN_DT_S = 0.4     # avoid taking near-identical frames
 MAX_REPROJ_ERR_PX = 2.5        # reject single sample if too high
 MAX_FINAL_TRANSLATION_STD_M = 0.01
 MAX_FINAL_ROTATION_STD_DEG = 1.0
-
-# optional frame-id sanity checks; set to None to disable
-EXPECTED_CAM1_RGB_FRAME_ID = None   # e.g. "zed2i_1_left_camera_frame"
-EXPECTED_CAM2_RGB_FRAME_ID = None
-EXPECTED_CAM3_RGB_FRAME_ID = None
-EXPECTED_CAM1_INFO_FRAME_ID = None
-EXPECTED_CAM2_INFO_FRAME_ID = None
-EXPECTED_CAM3_INFO_FRAME_ID = None
 
 BASE_BOARD_YAML = "config/base_board_pose.yaml"
 OUT_YAML = "config/camera_extrinsics_base.yaml"
@@ -316,165 +314,100 @@ class CamState:
 
 
 class CheckerboardBaseCalib(Node):
-    def __init__(self):
+    """N-camera variant (N >= 1): every camera in `cam_ids` must see the
+    checkerboard in the same synced sample for that sample to be accepted.
+    cam_ids order is preserved throughout (accepted[i].T_base_cam[cam_id],
+    the printed report, and the output YAML all key off cam_id, not a fixed
+    cam1/cam2/cam3 slot)."""
+
+    def __init__(self, cam_ids: list[str]):
         super().__init__("checkerboard_base_to_cameras_calib")
+        self.cam_ids = list(cam_ids)
+        self.cams: dict[str, CamState] = {cam_id: CamState(name=cam_id) for cam_id in cam_ids}
 
-        self.cam1 = CamState(
-            name=CAM1,
-            expected_rgb_frame_id=EXPECTED_CAM1_RGB_FRAME_ID,
-            expected_info_frame_id=EXPECTED_CAM1_INFO_FRAME_ID,
-        )
-        self.cam2 = CamState(
-            name=CAM2,
-            expected_rgb_frame_id=EXPECTED_CAM2_RGB_FRAME_ID,
-            expected_info_frame_id=EXPECTED_CAM2_INFO_FRAME_ID,
-        )
-        self.cam3 = CamState(
-            name=CAM3,
-            expected_rgb_frame_id=EXPECTED_CAM3_RGB_FRAME_ID,
-            expected_info_frame_id=EXPECTED_CAM3_INFO_FRAME_ID,
-        )
+        for cam_id in cam_ids:
+            rgb_topic, info_topic = _zed_topics(cam_id)
+            self.create_subscription(
+                Image, rgb_topic, lambda msg, c=cam_id: self._on_img(c, msg), 10
+            )
+            self.create_subscription(
+                CameraInfo, info_topic, lambda msg, c=cam_id: self._on_info(c, msg), 10
+            )
 
-        # Subscribe each camera's RGB image and CameraInfo.
-        self.create_subscription(Image, CAM1_RGB, self._on_img1, 10)
-        self.create_subscription(Image, CAM2_RGB, self._on_img2, 10)
-        self.create_subscription(Image, CAM3_RGB, self._on_img3, 10)
-        self.create_subscription(CameraInfo, CAM1_INFO, self._on_info1, 10)
-        self.create_subscription(CameraInfo, CAM2_INFO, self._on_info2, 10)
-        self.create_subscription(CameraInfo, CAM3_INFO, self._on_info3, 10)
-
-    def _on_img1(self, msg: Image) -> None:
+    def _on_img(self, cam_id: str, msg: Image) -> None:
         try:
-            self.cam1.update_img(msg)
+            self.cams[cam_id].update_img(msg)
         except RuntimeError as e:
             self.get_logger().error(str(e))
 
-    def _on_img2(self, msg: Image) -> None:
+    def _on_info(self, cam_id: str, msg: CameraInfo) -> None:
         try:
-            self.cam2.update_img(msg)
-        except RuntimeError as e:
-            self.get_logger().error(str(e))
-
-    def _on_img3(self, msg: Image) -> None:
-        try:
-            self.cam3.update_img(msg)
-        except RuntimeError as e:
-            self.get_logger().error(str(e))
-
-    def _on_info1(self, msg: CameraInfo) -> None:
-        try:
-            self.cam1.update_info(msg)
-        except RuntimeError as e:
-            self.get_logger().error(str(e))
-
-    def _on_info2(self, msg: CameraInfo) -> None:
-        try:
-            self.cam2.update_info(msg)
-        except RuntimeError as e:
-            self.get_logger().error(str(e))
-
-    def _on_info3(self, msg: CameraInfo) -> None:
-        try:
-            self.cam3.update_info(msg)
+            self.cams[cam_id].update_info(msg)
         except RuntimeError as e:
             self.get_logger().error(str(e))
 
     def ready(self) -> bool:
-        return (
-            self.cam1.has_fresh_pair()
-            and self.cam2.has_fresh_pair()
-            and self.cam3.has_fresh_pair()
-        )
+        return all(self.cams[c].has_fresh_pair() for c in self.cam_ids)
 
-    def get_synced_triple(
-        self,
-    ) -> Optional[
-        Tuple[
-            np.ndarray, np.ndarray, np.ndarray,
-            np.ndarray, np.ndarray, np.ndarray,
-            float, float, float,
-        ]
-    ]:
+    def get_synced_set(self) -> Optional[dict[str, tuple[np.ndarray, np.ndarray, float]]]:
+        """Returns {cam_id: (img_bgr, K, rgb_info_dt_s)} if every camera has a
+        fresh RGB/info pair AND all cameras' images share one timestamp
+        window <= SYNC_SLOP_S; None otherwise."""
         if not self.ready():
             return None
 
-        # Per-camera RGB↔info must be fresh.
-        dt_cam1 = abs(self.cam1.img_t - self.cam1.info_t)
-        dt_cam2 = abs(self.cam2.img_t - self.cam2.info_t)
-        dt_cam3 = abs(self.cam3.img_t - self.cam3.info_t)
-        if dt_cam1 > RGB_INFO_MAX_DT_S or dt_cam2 > RGB_INFO_MAX_DT_S or dt_cam3 > RGB_INFO_MAX_DT_S:
+        img_ts = [self.cams[c].img_t for c in self.cam_ids]
+        dts = {c: abs(self.cams[c].img_t - self.cams[c].info_t) for c in self.cam_ids}
+        if any(dt > RGB_INFO_MAX_DT_S for dt in dts.values()):
             return None
 
-        # And the three cameras' images must share a timestamp window.
-        min_t = min(self.cam1.img_t, self.cam2.img_t, self.cam3.img_t)
-        max_t = max(self.cam1.img_t, self.cam2.img_t, self.cam3.img_t)
-        cross_dt = max_t - min_t
+        cross_dt = max(img_ts) - min(img_ts)
         if cross_dt > SYNC_SLOP_S:
             return None
 
-        img1 = _img_to_numpy_color(self.cam1.img_msg)
-        img2 = _img_to_numpy_color(self.cam2.img_msg)
-        img3 = _img_to_numpy_color(self.cam3.img_msg)
-        return (
-            img1, img2, img3,
-            self.cam1.K.copy(), self.cam2.K.copy(), self.cam3.K.copy(),
-            dt_cam1, dt_cam2, dt_cam3,
-        )
+        return {
+            c: (_img_to_numpy_color(self.cams[c].img_msg), self.cams[c].K.copy(), dts[c])
+            for c in self.cam_ids
+        }
 
     def print_status(self) -> None:
-        if self.cam1.img_t is not None and self.cam2.img_t is not None and self.cam3.img_t is not None:
-            cross_dt = max(self.cam1.img_t, self.cam2.img_t, self.cam3.img_t) - min(
-                self.cam1.img_t, self.cam2.img_t, self.cam3.img_t
-            )
-            self.get_logger().info(
-                f"rgb_cross_dt={cross_dt:.4f}s (limit {SYNC_SLOP_S:.4f}s)"
-            )
-        self.get_logger().info(
-            f"{CAM1}: rgb_count={self.cam1.rgb_count}, info_count={self.cam1.info_count}, "
-            f"img_frame_id={self.cam1.img_frame_id}, info_frame_id={self.cam1.info_frame_id}, "
-            f"rgb_info_dt={None if self.cam1.img_t is None or self.cam1.info_t is None else abs(self.cam1.img_t - self.cam1.info_t):.4f}s"
-            if (self.cam1.img_t is not None and self.cam1.info_t is not None)
-            else f"{CAM1}: waiting..."
-        )
-        self.get_logger().info(
-            f"{CAM2}: rgb_count={self.cam2.rgb_count}, info_count={self.cam2.info_count}, "
-            f"img_frame_id={self.cam2.img_frame_id}, info_frame_id={self.cam2.info_frame_id}, "
-            f"rgb_info_dt={None if self.cam2.img_t is None or self.cam2.info_t is None else abs(self.cam2.img_t - self.cam2.info_t):.4f}s"
-            if (self.cam2.img_t is not None and self.cam2.info_t is not None)
-            else f"{CAM2}: waiting..."
-        )
-        self.get_logger().info(
-            f"{CAM3}: rgb_count={self.cam3.rgb_count}, info_count={self.cam3.info_count}, "
-            f"img_frame_id={self.cam3.img_frame_id}, info_frame_id={self.cam3.info_frame_id}, "
-            f"rgb_info_dt={None if self.cam3.img_t is None or self.cam3.info_t is None else abs(self.cam3.img_t - self.cam3.info_t):.4f}s"
-            if (self.cam3.img_t is not None and self.cam3.info_t is not None)
-            else f"{CAM3}: waiting..."
-        )
+        img_ts = [self.cams[c].img_t for c in self.cam_ids if self.cams[c].img_t is not None]
+        if len(img_ts) == len(self.cam_ids):
+            cross_dt = max(img_ts) - min(img_ts)
+            self.get_logger().info(f"rgb_cross_dt={cross_dt:.4f}s (limit {SYNC_SLOP_S:.4f}s)")
+        for cam_id in self.cam_ids:
+            st = self.cams[cam_id]
+            if st.img_t is not None and st.info_t is not None:
+                self.get_logger().info(
+                    f"{cam_id}: rgb_count={st.rgb_count}, info_count={st.info_count}, "
+                    f"img_frame_id={st.img_frame_id}, info_frame_id={st.info_frame_id}, "
+                    f"rgb_info_dt={abs(st.img_t - st.info_t):.4f}s"
+                )
+            else:
+                self.get_logger().info(f"{cam_id}: waiting...")
 
 
 @dataclass
 class SampleResult:
     idx: int
-    T_cam1_board: SE3
-    T_cam2_board: SE3
-    T_cam3_board: SE3
-    T_base_cam1: SE3
-    T_base_cam2: SE3
-    T_base_cam3: SE3
-    reproj1_px: float
-    reproj2_px: float
-    reproj3_px: float
-    img1: np.ndarray
-    img2: np.ndarray
-    img3: np.ndarray
-    corners1: np.ndarray
-    corners2: np.ndarray
-    corners3: np.ndarray
+    T_cam_board: dict[str, SE3]
+    T_base_cam: dict[str, SE3]
+    reproj_px: dict[str, float]
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--cam-ids", nargs="+", default=None,
+        help=f"Camera cam_ids to calibrate, e.g. --cam-ids zed2i_1 for a single-ZED rig. "
+             f"Topics are derived as /<cam_id>/zed_node/rgb/color/rect/{{image,camera_info}}. "
+             f"Defaults to the original 3-ZED trio {DEFAULT_CAM_IDS} if omitted.",
+    )
+    args = parser.parse_args()
+    cam_ids = args.cam_ids or DEFAULT_CAM_IDS
+
     rclpy.init()
-    node = CheckerboardBaseCalib()
+    node = CheckerboardBaseCalib(cam_ids)
 
     debug_dir = Path(DEBUG_DIR)
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -485,9 +418,9 @@ def main() -> None:
     print(T_base_board)
 
     print("")
-    print("=== Robust 3-camera base calibration ===")
-    print(f"Need {NUM_SAMPLES} accepted 3-camera samples")
-    print("Show the checkerboard to ALL THREE cameras and hold it steady.")
+    print(f"=== Robust {len(cam_ids)}-camera base calibration: {cam_ids} ===")
+    print(f"Need {NUM_SAMPLES} accepted {len(cam_ids)}-camera samples")
+    print(f"Show the checkerboard to {'ALL' if len(cam_ids) > 1 else 'THE'} camera(s) and hold it steady.")
     print("This script will reject stale, unsynced, or poor-quality captures.")
     print("")
 
@@ -497,190 +430,124 @@ def main() -> None:
     t_last_reject_print = 0.0
     last_accept_t = -1e9
 
-    # Collect NUM_SAMPLES good synced triples, solving the board pose in each.
+    # Collect NUM_SAMPLES good synced sets, solving the board pose in each.
     while len(accepted) < NUM_SAMPLES:
         rclpy.spin_once(node, timeout_sec=0.05)
 
         now = time.time()
         if now - t_start > MAX_WAIT_S:
-            raise RuntimeError("Timed out waiting for enough valid 3-camera captures.")
+            raise RuntimeError(f"Timed out waiting for enough valid {len(cam_ids)}-camera captures.")
 
         if now - t_last_print > PRINT_EVERY_S:
             print(f"[status] accepted {len(accepted)}/{NUM_SAMPLES}")
             node.print_status()
             t_last_print = now
 
-        triple = node.get_synced_triple()
-        if triple is None:
+        synced = node.get_synced_set()
+        if synced is None:
             continue
 
         # Space out samples so we don't average near-identical frames.
         if now - last_accept_t < INTER_SAMPLE_MIN_DT_S:
             continue
 
-        img1, img2, img3, K1, K2, K3, dt1, dt2, dt3 = triple
-
-        # Solve the board pose per camera; any failed detection rejects the whole triple.
-        try:
-            T_cam1_board, corners1, reproj1 = _solve_board_pose(img1, K1)
-        except RuntimeError as e:
-            if now - t_last_reject_print > 1.0:
-                print(f"[reject] {CAM1}: {e}")
-                t_last_reject_print = now
+        # Solve the board pose per camera; any failed detection rejects the whole set.
+        T_cam_board: dict[str, SE3] = {}
+        reproj_px: dict[str, float] = {}
+        corners_by_cam: dict[str, np.ndarray] = {}
+        rejected = False
+        for cam_id in cam_ids:
+            img, K, _dt = synced[cam_id]
+            try:
+                T_cam_board[cam_id], corners_by_cam[cam_id], reproj_px[cam_id] = _solve_board_pose(img, K)
+            except RuntimeError as e:
+                if now - t_last_reject_print > 1.0:
+                    print(f"[reject] {cam_id}: {e}")
+                    t_last_reject_print = now
+                rejected = True
+                break
+        if rejected:
             continue
 
-        try:
-            T_cam2_board, corners2, reproj2 = _solve_board_pose(img2, K2)
-        except RuntimeError as e:
-            if now - t_last_reject_print > 1.0:
-                print(f"[reject] {CAM2}: {e}")
-                t_last_reject_print = now
-            continue
-
-        try:
-            T_cam3_board, corners3, reproj3 = _solve_board_pose(img3, K3)
-        except RuntimeError as e:
-            if now - t_last_reject_print > 1.0:
-                print(f"[reject] {CAM3}: {e}")
-                t_last_reject_print = now
-            continue
-
-        # Reject the triple if any camera's reprojection error is too high.
-        if (
-            reproj1 > MAX_REPROJ_ERR_PX
-            or reproj2 > MAX_REPROJ_ERR_PX
-            or reproj3 > MAX_REPROJ_ERR_PX
-        ):
+        if any(r > MAX_REPROJ_ERR_PX for r in reproj_px.values()):
             print(
-                f"[reject] reproj too high: cam1={reproj1:.3f}px "
-                f"cam2={reproj2:.3f}px cam3={reproj3:.3f}px "
+                f"[reject] reproj too high: "
+                f"{ {c: round(r, 3) for c, r in reproj_px.items()} } "
                 f"(limit {MAX_REPROJ_ERR_PX:.3f}px)"
             )
             continue
 
         # T_base_cam = T_base_board · (T_cam_board)⁻¹ for each camera.
-        T_base_cam1 = T_base_board @ T_cam1_board.inverse()
-        T_base_cam2 = T_base_board @ T_cam2_board.inverse()
-        T_base_cam3 = T_base_board @ T_cam3_board.inverse()
+        T_base_cam = {c: T_base_board @ T_cam_board[c].inverse() for c in cam_ids}
 
         sample = SampleResult(
-            idx=len(accepted),
-            T_cam1_board=T_cam1_board,
-            T_cam2_board=T_cam2_board,
-            T_cam3_board=T_cam3_board,
-            T_base_cam1=T_base_cam1,
-            T_base_cam2=T_base_cam2,
-            T_base_cam3=T_base_cam3,
-            reproj1_px=reproj1,
-            reproj2_px=reproj2,
-            reproj3_px=reproj3,
-            img1=img1,
-            img2=img2,
-            img3=img3,
-            corners1=corners1,
-            corners2=corners2,
-            corners3=corners3,
+            idx=len(accepted), T_cam_board=T_cam_board, T_base_cam=T_base_cam, reproj_px=reproj_px,
         )
         accepted.append(sample)
         last_accept_t = now
 
-        print(
-            f"[accept {len(accepted)}/{NUM_SAMPLES}] "
-            f"rgb-info dt: cam1={dt1:.4f}s cam2={dt2:.4f}s cam3={dt3:.4f}s | "
-            f"reproj: cam1={reproj1:.3f}px cam2={reproj2:.3f}px cam3={reproj3:.3f}px"
-        )
+        dts_str = " ".join(f"{c}={synced[c][2]:.4f}s" for c in cam_ids)
+        reproj_str = " ".join(f"{c}={reproj_px[c]:.3f}px" for c in cam_ids)
+        print(f"[accept {len(accepted)}/{NUM_SAMPLES}] rgb-info dt: {dts_str} | reproj: {reproj_str}")
 
         # Save annotated corner images for visual inspection.
-        vis1 = _draw_chessboard(img1, corners1, f"{CAM1} sample {len(accepted)} reproj={reproj1:.3f}px")
-        vis2 = _draw_chessboard(img2, corners2, f"{CAM2} sample {len(accepted)} reproj={reproj2:.3f}px")
-        vis3 = _draw_chessboard(img3, corners3, f"{CAM3} sample {len(accepted)} reproj={reproj3:.3f}px")
-        cv2.imwrite(str(debug_dir / f"{CAM1}_sample_{len(accepted):02d}.png"), vis1)
-        cv2.imwrite(str(debug_dir / f"{CAM2}_sample_{len(accepted):02d}.png"), vis2)
-        cv2.imwrite(str(debug_dir / f"{CAM3}_sample_{len(accepted):02d}.png"), vis3)
+        for cam_id in cam_ids:
+            img, _K, _dt = synced[cam_id]
+            vis = _draw_chessboard(
+                img, corners_by_cam[cam_id],
+                f"{cam_id} sample {len(accepted)} reproj={reproj_px[cam_id]:.3f}px",
+            )
+            cv2.imwrite(str(debug_dir / f"{cam_id}_sample_{len(accepted):02d}.png"), vis)
 
     if len(accepted) < MIN_SAMPLES_TO_SOLVE:
         raise RuntimeError(f"Not enough accepted samples: {len(accepted)} < {MIN_SAMPLES_TO_SOLVE}")
 
     # Average each camera's extrinsic across all accepted samples.
-    base_cam1_poses = [s.T_base_cam1 for s in accepted]
-    base_cam2_poses = [s.T_base_cam2 for s in accepted]
-    base_cam3_poses = [s.T_base_cam3 for s in accepted]
-
-    T_base_cam1_avg, tstd1, rstd1 = _average_se3(base_cam1_poses)
-    T_base_cam2_avg, tstd2, rstd2 = _average_se3(base_cam2_poses)
-    T_base_cam3_avg, tstd3, rstd3 = _average_se3(base_cam3_poses)
-
-    reproj1_mean = float(np.mean([s.reproj1_px for s in accepted]))
-    reproj2_mean = float(np.mean([s.reproj2_px for s in accepted]))
-    reproj3_mean = float(np.mean([s.reproj3_px for s in accepted]))
-
-    # Relative camera transforms — a sanity check on inter-camera consistency.
-    T_cam1_cam2_check = T_base_cam1_avg.inverse() @ T_base_cam2_avg
-    T_cam1_cam3_check = T_base_cam1_avg.inverse() @ T_base_cam3_avg
+    T_base_cam_avg: dict[str, SE3] = {}
+    tstd: dict[str, float] = {}
+    rstd: dict[str, float] = {}
+    reproj_mean: dict[str, float] = {}
+    for cam_id in cam_ids:
+        poses = [s.T_base_cam[cam_id] for s in accepted]
+        T_base_cam_avg[cam_id], tstd[cam_id], rstd[cam_id] = _average_se3(poses)
+        reproj_mean[cam_id] = float(np.mean([s.reproj_px[cam_id] for s in accepted]))
 
     print("\n=== FINAL RESULTS ===")
     active_robot, T_robotA_activeRobot = get_active_robot_base()
-    T_robotA_cam1 = T_robotA_activeRobot.compose(T_base_cam1_avg)
-    T_robotA_cam2 = T_robotA_activeRobot.compose(T_base_cam2_avg)
-    T_robotA_cam3 = T_robotA_activeRobot.compose(T_base_cam3_avg)
+    T_robotA_cam = {c: T_robotA_activeRobot.compose(T_base_cam_avg[c]) for c in cam_ids}
 
-    print(f"\nT_base_cam1 (averaged, base = {active_robot}'s lbr_link_0):")
-    print(T_base_cam1_avg)
-    print(f"\nT_base_cam2 (averaged, base = {active_robot}'s lbr_link_0):")
-    print(T_base_cam2_avg)
-    print(f"\nT_base_cam3 (averaged, base = {active_robot}'s lbr_link_0):")
-    print(T_base_cam3_avg)
+    for cam_id in cam_ids:
+        print(f"\nT_base_{cam_id} (averaged, base = {active_robot}'s lbr_link_0):")
+        print(T_base_cam_avg[cam_id])
 
     print("\nSame poses in robot_a's frame (global reference):")
-    print(f"T_robotA_cam1:\n{T_robotA_cam1}")
-    print(f"T_robotA_cam2:\n{T_robotA_cam2}")
-    print(f"T_robotA_cam3:\n{T_robotA_cam3}")
+    for cam_id in cam_ids:
+        print(f"T_robotA_{cam_id}:\n{T_robotA_cam[cam_id]}")
 
     print("\nQuality metrics:")
-    print(f"cam1 mean reproj error: {reproj1_mean:.4f} px")
-    print(f"cam2 mean reproj error: {reproj2_mean:.4f} px")
-    print(f"cam3 mean reproj error: {reproj3_mean:.4f} px")
-    print(f"cam1 translation std:   {tstd1:.6f} m")
-    print(f"cam2 translation std:   {tstd2:.6f} m")
-    print(f"cam3 translation std:   {tstd3:.6f} m")
-    print(f"cam1 rotation std:      {rstd1:.6f} deg")
-    print(f"cam2 rotation std:      {rstd2:.6f} deg")
-    print(f"cam3 rotation std:      {rstd3:.6f} deg")
+    for cam_id in cam_ids:
+        print(f"{cam_id} mean reproj error: {reproj_mean[cam_id]:.4f} px")
+        print(f"{cam_id} translation std:   {tstd[cam_id]:.6f} m")
+        print(f"{cam_id} rotation std:      {rstd[cam_id]:.6f} deg")
 
-    print("\nConsistency T_cam1_cam2:")
-    print(T_cam1_cam2_check)
-    print("R det:", np.linalg.det(T_cam1_cam2_check.R), "valid:", T_cam1_cam2_check.is_valid())
-
-    print("\nConsistency T_cam1_cam3:")
-    print(T_cam1_cam3_check)
-    print("R det:", np.linalg.det(T_cam1_cam3_check.R), "valid:", T_cam1_cam3_check.is_valid())
+    # Relative camera transforms — a sanity check on inter-camera consistency
+    # (only meaningful with >= 2 cameras).
+    if len(cam_ids) >= 2:
+        ref = cam_ids[0]
+        print(f"\nConsistency checks relative to {ref}:")
+        for cam_id in cam_ids[1:]:
+            T_check = T_base_cam_avg[ref].inverse() @ T_base_cam_avg[cam_id]
+            print(f"T_{ref}_{cam_id}:\n{T_check}")
+            print("R det:", np.linalg.det(T_check.R), "valid:", T_check.is_valid())
 
     # Refuse to write a result whose sample spread is too loose to trust.
-    if (
-        tstd1 > MAX_FINAL_TRANSLATION_STD_M
-        or tstd2 > MAX_FINAL_TRANSLATION_STD_M
-        or tstd3 > MAX_FINAL_TRANSLATION_STD_M
-    ):
-        raise RuntimeError(
-            f"Calibration rejected: translation spread too high "
-            f"(cam1={tstd1:.6f}m, cam2={tstd2:.6f}m, cam3={tstd3:.6f}m)"
-        )
+    bad_t = {c: v for c, v in tstd.items() if v > MAX_FINAL_TRANSLATION_STD_M}
+    if bad_t:
+        raise RuntimeError(f"Calibration rejected: translation spread too high ({bad_t})")
 
-    if (
-        rstd1 > MAX_FINAL_ROTATION_STD_DEG
-        or rstd2 > MAX_FINAL_ROTATION_STD_DEG
-        or rstd3 > MAX_FINAL_ROTATION_STD_DEG
-    ):
-        raise RuntimeError(
-            f"Calibration rejected: rotation spread too high "
-            f"(cam1={rstd1:.6f}deg, cam2={rstd2:.6f}deg, cam3={rstd3:.6f}deg)"
-        )
-
-    out = {
-        CAM1: T_base_cam1_avg,
-        CAM2: T_base_cam2_avg,
-        CAM3: T_base_cam3_avg,
-    }
+    bad_r = {c: v for c, v in rstd.items() if v > MAX_FINAL_ROTATION_STD_DEG}
+    if bad_r:
+        raise RuntimeError(f"Calibration rejected: rotation spread too high ({bad_r})")
 
     # Back up any existing extrinsics before overwriting.
     out_path = Path(OUT_YAML)
@@ -689,23 +556,31 @@ def main() -> None:
         backup.write_text(out_path.read_text())
         print(f"Backed up existing YAML to: {backup}")
 
-    save_extrinsics_yaml(out_path, out)
+    save_extrinsics_yaml(out_path, T_base_cam_avg)
     print(f"\nWrote base-referenced camera extrinsics to: {out_path}")
 
-    out_robot_a = {
-        CAM1: T_robotA_cam1,
-        CAM2: T_robotA_cam2,
-        CAM3: T_robotA_cam3,
-    }
     out_path_robot_a = Path(OUT_YAML_ROBOT_A_FRAME)
     if out_path_robot_a.exists():
         backup_a = out_path_robot_a.with_suffix(".yaml.bak")
         backup_a.write_text(out_path_robot_a.read_text())
         print(f"Backed up existing YAML to: {backup_a}")
-    save_extrinsics_yaml(out_path_robot_a, out_robot_a)
+    save_extrinsics_yaml(out_path_robot_a, T_robotA_cam)
     print(f"Wrote robot_a-frame camera extrinsics (reference only) to: {out_path_robot_a}")
 
     print(f"Saved debug corner images to: {debug_dir}")
+
+    for cam_id in cam_ids:
+        log_camera_transform({
+            "stage": "base_to_cams_static",
+            "cam_id": cam_id,
+            "active_robot": active_robot,
+            "num_samples": len(accepted),
+            "T_base_cam": {"R": T_base_cam_avg[cam_id].R.tolist(), "t": T_base_cam_avg[cam_id].t.tolist()},
+            "T_robotA_cam": {"R": T_robotA_cam[cam_id].R.tolist(), "t": T_robotA_cam[cam_id].t.tolist()},
+            "reproj_err_px_mean": reproj_mean[cam_id],
+            "translation_std_m": tstd[cam_id],
+            "rotation_std_deg": rstd[cam_id],
+        })
 
     node.destroy_node()
     rclpy.shutdown()
