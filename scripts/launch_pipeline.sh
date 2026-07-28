@@ -13,16 +13,28 @@
 #   scripts/launch_pipeline.sh baseline          # alias for init-only
 #   scripts/launch_pipeline.sh --debug-logging   # runs pipeline runner with given args
 #
+# Named presets (init-only/fast-track/accurate-track/baseline) run inside a
+# tmux session with two windows so the tracker's start/stop/reset services
+# are one keypress away without reopening a shell:
+#   window 0 "run"  — the pipeline itself (this is what you were seeing before)
+#   window 1 "keys" — tracking_keyboard_control.py (s=start, x=stop, r=reset)
+# Switch windows: Ctrl+b then 0/1 (or n/p). Detach without killing: Ctrl+b d.
+#   scripts/launch_pipeline.sh stop              # kill that tmux session
+#   scripts/launch_pipeline.sh attach            # attach if already running
+#
 # Pass --disable-debug-frames after a track preset to skip building/publishing
 # fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/* topics),
 # e.g. scripts/launch_pipeline.sh fast-track --disable-debug-frames
 #
-# Override the container name via env var:
+# Override the container name or tmux session name via env vars:
 #   CONTAINER=other-container scripts/launch_pipeline.sh
+#   SESSION=other-session scripts/launch_pipeline.sh fast-track
 
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-vision}"
+SESSION="${SESSION:-mv_pipeline}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/thesis-venv/bin/activate && source /workspace/MasterThesis/install/setup.bash && cd /workspace/MasterThesis'
 
@@ -103,7 +115,7 @@ ACCURATE_TRACK_ARGS=(
 )
 
 usage() {
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 DISABLE_DEBUG_FRAMES=0
@@ -123,6 +135,18 @@ case "${1:-}" in
     -h|--help|help)
         usage
         exit 0
+        ;;
+    stop)
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            tmux kill-session -t "$SESSION"
+            echo "[*] killed tmux session: $SESSION"
+        else
+            echo "[*] no tmux session named $SESSION"
+        fi
+        exit 0
+        ;;
+    attach)
+        exec tmux attach -t "$SESSION"
         ;;
     baseline|init-only|init_only)
         MODE_NAME="init-only"
@@ -155,10 +179,29 @@ docker start "$CONTAINER" >/dev/null
 if (( $# == 0 )); then
     exec docker exec -it "$CONTAINER" bash -lc "$SRC && exec bash"
 elif [ -n "$MODE_NAME" ]; then
-    echo "[*] launching pipeline preset: $MODE_NAME"
-    exec docker exec -it "$CONTAINER" bash -lc \
-        "$SRC && mkdir -p outputs/logs && set -o pipefail && python3 -m src.perception.ros.learn_runners.run_pipeline_track_multicam \"\$@\" 2>&1 | tee \"$MODE_LOG\"" \
-        -- "$@"
+    echo "[*] launching pipeline preset: $MODE_NAME (tmux session: $SESSION)"
+
+    # Quote each pipeline arg for safe re-use inside the tmux send-keys string below.
+    QUOTED_ARGS=""
+    for a in "$@"; do
+        QUOTED_ARGS+=" $(printf '%q' "$a")"
+    done
+    RUN_CMD="$SRC && mkdir -p outputs/logs && set -o pipefail && python3 -m src.perception.ros.learn_runners.run_pipeline_track_multicam$QUOTED_ARGS 2>&1 | tee \"$MODE_LOG\""
+    KEYS_CMD="$SRC && python3 -m src.perception.ros.tracking_keyboard_control"
+
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "[*] session $SESSION already running — attaching (run 'scripts/launch_pipeline.sh stop' first for a clean restart)"
+        exec tmux attach -t "$SESSION"
+    fi
+
+    tmux new-session -d -s "$SESSION" -n run -c "$REPO_DIR"
+    tmux send-keys -t "$SESSION:run" "docker exec -it \"$CONTAINER\" bash -lc $(printf '%q' "$RUN_CMD")" Enter
+
+    tmux new-window -t "$SESSION" -n keys -c "$REPO_DIR"
+    tmux send-keys -t "$SESSION:keys" "docker exec -it \"$CONTAINER\" bash -lc $(printf '%q' "$KEYS_CMD")" Enter
+
+    tmux select-window -t "$SESSION:run"
+    exec tmux attach -t "$SESSION"
 else
     exec docker exec -it "$CONTAINER" bash -lc \
         "$SRC && exec python3 -m src.perception.ros.learn_runners.run_pipeline_track_multicam \"\$@\"" \

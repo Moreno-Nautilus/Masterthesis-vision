@@ -186,7 +186,12 @@ scripts/launch_pipeline.sh accurate-track   # detect once, then accurate (settle
 ```
 
 Each command restarts the `vision` container, sources everything, runs the node, and
-tees the log to `outputs/logs/`.
+tees the log to `outputs/logs/`. It opens a tmux session with two windows: `run`
+(the pipeline itself) and `keys` (a keyboard helper for pausing/resuming tracking
+without reloading any model — press `s`/`x`/`r`, see
+[pipeline_walkthrough.md](pipeline_walkthrough.md#keyboard-control-local-debugging)).
+Detach with `Ctrl+b d`, reattach with `scripts/launch_pipeline.sh attach`, and stop
+everything with `scripts/launch_pipeline.sh stop`.
 
 **Which one should I use?**
 
@@ -244,8 +249,13 @@ analysis, **not** the live interface:
 
 </details>
 
-To stop: `Ctrl+C` in the pipeline terminal. Stop the host stack with
-`scripts/launch_host.sh stop` when you're completely done.
+To stop for good: `scripts/launch_pipeline.sh stop` (kills the whole tmux
+session, both windows). Stop the host stack with `scripts/launch_host.sh stop`
+when you're completely done.
+
+To pause/resume without reloading models: switch to the `keys` tmux window
+(`Ctrl+b 1`) and press `x`/`s` instead of stopping the session — see
+[pipeline_walkthrough.md](pipeline_walkthrough.md#keyboard-control-local-debugging).
 
 ---
 

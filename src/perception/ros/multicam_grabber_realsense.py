@@ -50,10 +50,11 @@ class DynamicCameraTopics(CameraTopics):
     in the dual-LBR rig, so each needs its own flange pose stream -- see
     ALL_CAMERAS in run_pipeline_track_multicam_realsense.py).
 
-    robot_base_key selects which entry of config/robot_bases.yaml this
-    camera's flange pose (published in ITS OWN arm's lbr_*_link_0 frame)
-    must be shifted by to land in robot_a's frame, matching how the static
-    T_map entries are shifted by the active robot's base in
+    robot_base_key selects which entry of the (possibly re-referenced,
+    see get_dual_arm_base_link()) robot_bases dict this camera's flange pose
+    (published in ITS OWN arm's lbr_*_link_0 frame) must be shifted by to
+    land in the pipeline's chosen global reference frame, matching how the
+    static T_map entries are shifted by the active robot's base in
     get_active_robot_base().
     """
     is_dynamic: bool = False
@@ -147,19 +148,21 @@ class MultiCamGrabberRealsense(Node):
         self.flange_pose_max_age_s = float(flange_pose_max_age_s)
         # None = leave everything in whichever robot is physically connected's
         # frame (old behavior). If given, static (non-dynamic) entries -- true
-        # base-frame poses -- are shifted into robot_a's frame at load time,
-        # so the static zed2i_1 lookup and the live T_base_flange(t) @
-        # T_flange_cam composition stay in the same frame.
+        # base-frame poses -- are shifted into the caller's chosen global
+        # reference frame at load time (e.g. robot_a's frame, or the dual-arm
+        # base_link frame -- see get_dual_arm_base_link()), so the static
+        # zed2i_1 lookup and the live T_base_flange(t) @ T_flange_cam
+        # composition stay in the same frame.
         # T_flange_cam entries (dynamic cams) are camera-to-FLANGE, not
         # base-frame, so they must NOT be converted.
         self._T_robotA_activeRobot = T_robotA_activeRobot
         # Per-dynamic-camera shift: each end-effector-mounted camera is
         # bolted to a different arm (lbr_one/lbr_two in the dual-arm rig),
         # so its live flange pose arrives already expressed in THAT arm's
-        # own lbr_*_link_0 frame and needs its own robot_bases.yaml entry
-        # (DynamicCameraTopics.robot_base_key) to land in robot_a's frame --
-        # a single global T_robotA_activeRobot is not enough once more than
-        # one arm is streaming flange poses at once.
+        # own lbr_*_link_0 frame and needs its own robot_bases-keyed entry
+        # to land in the same global reference frame as T_robotA_activeRobot
+        # above -- a single global shift is not enough once more than one arm
+        # is streaming flange poses at once.
         self._robot_bases = robot_bases or {}
 
         dynamic_ids = {c.cam_id for c in cameras if c.is_dynamic}
