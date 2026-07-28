@@ -35,7 +35,7 @@ from fp_debug_msgs.msg import DebugCandidate, DebugFrame, DebugMaskCrop, DebugPo
 from concurrent.futures import ThreadPoolExecutor
 
 from src.calibration.io_extrinsics import load_extrinsics_yaml
-from src.utils.robot_bases import get_active_robot_base
+from src.utils.robot_bases import get_active_robot_base, load_robot_bases
 from src.perception.learned.DINO.dino_identifier import (
     DINOIdentifier,
     DINOIdentifierConfig,
@@ -273,21 +273,43 @@ ALL_CAMERAS: list[DynamicCameraTopics] = [
         rgb_info_topic="/zed2i_1/zed_node/rgb/color/rect/image/camera_info",
         is_dynamic=False,
     ),
+    # realsense_1 is bolted to the LEFT arm (port_id 30200 -- see
+    # lbr_dual_arm_description/ros2_control/lbr_one_system_config.yaml --
+    # and robot_base_key="robot_a" in config/robot_bases.yaml). Its
+    # hand-eye offset in camera_extrinsics_realsense.yaml is still the
+    # identity placeholder (not yet calibrated).
     DynamicCameraTopics(
         cam_id="realsense_1",
-        depth_topic="/realsense_1/camera/aligned_depth_to_color/image_raw",
+        # /image_rect (not /image_raw): rectified by the per-camera
+        # image_proc RectifyNode pair started in zed_realsense_trio.launch.py
+        # (see comment there). camera_info topics are unchanged — the D405's
+        # raw camera_info already carries P == K (Tx=Ty=0), which is what
+        # RectifyNode uses as the rectified image's intrinsics, so the
+        # original (distorted) camera_info's K is still the correct K to
+        # read for the rectified image.
+        depth_topic="/realsense_1/camera/aligned_depth_to_color/image_rect",
         info_topic="/realsense_1/camera/aligned_depth_to_color/camera_info",
-        rgb_topic="/realsense_1/camera/color/image_raw",
+        rgb_topic="/realsense_1/camera/color/image_rect",
         rgb_info_topic="/realsense_1/camera/color/camera_info",
         is_dynamic=True,
+        flange_pose_topic="/left/ee_pose",
+        robot_base_key="robot_a",
     ),
+    # realsense_2 is bolted to the RIGHT arm (port_id 30201, robot_base_key
+    # "robot_b"). This is the camera that already has a real hand-eye
+    # calibration in camera_extrinsics_realsense.yaml, taken with
+    # active_robot: robot_b.
     DynamicCameraTopics(
         cam_id="realsense_2",
-        depth_topic="/realsense_2/camera/aligned_depth_to_color/image_raw",
+        # See realsense_1's comment above — same /image_rect + unchanged
+        # camera_info rationale.
+        depth_topic="/realsense_2/camera/aligned_depth_to_color/image_rect",
         info_topic="/realsense_2/camera/aligned_depth_to_color/camera_info",
-        rgb_topic="/realsense_2/camera/color/image_raw",
+        rgb_topic="/realsense_2/camera/color/image_rect",
         rgb_info_topic="/realsense_2/camera/color/camera_info",
         is_dynamic=True,
+        flange_pose_topic="/right/ee_pose",
+        robot_base_key="robot_b",
     ),
 ]
 
@@ -4548,6 +4570,8 @@ class FoundationPoseTrackerNode(Node):
                     self._fused_lost_count[tid] = 0
                     self._fused_pose_status[tid] = "fresh"
                     self._fused_last_drop_reasons.pop(tid, None)
+                    self._part_id_assigner.release(tid)
+                    self._track_id_to_object_id.pop(tid, None)
                 self._drop_realtime_trackers_for_track_ids(lost_track_ids)
                 self._remove_planning_scene_objects(lost_track_ids, stamp)
                 self._force_reinit_tracks.clear()
@@ -4689,18 +4713,6 @@ def parse_args() -> argparse.Namespace:
     # Fixed at 3 for this variant: zed2i_1 (static) + realsense_1 + realsense_2
     # (end-effector-mounted, dynamic extrinsics). See ALL_CAMERAS above.
     p.add_argument("--num-cameras", type=int, default=3, choices=[3])
-    p.add_argument(
-        "--flange-pose-topic",
-        type=str,
-        default="/iiwa/ee_pose",
-        help=(
-            "geometry_msgs/PoseStamped topic publishing the live base->flange "
-            "transform, used to compute the current camera-to-base extrinsic "
-            "for the end-effector-mounted RealSense cameras. Published by "
-            "mv_launch's flange_pose_publisher node (tf2 lookup of the KUKA "
-            "iiwa's lbr_link_0 -> lbr_link_ee transform)."
-        ),
-    )
     p.add_argument(
         "--flange-pose-max-age-s",
         type=float,
@@ -5004,6 +5016,7 @@ def main() -> None:
     # produce the actual camera-to-base extrinsic each frame.
     T_map = load_extrinsics_yaml("config/camera_extrinsics_realsense.yaml")
     active_robot, T_robotA_activeRobot = get_active_robot_base()
+    robot_bases = load_robot_bases()
     print(
         f"[PIPELINE] active_robot={active_robot} (config/robot_bases.yaml) -- "
         f"fused poses are output in robot_a's frame (global reference)"
@@ -5016,9 +5029,9 @@ def main() -> None:
         use_best_effort_if_unsynced=True,
         static_extrinsics_base_cam=T_map,
         rgb_depth_max_dt_s=0.08,
-        flange_pose_topic=args.flange_pose_topic,
         flange_pose_max_age_s=args.flange_pose_max_age_s,
         T_robotA_activeRobot=T_robotA_activeRobot,
+        robot_bases=robot_bases,
     )
 
     # grabber.T_base_cam_map is the dynamic-composing wrapper (static

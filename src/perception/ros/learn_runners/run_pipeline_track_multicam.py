@@ -4515,6 +4515,8 @@ class FoundationPoseTrackerNode(Node):
                     self._fused_lost_count[tid] = 0
                     self._fused_pose_status[tid] = "fresh"
                     self._fused_last_drop_reasons.pop(tid, None)
+                    self._part_id_assigner.release(tid)
+                    self._track_id_to_object_id.pop(tid, None)
                 self._drop_realtime_trackers_for_track_ids(lost_track_ids)
                 self._remove_planning_scene_objects(lost_track_ids, stamp)
                 self._force_reinit_tracks.clear()

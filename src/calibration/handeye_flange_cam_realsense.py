@@ -85,7 +85,14 @@ FLANGE_POSE_TOPIC_DEFAULT = "/iiwa/ee_pose"
 def _camera_topics(cam_id: str) -> tuple[str, str]:
     # Matches the realsense2_camera ROS2 wrapper's default namespacing, as
     # used throughout src/perception/ros/learn_runners/run_pipeline_track_multicam_realsense.py.
-    rgb = f"/{cam_id}/camera/color/image_raw"
+    # /image_rect (not /image_raw): rectified by the image_proc RectifyNode
+    # started per-camera in zed_realsense_trio.launch.py. Needed here
+    # specifically because _solve_board_pose / _compute_reproj_err_px below
+    # hardcode dist=0 for solvePnP/projectPoints — that assumption is only
+    # correct once the image is actually undistorted upstream (the D405
+    # color stream has real non-zero Brown-Conrady distortion, see
+    # docs/getting_started_realsense.md).
+    rgb = f"/{cam_id}/camera/color/image_rect"
     info = f"/{cam_id}/camera/color/camera_info"
     return rgb, info
 

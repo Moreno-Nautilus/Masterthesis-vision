@@ -18,6 +18,7 @@ files, or pipeline code was changed — every file used here is new:
 | Pipeline runner | `run_pipeline_track_multicam.py` | `run_pipeline_track_multicam_realsense.py` |
 | Flange pose (new, no 3-ZED equivalent) | — | `mv_launch` → `flange_pose_publisher.py` (§5) |
 | Hand-eye calibration (new, no 3-ZED equivalent) | — | `src/calibration/handeye_flange_cam_realsense.py` + `board_pose_from_flange_realsense.py` (§4) |
+| RGB/depth rectification (new, no 3-ZED equivalent — ZED rectifies internally) | — | `image_proc` rectify containers in `zed_realsense_trio.launch.py` (§8) |
 
 > **Status: runs end-to-end, verified working** (see §1 below for the exact
 > tested sequence). `config/camera_extrinsics_realsense.yaml` ships **identity**
@@ -110,14 +111,18 @@ detach without killing anything).
 ```bash
 source /opt/ros/humble/setup.bash
 ros2 topic hz /zed2i_1/zed_node/rgb/color/rect/image
-ros2 topic hz /realsense_1/camera/color/image_raw
+ros2 topic hz /realsense_1/camera/color/image_raw     # raw driver output (still published, unused by the pipeline)
 ros2 topic hz /realsense_2/camera/color/image_raw
+ros2 topic hz /realsense_1/camera/color/image_rect    # rectified — this is what the pipeline actually consumes, see §8
+ros2 topic hz /realsense_2/camera/color/image_rect
 ros2 topic echo /iiwa/ee_pose --once
 ```
 
-All four must return real data before you continue. If a RealSense topic is
+All must return real data before you continue. If a RealSense `image_raw` topic is
 silent, check the `cams` tmux window (`Ctrl+b` `0`) for the actual error — see
-§7 Troubleshooting for the specific failure modes already hit and fixed once.
+§7 Troubleshooting for the specific failure modes already hit and fixed once. If
+`image_raw` is fine but `image_rect` is silent, the rectify container failed to
+start — check the same tmux window; see §8.
 
 ### Step 3 — start the pipeline (terminal 3)
 
@@ -288,132 +293,205 @@ scripts and pull `T_flange_cam` directly from the mount's CAD model — edit the
 directly (same row-major 3×3 `R` + 3-vector `t` convention as the rest of the
 repo). The rest of this section covers the checkerboard-based routine.
 
-### 4.0 Which robot, and its base frame
+### 4.0 Two-script dual-arm routine (current workflow)
 
-[config/robot_bases.yaml](../config/robot_bases.yaml) records the two robots'
-base-frame offsets (same coordinate-frame convention, Robot B offset
-`[0, 0.84, 0]` m from Robot A) and an `active_robot` selector. Both calibration
-scripts below read `active_robot` purely for logging/output-header purposes —
-they always compute poses directly in whatever robot's `lbr_link_0` is actually
-streaming tf on the machine you run them on, via `/iiwa/ee_pose`. **Set
-`active_robot` in that file to match the robot you're actually calibrating
-before running either script**, so the output files are correctly labeled. We
-start with Robot B.
+The routine below drives **both** LBR arms of the dual-arm rig
+(`lbr_dual_arm_bringup`, arms `lbr_one`/left and `lbr_two`/right — see
+`~/Desktop/KUKA_dual_arm_bringup_README.md`), each carrying its own wrist
+RealSense (`realsense_1` on `lbr_one`, `realsense_2` on `lbr_two`), plus the
+one static ZED (`zed2i_1`). It's split into two scripts so the
+slow/manual/human-judgment part (deciding where to jog the arms) is done
+once and its raw result kept forever, while the actual calibration solve is
+scripted, repeatable, and doesn't need an operator standing at the robot:
+
+1. **`capture_flange_poses_dual.py`** (manual, once per arm) — jog each arm
+   with MoveIt RViz to 7 poses where its own wrist camera sees the fixed
+   checkerboard, press Enter to save that arm's flange pose. Nothing is
+   calibrated yet; only the poses themselves are recorded, permanently, to
+   `config/flange_poses/left.json` / `right.json` (saved after **every**
+   single capture, not just at the end — a crash mid-session loses nothing
+   already accepted).
+2. **`autocalibrate_dual_realsense.py`** (automatic, replay) — reads those
+   saved poses back and, assuming the checkerboard hasn't moved since step 1,
+   drives both arms there via MoveIt automatically (no jogging), solving:
+   - **Stage A**: both arms' `T_flange_cam` (hand-eye), moving both arms
+     *simultaneously* per pose-pair using the first 5 poses/arm.
+   - **Stage B**: the checkerboard's pose in the robot base frame, using the
+     remaining 2 poses/arm (4 samples total), now that both hand-eye
+     transforms are known.
+   - **Stage C**: the static ZED's extrinsic, from that now-known board pose
+     (`scripts/calibrate_zed_from_board_pose.sh`).
+
+   Every stage's result + quality metrics is appended (never overwritten) to
+   `outputs/calibration_logs/{camera,checkerboard,flange}_transforms.json`
+   (see §4.6) in addition to updating the live YAML configs.
+
+The original single-arm, single-camera manual scripts
+(`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`,
+§4.7 below) still work standalone if you ever need to recalibrate just one
+camera by hand — the dual-arm routine reuses their PnP/AX=XB solving code
+directly, it doesn't replace or remove them.
 
 ### 4.1 Bring everything up
 
-Same as [§1](#1-run-it-start-to-finish-the-tested-sequence) Steps 0–2: real
-robot bringup (`lbr_bringup hardware.launch.py`, *not* the mock/identity
-placeholder — you need real, varied flange motion for this), the host camera
-stack (`scripts/launch_host_realsense.sh`), and verify `/iiwa/ee_pose` and both
-RealSense RGB topics are live.
-
-For jogging the arm to calibration poses, also bring up MoveIt with a real
-motion-planning GUI panel (not the RViz-only scene viewer used for pipeline
-visualization):
+Real dual-arm hardware bringup (**not** `mock.launch.py` — Stage A/B need
+real, varied flange motion) plus MoveIt, in two terminals:
 
 ```bash
-ros2 launch lbr_bringup move_group.launch.py model:=iiwa7 rviz:=true
+# Terminal 1
+ros2 launch lbr_dual_arm_bringup hardware.launch.py
+
+# Terminal 2
+ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true
 ```
 
-This one launch call brings up both `move_group` and RViz, already loaded
-with `iiwa7_moveit_config`'s `moveit.rviz`, which includes the MotionPlanning
-panel — no separate `rviz.launch.py` call needed. In RViz's **MotionPlanning**
-panel, drag the interactive marker on the flange to a candidate pose, then
-**Plan & Execute**. This is how you'll position the arm before each captured
-sample in both stages below. See
-[moveit_robot_control.md](moveit_robot_control.md) for the full walkthrough
-(jogging via joints vs. the interactive marker, verifying the executed pose
-via tf, etc.).
+Then start the `LBRServer` app on **both** pendants (left, then right) to
+open the FRI UDP connections `hardware.launch.py` is waiting on — see
+`~/Desktop/KUKA_dual_arm_CHEATSHEET.md` for the full pre-flight checklist
+(T1 mode, port 30200/30201, etc.).
 
-Confirm which RealSense cameras are actually connected before picking a
-`--cam-id`:
+Also bring up the host camera stack and verify both RealSense RGB topics and
+both flange-pose topics are live:
 
 ```bash
-python3 -m src.calibration.realsense_devices
-# or, equivalently: rs-enumerate-devices -s
+scripts/launch_host_realsense.sh
+ros2 topic echo /left/ee_pose --once
+ros2 topic echo /right/ee_pose --once
 ```
+
+For **Step 1** (`capture_flange_poses_dual.py`), jog each arm in RViz's
+**MotionPlanning** panel exactly as in
+[moveit_robot_control.md](moveit_robot_control.md) — drag the interactive
+marker on that arm's flange, **Plan & Execute**. **Step 2**
+(`autocalibrate_dual_realsense.py`) needs no jogging at all; it drives the
+arms itself through the same `move_group` this terminal started, via the
+`moveit_msgs/action/MoveGroup` action directly (see
+[src/calibration/moveit_dual_arm.py](../src/calibration/moveit_dual_arm.py) —
+there is no `moveit_commander`/`moveit_py` Python package installed in this
+environment, so this talks to the same action `move_group`'s own RViz plugin
+uses under the hood).
 
 ### 4.2 Recommended Foxglove layout
 
-Both scripts publish a live debug image topic
-(`/calibration/handeye/<cam_id>/debug_image`,
-`/calibration/board_pose/<cam_id>/debug_image`) with detected checkerboard
-corners overlaid — add an **Image** panel on that topic so you can confirm the
-full board is visible and well-detected *before* pressing Enter to capture.
-Also useful: a **3D** panel with the robot model (to see the jogged pose) and a
-**Raw Messages** panel on `/iiwa/ee_pose` (confirms the flange pose topic is
-actually streaming). This reuses the same `foxglove_bridge` already started by
-`launch_host_realsense.sh` — nothing extra to launch.
+`capture_flange_poses_dual.py` publishes
+`/calibration/capture_flange_poses/<left|right>/debug_image`;
+`autocalibrate_dual_realsense.py` publishes
+`/calibration/autocalibrate/<left|right>/debug_image` — add an **Image**
+panel on whichever is running so you can confirm the checkerboard is
+visible. Also useful: a **3D** panel with the robot model, and **Raw
+Messages** panels on `/left/ee_pose` and `/right/ee_pose`. Same
+`foxglove_bridge` as `launch_host_realsense.sh` already starts.
 
-### 4.3 Stage 1 — flange ↔ camera (`T_flange_cam`)
+### 4.3 Step 1 — capture flange poses (manual, per arm)
 
-Run once per RealSense camera, inside the `vision` container:
-
-```bash
-python3 -m src.calibration.handeye_flange_cam_realsense --cam-id realsense_1
-```
-
-For each of **at least 10 samples (15 recommended)**: jog the arm with MoveIt to
-a pose where the checkerboard is fully visible to `realsense_1`, let it settle,
-then press Enter in the terminal to capture. **Vary orientation, not just
-position** — the classic `AX = XB` hand-eye solve
-(`cv2.calibrateHandEye`, method `TSAI`) is only well-conditioned with enough
-rotational diversity between samples; a dozen samples that only translate the
-wrist will not solve reliably. Each sample pairs a checkerboard-in-camera pose
-(PnP on the detected corners, same method as
-[src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py))
-with the flange-in-base pose read from `/iiwa/ee_pose` at capture time.
-
-The script prints pairwise `AX=XB` residuals as a QA signal (large residuals →
-redo with more rotational spread or check the arm had actually stopped moving
-before you pressed Enter), then writes `T_flange_cam` into the `realsense_1`
-block of `config/camera_extrinsics_realsense.yaml` — backing up the previous
-file to `.yaml.bak` first, and leaving the file's header comment and the other
-cam_id entries (`zed2i_1`, `realsense_2`) untouched.
-
-Repeat for `realsense_2`.
-
-### 4.4 Stage 2 — checkerboard pose in the robot base frame
-
-Once Stage 1 has given a real (non-identity) `T_flange_cam` for a camera, use
-that same camera to compute where the checkerboard actually sits in the robot
-base frame — replacing the hand-measured value in
-[config/base_board_pose.yaml](../config/base_board_pose.yaml):
+Inside the `vision` container:
 
 ```bash
-python3 -m src.calibration.board_pose_from_flange_realsense --cam-id realsense_1
+python3 -m src.calibration.capture_flange_poses_dual --arm left
+python3 -m src.calibration.capture_flange_poses_dual --arm right
 ```
 
-Keep the checkerboard **fixed** for this whole run (its own pose is what's
-being solved for). For each of 5–8 samples, optionally re-jog the arm to a
-different pose for redundancy (or just capture repeatedly from one pose), press
-Enter to capture. Each sample computes
+For each of the recommended **7 samples per arm**: jog that arm with MoveIt
+to a pose where the checkerboard is fully visible to its own wrist
+RealSense, let it settle, press Enter. A live checkerboard detection on that
+arm's camera gates the capture (reject if the board isn't actually
+in view or the reprojection error is too high) — but only the **flange
+pose** is saved, not the checkerboard's own pose. **Vary orientation, not
+just position** across at least the first 5 of the 7 — those are the ones
+`autocalibrate_dual_realsense.py` uses for the `AX=XB` hand-eye solve by
+default (`--num-handeye-poses`, default 5), which is only well-conditioned
+with real rotational diversity; the last 2 (`--num-board-poses`, default 2)
+are used for the checkerboard-pose solve, where the pose itself matters less
+since `T_flange_cam` is already known by that point.
 
+Every capture is written immediately to
+`config/flange_poses/<left|right>.json` — safe to stop with `q` early (if
+you already have >= 1 sample) or Ctrl-C between captures; nothing already
+accepted is lost. Pass `--append` to add to a previous session's captures
+instead of starting over.
+
+Keep the checkerboard **fixed** for the rest of this whole section — Step 2
+replays these exact poses assuming the board hasn't moved.
+
+### 4.4 Step 2 — automatic calibration (replay + solve)
+
+```bash
+python3 -m src.calibration.autocalibrate_dual_realsense
 ```
-T_base_board = T_base_flange @ T_flange_cam @ T_cam_board
-```
 
-directly — no `AX=XB` solve needed here since `T_flange_cam` is already known.
-Samples are averaged with the same rotation/translation spread quality gates as
-`base_to_cams_calib_3.py`; the result overwrites `config/base_board_pose.yaml`
-(backing up to `.yaml.bak` first), labeled with the `active_robot` frame it was
-computed in.
+Runs Stage A → B → C in order (see §4.0), aborting before any later stage if
+an earlier one doesn't have enough accepted samples — nothing partial is
+ever written to the YAML configs. Pass `--skip-zed` to stop after Stage B
+(e.g. if you want to inspect the checkerboard pose before trusting the ZED
+solve to it), then run `scripts/calibrate_zed_from_board_pose.sh` separately
+once satisfied. `--min-handeye-samples` (default 5) can loosen the Stage A
+gate if you deliberately captured fewer poses.
 
-This computed board pose is also what
-[src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py)
-reads for the static ZED calibration — so re-running that script after Stage 2
-picks up the improved (measured, not hand-eyeballed) board pose too.
+Stage A drives both arms **simultaneously** per pose-pair (a single
+`both_arms` MoveGroup goal covering both tip links at once, see
+`moveit_dual_arm.ArmTarget`/`DualArmMoveitClient.move_to`) — MoveIt supports
+this directly since `lbr_dual_arm_moveit_config`'s SRDF already defines a
+`both_arms` planning group. Stage B moves one arm at a time (each board-pose
+sample only needs one camera).
+
+Stage A writes `T_flange_cam` for **both** `realsense_1` and `realsense_2`
+into `config/camera_extrinsics_realsense.yaml` together (backing up to
+`.yaml.bak` first). Stage B overwrites `config/base_board_pose.yaml`. Stage C
+(via `scripts/calibrate_zed_from_board_pose.sh`) overwrites
+`config/camera_extrinsics_base.yaml`'s `zed2i_1` entry, reusing
+[src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py)'s
+existing PnP + averaging + QA-gate logic (that script now takes a
+`--cam-ids` list — still defaults to the original 3-ZED trio with no args —
+scoped here to the single ZED this rig has).
 
 ### 4.5 Sanity-checking the result
 
-Compare `T_flange_cam` translation magnitude against a rough physical estimate
-(camera is bolted a few cm from the flange, not tens of centimeters) — a wildly
-large translation usually means too few/too correlated samples rather than a
-real mechanical offset. Also see the `lbr_link_0 == base` assumption flagged in
-[§5.2](#52-whats-implemented-flange_pose_publisher) below: Stage 2's computed
-board pose is a good way to *verify* that assumption, since it's now derived
-from real tf data instead of a hand-typed guess.
+Compare each `T_flange_cam` translation magnitude against a rough physical
+estimate (camera is bolted a few cm from the flange, not tens of
+centimeters) — a wildly large translation usually means too few/too
+correlated samples rather than a real mechanical offset. Also see the
+`lbr_link_0 == base` assumption flagged in
+[§5.2](#52-whats-implemented-flange_pose_publisher) below: Stage B's
+computed board pose is a good way to *verify* that assumption, since it's
+now derived from real tf data instead of a hand-typed guess.
+
+### 4.6 Where the calibration history + quality metrics live
+
+Every run of `autocalibrate_dual_realsense.py` (and any standalone run of
+`base_to_cams_calib_3.py`) **appends** an entry — never overwrites — to:
+
+| File | What's logged |
+|---|---|
+| `outputs/calibration_logs/camera_transforms.json` | One entry per camera per run: `T_flange_cam` (RealSense, Stage A) or `T_base_cam` (ZED, Stage C) plus its QA metrics (`AX=XB` rotation/translation residuals for hand-eye; reprojection error + translation/rotation std for the static ZED solve). |
+| `outputs/calibration_logs/checkerboard_transforms.json` | One entry per Stage B run: the solved `T_base_board`, sample count, translation/rotation std, mean reprojection error. |
+| `outputs/calibration_logs/flange_transforms.json` | One entry per arm per Stage A+B run: exactly which saved `config/flange_poses/<arm>.json` capture indices were used for hand-eye vs. board-pose, with each capture's own pose inlined (self-contained even if the flange-pose file is later overwritten by a fresh capture session). |
+
+See [src/calibration/calibration_log.py](../src/calibration/calibration_log.py)
+for the exact schema. The live YAML configs
+(`config/camera_extrinsics_realsense.yaml`, `config/camera_extrinsics_base.yaml`,
+`config/base_board_pose.yaml`) still only ever hold the *latest* calibration —
+these JSON logs are the append-only history + QA trail alongside them.
+
+### 4.7 Manual single-camera fallback (original scripts, still available)
+
+If you need to recalibrate just one RealSense by hand instead of running the
+full dual-arm routine (e.g. only one camera physically moved), the original
+manual, single-arm/single-camera scripts are unchanged and still work:
+
+```bash
+python3 -m src.calibration.handeye_flange_cam_realsense --cam-id realsense_1
+python3 -m src.calibration.board_pose_from_flange_realsense --cam-id realsense_1
+```
+
+[config/robot_bases.yaml](../config/robot_bases.yaml) records the two
+robots' base-frame offsets and an `active_robot` selector these two scripts
+read purely for logging/output-header purposes (they always compute poses
+directly in whatever robot's `lbr_link_0`/`lbr_{one,two}_link_0` is actually
+streaming tf on the machine you run them on). **Set `active_robot` to match
+the arm you're actually calibrating before running either script.** See each
+script's own docstring for the full per-sample walkthrough (jog with
+MoveIt → press Enter → repeat >= 10-15 times for hand-eye, >= 5 for
+board-pose).
 
 ---
 
@@ -520,6 +598,7 @@ three) — passing anything else raises an error at startup.
 | Fused pose is clearly wrong for objects only seen by a RealSense | Expected until §4's calibration has been run for that camera (identity placeholder until then). Also double check the `lbr_link_0 == base` assumption (§5.2) once real calibration is in. |
 | `run_pipeline_track_multicam_realsense` errors on `--num-cameras` | This variant only accepts `--num-cameras 3` — don't pass `2` (that flag exists for the original 3-ZED runner, not this one). |
 | Depth looks misaligned with color on a RealSense | Check `align_depth.enable:=true` is actually taking effect — it's set in `zed_realsense_trio.launch.py`; confirm via `ros2 topic echo /realsense_1/camera/aligned_depth_to_color/camera_info` matches the color camera_info resolution. |
+| `image_rect` topics silent, `image_raw` topics fine | The `<cam>_rectify_container` (an `image_proc` composable-node container) failed to start or crashed — check the `cams` tmux window for its output. Most likely cause: `ros-humble-image-proc` isn't installed on the **host** (see §8) — `sudo apt install ros-humble-image-proc ros-humble-image-pipeline`. |
 
 For anything not specific to the RealSense cameras (GPU saturation, docker
 container missing, general pipeline flags), see
@@ -528,14 +607,131 @@ unchanged.
 
 ---
 
-## 8. Where to read more
+## 8. RGB/depth rectification (undistorting the RealSense color stream)
+
+**Why this exists**: unlike the ZED wrapper, which rectifies the color image
+internally before publishing (`rgb/color/rect/image`), `realsense2_camera`
+publishes the D405 color stream **as-is, still distorted** —
+`color/image_raw`, not `image_rect_raw` (confirmed in
+`realsense2_camera`'s `rs_node_setup.cpp`: only `RS2_STREAM_DEPTH` and IR/`Y8`
+formats are marked `rectified_image`, color is not). The D405's actual
+distortion is real, not a rounding-error formality — checked live via
+`rs-enumerate-devices -c -v` on both mounted units:
+
+```
+Intrinsic of "Color" / 640x480 / {YUYV/RGB8/BGR8/RGBA8/BGRA8}
+  Distortion: Inverse Brown Conrady
+  Coeffs:     -0.0552926  0.0611028  0.000408301  3.47888e-05  -0.0209464
+```
+
+(By contrast the D405's **depth** stream reports `Coeffs: 0 0 0 0 0` — it's
+already rectified, nothing to do there on its own.)
+
+The `realsense2_camera` package has **no built-in flag** for this — there is
+no `enable_rectify`/`color.rectify`/equivalent parameter anywhere in
+`rs_launch.py`'s ~90 configurable parameters, and no mention of
+rectification/undistortion anywhere else in the vendored package (README,
+launch files, or source). It expects a downstream consumer to do it, same as
+any other unrectified ROS camera driver.
+
+**What was added** — a per-camera `image_proc` rectify stage in
+`zed_realsense_trio.launch.py` (`_rectify_container(...)`, one
+`ComposableNodeContainer` per RealSense with two `image_proc::RectifyNode`
+instances):
+
+| Node | Subscribes | Publishes | `interpolation` |
+|---|---|---|---|
+| `rectify_color_node` | `camera/color/image_raw` + `camera/color/camera_info` | `camera/color/image_rect` | `1` (linear — fine for RGB) |
+| `rectify_aligned_depth_node` | `camera/aligned_depth_to_color/image_raw` + `camera/aligned_depth_to_color/camera_info` | `camera/aligned_depth_to_color/image_rect` | `0` (nearest-neighbor — avoids inventing blended foreground/background depth at object silhouettes) |
+
+**Why depth needs rectifying too, not just color**: `aligned_depth_to_color`
+is registered to the *distorted* color pixel grid (that's what "aligned to
+color" means for this driver), and `MultiCamGrabberRealsense` backprojects
+using the **depth** stream's `camera_info.K`
+(`multicam_grabber.py`/`multicam_grabber_realsense.py`, `_K_depth`, matching
+what the ZED path does with `depth_registered`). If only color were
+rectified, RGB pixels and depth pixels covering the same physical point would
+land at different pixel coordinates, and detection masks/silhouettes (SAM,
+DINO — everything reading `View.rgb`, see `src/perception/view.py`) would no
+longer line up with `View.depth` at the same indices. Both rectify nodes are
+fed the color stream's distortion coefficients (`aligned_depth_to_color`'s
+`camera_info` is derived from the color intrinsics by the driver), so
+`color/image_rect` and `aligned_depth_to_color/image_rect` end up back on one
+shared, correctly-registered pixel grid.
+
+**Why no new `camera_info` was needed**: `image_proc::RectifyNode` publishes
+*only* the rectified image, not a corresponding rectified `CameraInfo` — the
+correct rectified intrinsics are conventionally `CameraInfo.P`'s 3×3 block
+(what `image_geometry::PinholeCameraModel` reprojects into via
+`cv::initUndistortRectifyMap`). `realsense2_camera` already sets
+`P` = a straight copy of `K` (`Tx=Ty=0`, see `base_realsense_node.cpp`), so
+for this driver the original (still-distorted) `camera_info.K` **is already**
+the correct rectified `K` — only the image pixels change, not the published
+intrinsics. That's why `run_pipeline_track_multicam_realsense.py`'s
+`ALL_CAMERAS` entries for `realsense_1`/`realsense_2` still point
+`info_topic`/`rgb_info_topic` at the original `camera_info` topics, only the
+image topics changed to `.../image_rect`.
+
+**What consumes the rectified topics now**:
+- `src/perception/ros/learn_runners/run_pipeline_track_multicam_realsense.py`
+  (`ALL_CAMERAS`) — `depth_topic`/`rgb_topic` for both RealSense cameras.
+- `scripts/launch_host_realsense.sh` (`VIZ2_CMD`/`VIZ3_CMD`) — the debug
+  visualizers, so what you see in Foxglove matches what the pipeline
+  actually consumes.
+- `src/calibration/handeye_flange_cam_realsense.py` (`_camera_topics`, also
+  used by `board_pose_from_flange_realsense.py`) — this was a **real
+  pre-existing accuracy bug**, not just a topic-naming inconsistency:
+  `_solve_board_pose`/`_compute_reproj_err_px` hardcode `dist = 0` for
+  `cv2.solvePnP`/`cv2.projectPoints`, which was silently wrong while reading
+  the distorted `image_raw` (any hand-eye calibration run before this change
+  solved PnP against a distorted image as if undistorted, biasing
+  `T_flange_cam`). Reading `image_rect` instead makes the `dist=0` assumption
+  correct.
+
+**Where it runs**: the rectify containers are declared inside
+`zed_realsense_trio.launch.py` and start automatically as part of
+`scripts/launch_host_realsense.sh` (the `cams` tmux window) — **on the host**,
+same as the camera drivers, not inside the `vision` Docker container. See §3
+for why: the whole camera stack (ZED, both RealSenses, `flange_pose_publisher`)
+runs bare-metal via `launch_host_realsense.sh`; only the perception pipeline
+runner (`launch_pipeline_realsense.sh`) goes through `docker exec` into
+`vision`. `image_proc`/`image_pipeline` were therefore installed on the
+**host** system, not in the container:
+
+```bash
+sudo apt install ros-humble-image-proc ros-humble-image-pipeline
+```
+
+If you ever rebuild `mv_launch` after editing `zed_realsense_trio.launch.py`
+(§3's rebuild note also applies here — it's a `launch/` file, not compiled
+source, but the package needs reinstalling for the change to be picked up by
+`ros2 launch`):
+
+```bash
+cd ~/franka_ros2_ws
+colcon build --packages-select mv_launch
+source install/setup.bash
+```
+
+The raw `color/image_raw` and `aligned_depth_to_color/image_raw` topics are
+still published by the driver (nothing subscribes to them anymore within this
+repo, but they're harmless to leave running and useful as an independent
+liveness check — see the Step 2 verify block in §1 and the troubleshooting
+table above).
+
+---
+
+## 9. Where to read more
 
 - **[getting_started.md](getting_started.md)** — the original 3-ZED guide this
   variant is based on; calibration mental model, Foxglove setup, remote access, and
   the full troubleshooting table still apply.
+- **[calibration_cheatsheet.md](calibration_cheatsheet.md)** — condensed,
+  copy-pasteable command sequence for the whole dual-arm calibration routine
+  (§4 below), print-and-tape-to-the-rig style.
 - **[moveit_robot_control.md](moveit_robot_control.md)** — how to jog the KUKA
-  LBR via MoveIt's RViz plugin, used to position the arm between §4's
-  calibration samples.
+  LBR via MoveIt's RViz plugin, used to position the arm during §4.3 (Step 1)
+  captures.
 - **[README §6](../README.md#6-realsense-trio-variant)**
   — condensed version of §1 above, for quick reference.
 - **[config/camera_extrinsics_realsense.yaml](../config/camera_extrinsics_realsense.yaml)**
@@ -543,18 +739,53 @@ unchanged.
 - **[config/robot_bases.yaml](../config/robot_bases.yaml)** — named robot base
   offsets (Robot A / Robot B) and the `active_robot` selector used by §4's
   calibration scripts.
+- **[config/flange_poses/](../config/flange_poses/)** — permanent per-arm
+  flange pose captures written by `capture_flange_poses_dual.py` (§4.3) and
+  read back by `autocalibrate_dual_realsense.py` (§4.4). See
+  `src/calibration/flange_pose_store.py` for the JSON schema.
+- **[outputs/calibration_logs/](../outputs/calibration_logs/)** — append-only
+  JSON history of every calibration run's transforms + quality metrics (§4.6),
+  written by `calibration_log.py`.
+- **[src/calibration/capture_flange_poses_dual.py](../src/calibration/capture_flange_poses_dual.py)**
+  — dual-arm routine Step 1 (manual): jog each arm, save its flange poses
+  permanently. See §4.3.
+- **[src/calibration/autocalibrate_dual_realsense.py](../src/calibration/autocalibrate_dual_realsense.py)**
+  — dual-arm routine Step 2 (automatic): replays the saved poses to solve
+  hand-eye (Stage A), checkerboard pose (Stage B), and the ZED extrinsic
+  (Stage C). See §4.4.
+- **[src/calibration/moveit_dual_arm.py](../src/calibration/moveit_dual_arm.py)**
+  — `MoveGroup` action-client helper used by Step 2 above; the only code in
+  this repo that sends motion commands to the robot (`ArmTarget`,
+  `DualArmMoveitClient.move_to`, incl. the simultaneous `both_arms` goal).
+- **[src/calibration/flange_pose_store.py](../src/calibration/flange_pose_store.py)**
+  — JSON schema + save/load for `config/flange_poses/<left,right>.json`.
+- **[src/calibration/calibration_log.py](../src/calibration/calibration_log.py)**
+  — append-only JSON run logs under `outputs/calibration_logs/` (§4.6).
 - **[src/calibration/handeye_flange_cam_realsense.py](../src/calibration/handeye_flange_cam_realsense.py)**
-  — Stage 1: solves `T_flange_cam` via `cv2.calibrateHandEye`.
+  — manual single-camera fallback (§4.7): solves `T_flange_cam` via
+  `cv2.calibrateHandEye`. Its PnP/reprojection/AX=XB-solving helpers are
+  reused directly by the dual-arm Step 2 script above.
 - **[src/calibration/board_pose_from_flange_realsense.py](../src/calibration/board_pose_from_flange_realsense.py)**
-  — Stage 2: computes the checkerboard's pose in the robot base frame using
-  Stage 1's result.
+  — manual single-camera fallback (§4.7): computes the checkerboard's pose in
+  the robot base frame using Stage 1's result. Its averaging/RPY helpers are
+  reused directly by the dual-arm Step 2 script above.
+- **[src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py)**
+  — static camera-to-base calibration, now generalized to an arbitrary
+  `--cam-ids` list (defaults to the 3-ZED trio). §4.4 Stage C pins this to
+  the single `zed2i_1` via `scripts/calibrate_zed_from_board_pose.sh`.
 - **[src/calibration/realsense_devices.py](../src/calibration/realsense_devices.py)**
   — wraps `rs-enumerate-devices -s` to list/match connected RealSense cameras.
 - **[src/perception/ros/multicam_grabber_realsense.py](../src/perception/ros/multicam_grabber_realsense.py)**
   — the dynamic-extrinsics grabber; `_FlangeComposedExtrinsicsMap` is where the
   per-frame `T_base_flange @ T_flange_cam` composition happens.
 - **[../../franka_ros2_ws/src/mv_launch/launch/zed_realsense_trio.launch.py](../../franka_ros2_ws/src/mv_launch/launch/zed_realsense_trio.launch.py)**
-  — camera launch file (host side), also starts `flange_pose_publisher`.
+  — camera launch file (host side), also starts `flange_pose_publisher` and (§8)
+  the per-camera `image_proc` rectify containers.
 - **[../../franka_ros2_ws/src/mv_launch/mv_launch/flange_pose_publisher.py](../../franka_ros2_ws/src/mv_launch/mv_launch/flange_pose_publisher.py)**
   — tf2-based flange pose node; read its docstring for the `lbr_link_0 == base`
   assumption in full.
+- **§8** — RGB/depth rectification: why the RealSense color stream needs it
+  (real Brown-Conrady distortion, unlike the ZED which rectifies internally),
+  why depth needs rectifying too (pixel-grid alignment with `View.rgb`), and
+  the `ros-humble-image-proc`/`ros-humble-image-pipeline` host dependency it
+  introduces.
