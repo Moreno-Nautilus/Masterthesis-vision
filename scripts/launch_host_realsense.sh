@@ -27,14 +27,15 @@
 set -euo pipefail
 
 SESSION="${SESSION:-mv_host_realsense}"
+ZED_SERIAL="${ZED_SERIAL:-36829049}"
 RS1_SERIAL="${RS1_SERIAL:-260322275185}"
 RS2_SERIAL="${RS2_SERIAL:-260522275434}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-SRC_HOST="export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros/humble/setup.bash && source \"\$HOME/franka_ros2_ws/install/setup.bash\" && source \"$REPO_DIR/install/setup.bash\" && if [ -f \"\$HOME/franka_ros2_ws/install/setup.bash\" ]; then source \"\$HOME/franka_ros2_ws/install/setup.bash\"; fi"
+SRC_HOST="export RMW_IMPLEMENTATION=rmw_fastrtps_cpp && export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros/humble/setup.bash && source \"\$HOME/zed_ros2_ws/install/setup.bash\" && source \"$REPO_DIR/install/setup.bash\""
 SRC_ROS="$SRC_HOST"
 
-CAM_CMD="ros2 launch mv_launch zed_realsense_trio.launch.py rs1_serial:='$RS1_SERIAL' rs2_serial:='$RS2_SERIAL'"
+CAM_CMD="ros2 launch mv_launch zed_realsense_trio.launch.py cam1_serial:=$ZED_SERIAL rs1_serial:=$RS1_SERIAL rs2_serial:=$RS2_SERIAL"
 FOXGLOVE_CMD='ros2 launch foxglove_bridge foxglove_bridge_launch.xml address:=0.0.0.0 port:=8765'
 
 VIZ1_CMD='python3 -m src.perception.ros.learn_runners.visualize_pipeline --node-name foundationpose_external_visualizer_zed2i_1 --cam-id zed2i_1 --rgb-topic /zed2i_1/zed_node/rgb/color/rect/image --camera-info-topic /zed2i_1/zed_node/rgb/color/rect/image/camera_info --debug-topic /perception/fp/debug_frame/zed2i_1 --raw-out-topic /perception/fp/rgb_raw/zed2i_1_external --sam-out-topic /perception/fp/sam_overlay/zed2i_1_external --dino-out-topic /perception/fp/dino_overlay/zed2i_1_external --pose-out-topic /perception/fp/pose_overlay/zed2i_1_external --track-out-topic /perception/fp/track_overlay/zed2i_1_external --output-scale 0.5 --max-sync-dt-s 999'
