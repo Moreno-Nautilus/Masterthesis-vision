@@ -12,12 +12,15 @@ squares) is on hand, and you're starting from nothing running.
 
 ```bash
 # Terminal 1 — hardware interface (both arms)
-ros2 launch lbr_dual_arm_bringup hardware.launch.py
+# use_gripper defaults to true (Y-gripper attached, arm_one/arm_two tipped at
+# the gripper TCP); pass use_gripper:=false for the bare flange instead.
+ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
 ```
 
 ```bash
 # Terminal 2 — MoveIt + RViz (needed for Step 1 jogging AND Step 2's automatic moves)
-ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true
+# use_gripper must match Terminal 1's value.
+ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true use_gripper:=true
 ```
 
 Then on **both pendants** (left first, then right): start the `LBRServer` app
@@ -64,6 +67,19 @@ Same again for the **right** arm / `realsense_2`.
 
 ✅ Checkpoint: `config/flange_poses/left.json` and `right.json` each have 7
 entries. (`--append` if you need to add more later without starting over.)
+
+**Alternative — hand-guided capture**: instead of jogging in RViz, bring the
+rig up in gravity-compensation mode
+(`ros2 launch lbr_dual_arm_bringup calibration.launch.py`) and physically
+push each arm into place, then run
+`python3 -m src.calibration.capture_flange_poses_dual_handguided --arm left`
+(same for `right`). Also saves the joint configuration, not just the
+Cartesian pose, so Step 2's replay reproduces the exact captured posture
+instead of re-deriving one via IK. Captures from the two capture scripts are
+**not interchangeable** — `autocalibrate_dual_realsense.py` now requires
+joint positions on every capture it uses (see
+[hand_guided_calibration.md](hand_guided_calibration.md)) — pick one script
+and use it for both arms.
 
 ---
 

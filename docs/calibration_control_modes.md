@@ -1,0 +1,259 @@
+# Calibration Control Modes — Gravity Compensation / Cartesian Impedance / Admittance
+
+A walkthrough of the **three** ways the dual-arm rig can be driven during
+calibration, when to reach for each, and exactly how to bring each one up.
+This is the entry point — it cross-references
+[hand_guided_calibration.md](hand_guided_calibration.md) and
+[compliant_control.md](compliant_control.md) for the full technical detail
+behind each mode rather than repeating it here.
+
+> **TL;DR table**
+
+| | Gravity compensation | Cartesian impedance | Admittance |
+|---|---|---|---|
+| Status | **Used today** — Step 1 of calibration | Additive, not yet wired into any calibration script | Additive, not yet wired into any calibration script |
+| Command interface | `effort` (torque, ~zero task stiffness) | `effort` (torque, task-space spring) | `position` |
+| Controller | `gravity_compensation_lbr_one`/`_two` | `cartesian_impedance_lbr_one`/`_two` | `lbr_state_broadcaster_lbr_{one,two}` + `lbr_joint_position_command_controller_lbr_{one,two}` |
+| Bring-up | `calibration.launch.py` | `cartesian_impedance.launch.py` | `admittance.launch.py` |
+| Client (Masterthesis-vision) | `capture_flange_poses_dual_handguided.py` | `src/calibration/cartesian_impedance_dual_arm.py` | `src/calibration/admittance_dual_arm.py` |
+| Restoring/goal term | No — arm floats, operator positions it by hand | Yes — spring toward a commanded `target_frame` | No — holds wherever force stops |
+| Gains changeable at runtime | N/A (no task stiffness by design) | Yes, via `set_parameters` service, stationary-guarded | Yes, via `set_parameters` service, stationary-guarded |
+
+All three run on the **same URDF/rig**, just different `ros2_control`
+controllers activated by different launch files — you can only have **one**
+of these three (plus the default `hardware.launch.py`) active at a time per
+arm, since they contend for the same command interface.
+
+---
+
+## 1. Gravity compensation — hand-guiding the arm into place
+
+**What it is.** Near-zero commanded torque beyond a model-based gravity
+term — the arm floats, and you physically push it wherever you want. No
+task-space spring, no goal pose, nothing holding it in place once you let
+go except the KUKA cabinet's own brake/friction.
+
+**Where it fits today.** This is **Step 1** of the dual-arm hand-eye
+calibration routine — the alternative to RViz-jogging described in
+[calibration_cheatsheet.md §1](calibration_cheatsheet.md#1-capture-flange-poses-manual-5-min-per-arm).
+You hand-guide each arm to a pose where the checkerboard is visible, then
+`capture_flange_poses_dual_handguided.py` records both the Cartesian flange
+pose **and** the literal joint configuration (needed later because the
+7-DOF arm is redundant — see
+[hand_guided_calibration.md §1](hand_guided_calibration.md#1-why)).
+
+**Bring-up:**
+
+```bash
+source ~/franka_ros2_ws/install/setup.bash
+ros2 launch lbr_dual_arm_bringup calibration.launch.py use_gripper:=true
+```
+
+**Pendant settings required first** (`LBRServerSelect` → `LBRServer` app
+"Inputs" screen, both pendants): **FRI send period `1 ms`**, **FRI control
+mode `JOINT_IMPEDANCE_CONTROL`**, **FRI client command mode `TORQUE`** — see
+[hand_guided_calibration.md §3](hand_guided_calibration.md#3-hardware-bring-up-calibrationlaunchpy)
+for why each of these specifically (and how they differ from the
+position-mode/RViz-jogging pendant setup).
+
+**Capture:**
+
+```bash
+python3 -m src.calibration.capture_flange_poses_dual_handguided --arm left
+python3 -m src.calibration.capture_flange_poses_dual_handguided --arm right
+```
+
+**Full detail** (why it's a separate controller instance per arm, what the
+gravity term does/doesn't account for, the SRDF fix it surfaced): see
+[hand_guided_calibration.md](hand_guided_calibration.md).
+
+---
+
+## 2. Cartesian impedance — compliant execution of a Cartesian or joint-space goal
+
+**What it is.** A task-space spring-damper: command a pose
+(`target_frame`), and the controller applies torque proportional to the
+error, with `stiffness.*` setting how stiff that spring is per axis. Unlike
+gravity compensation, it **does** hold a goal and resist small pushes;
+unlike `joint_trajectory_controller`, it's genuinely compliant — push hard
+enough and it yields, rather than fighting back at full torque.
+
+**Where it fits.** Not wired into `autocalibrate_dual_realsense.py`
+today — that script still replays captures via
+`joint_trajectory_controller`'s hard position control (exact joint-space
+replay, see [hand_guided_calibration.md §7](hand_guided_calibration.md#7-replay-autocalibrate_dual_realsensepy)).
+This mode is available as a building block for anything calibration-adjacent
+that benefits from compliant motion instead — e.g. a compliant final
+approach before a capture, or driving the arm through a MoveIt-planned path
+without the trajectory controller's rigidity. Two ways to command it,
+matching what `capture_flange_poses_dual*.py` already saves:
+
+```python
+from src.calibration.cartesian_impedance_dual_arm import CartesianImpedanceDualArmClient
+from src.calibration.moveit_dual_arm import ArmTarget, JointTarget
+
+client = CartesianImpedanceDualArmClient(node)
+
+# A Cartesian pose (e.g. from FlangePoseCapture.T_armBase_flange):
+client.move_to_cartesian(ArmTarget(group_name="arm_one_flange", base_frame="lbr_one_link_0",
+                                    tip_link="lbr_one_link_ee", T_armBase_flange=pose))
+
+# The literal captured joint configuration (e.g. from a hand-guided
+# capture's joint_positions) -- FK'd to a target_frame, with the joint
+# vector itself set as a soft nullspace bias toward that elbow posture:
+client.move_to_joint_compliant("left", JointTarget(group_name="arm_one_flange",
+                                                     joint_positions=capture.joint_positions))
+```
+
+**Bring-up:**
+
+```bash
+source ~/franka_ros2_ws/install/setup.bash
+ros2 launch lbr_dual_arm_bringup cartesian_impedance.launch.py use_gripper:=true
+```
+
+**Defaults** (already reasonable out of the box, no configuration needed
+before first use): 1000 N/m translational / 30 Nm/rad rotational stiffness,
+`nullspace_stiffness: 0.0` (no elbow bias applied until you explicitly set
+one — see below). Named profiles for quick retuning:
+
+```python
+from src.calibration import gain_profiles
+from src.calibration.cartesian_impedance_dual_arm import GainSettings
+
+client.set_gains("left", GainSettings(**gain_profiles.load_impedance_profile("insertion")))
+```
+
+**Nothing about its compliance behavior changes except through a service
+call**, and gains specifically only while the arm is stationary — see
+[compliant_control.md §1](compliant_control.md#1-cartesian-impedance) for
+the full mechanism (`set_gains()` vs `set_nullspace_target()`, why the
+nullspace bias is soft, the `set_parameters`-based design).
+
+---
+
+## 3. Admittance — force-driven compliance on the position interface
+
+**What it is.** Software compliance built on top of *position* control, not
+torque: it reads the FRI-estimated external joint torque, converts it to a
+task-space force, and integrates a position setpoint that moves in response
+— push it and it yields in that direction; stop pushing and it just holds
+there (no spring back to a nominal pose, unlike cartesian impedance — see
+[compliant_control.md §2](compliant_control.md#2-admittance)).
+
+**Where it fits.** Also not wired into any calibration script yet. The
+closest existing thing it complements is gravity-compensation hand-guiding
+(§1) — both let you push the arm around by hand — but admittance runs on
+the position interface (no torque command mode needed) and is tunable
+per-axis (deadband + responsiveness), where gravity compensation is
+"floats everywhere, uniformly." Useful if you ever want programmatic,
+force-sensitive positioning without switching the rig into torque mode at
+all.
+
+**Bring-up:**
+
+```bash
+source ~/franka_ros2_ws/install/setup.bash
+ros2 launch lbr_dual_arm_bringup admittance.launch.py use_gripper:=true
+```
+
+**Running it:**
+
+```python
+from src.calibration.admittance_dual_arm import AdmittanceDualArmNode
+import rclpy
+
+node = AdmittanceDualArmNode()
+rclpy.spin(node)  # one control step per incoming LBRState message, per arm
+```
+
+**Defaults** are applied automatically at startup from
+`config/admittance_gain_profiles.yaml`'s `"holding"` profile — nothing to
+configure before first use. Changing them afterward is **only** possible
+through the node's standard `~/set_parameters` service (no bare Python
+setter exists), and only while that arm is stationary — see
+[compliant_control.md §2](compliant_control.md#2-admittance) for the exact
+service-call pattern and the stationary-guard mechanics.
+
+**New dependency**: needs `optas` (added to
+[Dockerfile.thesisnewcuda](../Dockerfile.thesisnewcuda), not yet in the
+built `vision` image — rebuild it before running this).
+
+---
+
+## 4. Picking a mode during an actual calibration session
+
+Walking the existing routine
+([calibration_cheatsheet.md](calibration_cheatsheet.md)) end to end with
+where each mode could apply:
+
+1. **Bring up hardware** — `hardware.launch.py` (default, position mode) if
+   you're jogging in RViz for Step 1, **or** `calibration.launch.py`
+   (§1, gravity compensation) if you're hand-guiding instead. Pick one; they
+   both feed the same capture scripts, just via different positioning
+   methods.
+2. **Step 1, capture** — either RViz jogging (`hardware.launch.py` +
+   `move_group.launch.py`, unchanged) or hand-guiding (§1). Cartesian
+   impedance/admittance aren't used here today, but hand-guiding-via-admittance
+   (§3) is a plausible drop-in alternative to gravity compensation if you
+   ever want per-axis-tunable compliance instead of uniform floating — not
+   currently scripted, would need a small capture-script variant.
+3. **Step 2, automatic replay** — `autocalibrate_dual_realsense.py`, still
+   `joint_trajectory_controller` under the hood (exact joint-space replay,
+   unaffected by anything in this doc). Cartesian impedance (§2) is what
+   you'd reach for if replay ever needs to be compliant instead of rigid
+   (e.g. the checkerboard/fixture might be in the way and you'd rather the
+   arm yield than fault) — `move_to_joint_compliant()` is a drop-in
+   candidate for that, but nothing currently calls it from the replay
+   script.
+4. **Anything requiring contact** (e.g. probing a fixture, force-sensitive
+   alignment) is a genuinely new capability none of the existing
+   calibration scripts need yet — admittance (§3) or cartesian impedance
+   with a low `insertion`-style stiffness profile (§2) are the two starting
+   points, not the current gravity-compensation/position-control routine.
+
+**Bottom line for calibration as it exists today**: you only need §1
+(gravity compensation) to run the routine end to end. §2 and §3 are ready
+building blocks for compliant capture/replay variants, not yet integrated
+into `capture_flange_poses_dual_handguided.py` or
+`autocalibrate_dual_realsense.py`.
+
+---
+
+## 5. Quick command reference
+
+```bash
+# Gravity compensation (Step 1, hand-guided capture)
+ros2 launch lbr_dual_arm_bringup calibration.launch.py use_gripper:=true
+python3 -m src.calibration.capture_flange_poses_dual_handguided --arm left
+python3 -m src.calibration.capture_flange_poses_dual_handguided --arm right
+
+# Cartesian impedance (additive)
+ros2 launch lbr_dual_arm_bringup cartesian_impedance.launch.py use_gripper:=true
+
+# Admittance (additive)
+ros2 launch lbr_dual_arm_bringup admittance.launch.py use_gripper:=true
+
+# Default position-controlled pipeline (Step 1 RViz jogging, Step 2 replay)
+ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
+ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true use_gripper:=true
+python3 -m src.calibration.autocalibrate_dual_realsense
+```
+
+Only one of `hardware.launch.py` / `calibration.launch.py` /
+`cartesian_impedance.launch.py` / `admittance.launch.py` should be running
+per arm at a time — `Ctrl+C` the current bring-up before switching modes.
+
+## Where to read more
+
+- **[hand_guided_calibration.md](hand_guided_calibration.md)** — gravity
+  compensation in full: where it comes from, its limits, the SRDF fix it
+  surfaced, and how `capture_flange_poses_dual_handguided.py` /
+  `autocalibrate_dual_realsense.py` changed to support it.
+- **[compliant_control.md](compliant_control.md)** — cartesian impedance
+  and admittance in full: the controller patch, the `set_parameters`-only
+  design, gain profiles, and known caveats.
+- **[calibration_cheatsheet.md](calibration_cheatsheet.md)** — the
+  commands-only walkthrough of the calibration routine itself.
+- **[moveit_robot_control.md](moveit_robot_control.md)** — the default
+  RViz-jogging / MoveGroup workflow these modes sit alongside.

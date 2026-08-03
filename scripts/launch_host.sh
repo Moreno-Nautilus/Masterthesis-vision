@@ -16,6 +16,11 @@
 # Set NUM_CAMERAS=2 to skip the viz window for the 3rd camera (zed2i_3):
 #   NUM_CAMERAS=2 scripts/launch_host.sh
 #
+# Run "calibrate" (or set CALIBRATE_2K=1) to grab/publish at the ZED2i's
+# HD2K resolution (15fps) instead of the default HD1080 (30fps) --
+# higher-accuracy checkerboard corner detection for calibration:
+#   scripts/launch_host.sh calibrate
+#
 # Switch windows in tmux: Ctrl+b then 0/1/2/3/4 (or n/p for next/prev).
 # Detach without killing: Ctrl+b d.
 
@@ -23,12 +28,20 @@ set -euo pipefail
 
 SESSION="${SESSION:-mv_host}"
 NUM_CAMERAS="${NUM_CAMERAS:-3}"
+CALIBRATE_2K="${CALIBRATE_2K:-0}"
+if [ "${1:-}" = "calibrate" ]; then
+    CALIBRATE_2K=1
+    shift
+fi
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SRC_HOST="export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/ros/humble/setup.bash && source \"\$HOME/franka_ros2_ws/install/setup.bash\" && source \"$REPO_DIR/install/setup.bash\" && if [ -f \"\$HOME/franka_ros2_ws/install/setup.bash\" ]; then source \"\$HOME/franka_ros2_ws/install/setup.bash\"; fi"
 SRC_ROS="$SRC_HOST"
 
 CAM_CMD='ros2 launch mv_launch zed2i_pair.launch.py'
+if [ "$CALIBRATE_2K" = "1" ]; then
+    CAM_CMD="$CAM_CMD override_path:=/home/pdzuser/zed_ros2_ws/src/mv_launch/config/zed_override_2k.yaml"
+fi
 FOXGLOVE_CMD='ros2 launch foxglove_bridge foxglove_bridge_launch.xml address:=0.0.0.0 port:=8765'
 
 VIZ1_CMD='python3 -m src.perception.ros.learn_runners.visualize_pipeline --node-name foundationpose_external_visualizer_zed2i_1 --cam-id zed2i_1 --rgb-topic /zed2i_1/zed_node/rgb/color/rect/image --camera-info-topic /zed2i_1/zed_node/rgb/color/rect/image/camera_info --debug-topic /perception/fp/debug_frame/zed2i_1 --raw-out-topic /perception/fp/rgb_raw/zed2i_1_external --sam-out-topic /perception/fp/sam_overlay/zed2i_1_external --dino-out-topic /perception/fp/dino_overlay/zed2i_1_external --pose-out-topic /perception/fp/pose_overlay/zed2i_1_external --track-out-topic /perception/fp/track_overlay/zed2i_1_external --output-scale 0.5 --max-sync-dt-s 999'

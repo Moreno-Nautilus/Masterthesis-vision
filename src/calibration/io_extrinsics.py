@@ -11,8 +11,17 @@ def load_extrinsics_yaml(path: str | Path) -> dict[str, SE3]:
     """
     YAML format:
     cam_id:
-      R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # row-major
-      t: [tx,ty,tz]
+      R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # row-major (not column-major)
+      t: [tx,ty,tz]                                # meters
+
+    R/t is the camera-to-{base,flange} transform, applied as
+    p_dst = R @ p_cam + t. Which frame "dst" is depends on the file: for
+    config/camera_extrinsics_base.yaml and the zed2i_1 entry of
+    config/camera_extrinsics_realsense.yaml, dst is the active robot's
+    lbr_link_0 (see config/robot_bases.yaml: active_robot); for the
+    realsense_1/realsense_2 entries of config/camera_extrinsics_realsense.yaml,
+    dst is that same active robot's lbr_link_ee (flange) -- see
+    src/calibration/handeye_flange_cam_realsense.py.
     """
     path = Path(path)
     data = yaml.safe_load(path.read_text())
@@ -29,8 +38,11 @@ def save_extrinsics_yaml(path: str | Path, extr: dict[str, SE3]) -> None:
     """
     Writes YAML format:
     cam_id:
-      R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # row-major
-      t: [tx,ty,tz]
+      R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # row-major (not column-major)
+      t: [tx,ty,tz]                                # meters
+
+    See load_extrinsics_yaml() for the exact convention (p_dst = R @ p_cam + t)
+    and which frame "dst" is for each file/entry.
     """
     path = Path(path)
     # Flatten each camera's SE3 into the row-major R + t YAML layout.

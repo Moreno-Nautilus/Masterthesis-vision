@@ -1,0 +1,32 @@
+# Named compliance profiles for admittance_dual_arm.py's
+# AdmittanceDualArmNode.set_gain_profile(), applied directly to the running
+# lbr_demos_advanced_py.AdmittanceController instance's f_ext_th/dq_gains/
+# dx_gains (no public setter exists upstream, see the call site). Only
+# apply these while the target arm's admittance loop is stationary (its own
+# |dq| below threshold) -- set_gain_profile() enforces this itself.
+#
+# f_ext_th [N,N,N,Nm,Nm,Nm] -- external-force deadband; below this,
+# measured force is ignored entirely (the law never sees it).
+# dq_gains [7 joint gains] -- how strongly task-space velocity maps to each
+# joint's velocity command.
+# dx_gains [Fx,Fy,Fz,Tx,Ty,Tz] -- how much task-space velocity results per
+# unit of (deadbanded) external force/torque.
+# There is no restoring/stiffness term (see admittance_dual_arm.py's module
+# docstring) -- these profiles only change how sensitive/fast the yield is,
+# not whether the arm returns to a nominal pose after being pushed.
+#
+# "holding" -- less sensitive, slower to yield (closer to rigid); starting
+# point is lbr_demos_advanced_py's own defaults. "insertion" -- more
+# sensitive (lower deadband) and faster to yield, for contact-seeking /
+# alignment tasks. Illustrative starting points, not validated for a
+# specific task -- tune per-axis for real use.
+
+holding:
+  f_ext_th: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
+  dq_gains: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  dx_gains: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+insertion:
+  f_ext_th: [0.5, 0.5, 0.5, 0.2, 0.2, 0.2]
+  dq_gains: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  dx_gains: [0.3, 0.3, 0.3, 0.2, 0.2, 0.2]

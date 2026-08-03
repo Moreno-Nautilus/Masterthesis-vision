@@ -20,16 +20,32 @@ camera pipeline as usual; tracked parts should appear in RViz once you
 Add -> moveit_ros_visualization -> PlanningScene and set its
 "Planning Scene Topic" to /planning_scene (Fixed Frame is already "world",
 matching --planning-scene-frame-id's default).
+
+This also broadcasts config/camera_extrinsics_base.yaml and
+config/camera_extrinsics_realsense.yaml as static TF frames (see
+src/calibration/publish_extrinsics_tf.py) hanging off the mock robot's own
+lbr_link_0 / lbr_link_ee frames, so Add -> TF in RViz shows the calibrated
+camera poses (zed2i_1/2/3, realsense_1/2) alongside the robot.
+
+It also publishes the ZED cameras + their mounting holders as
+CollisionObjects on /planning_scene, at the same zed2i_* poses (see
+src/calibration/publish_camera_scene_objects.py, Assets/ZED2.stl,
+Assets/zed_camer_holder.stl) -- these show up in the same PlanningScene
+display as the tracked parts, alongside the TF frames above.
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import ExecuteProcess
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
+
+
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -87,4 +103,23 @@ def generate_launch_description() -> LaunchDescription:
         arguments=["-d", rviz_config],
     )
 
-    return LaunchDescription([mock_robot, move_group, rviz])
+    # Not an installed ROS package executable, so run it as a plain module
+    # via ExecuteProcess instead of launch_ros's Node action.
+    extrinsics_tf = ExecuteProcess(
+        cmd=["python3", "-m", "src.calibration.publish_extrinsics_tf"],
+        cwd=REPO_DIR,
+        output="screen",
+    )
+
+    # Publishes the ZED cameras + their mounting holders as CollisionObjects
+    # on /planning_scene, at the zed2i_* poses from camera_extrinsics_base.yaml
+    # -- see src/calibration/publish_camera_scene_objects.py.
+    camera_scene_objects = ExecuteProcess(
+        cmd=["python3", "-m", "src.calibration.publish_camera_scene_objects"],
+        cwd=REPO_DIR,
+        output="screen",
+    )
+
+    return LaunchDescription(
+        [mock_robot, move_group, rviz, extrinsics_tf, camera_scene_objects]
+    )

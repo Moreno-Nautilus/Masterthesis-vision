@@ -20,6 +20,13 @@ that publishes a canonical pose per object in the **robot base frame**.
 > for the full step-by-step run sequence, or [§6 below](#6-realsense-trio-variant)
 > for a quick reference — a separate, parallel pipeline (own
 > scripts/config/launch files); nothing above is affected by it.
+>
+> **Just want to view tracked objects / camera poses in RViz?** See
+> **[docs/visualization.md](docs/visualization.md)** for the MoveIt2 planning
+> scene view and camera-extrinsics TF frames — the 2D per-camera overlays
+> (Foxglove) are covered in
+> [docs/getting_started.md §1](docs/getting_started.md#watch-the-result-in-foxglove)
+> instead.
 
 ---
 
@@ -44,8 +51,9 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **N-camera extrinsic calibration** (checkerboard → base frame) — see §4. Defaults to the 3-ZED trio; accepts `--cam-ids` for any subset (e.g. the RealSense-trio rig's single `zed2i_1`). |
 | [src/calibration/io_extrinsics.py](src/calibration/io_extrinsics.py) | Load/save extrinsics YAML (`R` row-major + `t`) ↔ `SE3`. |
 | [src/calibration/capture_flange_poses_dual.py](src/calibration/capture_flange_poses_dual.py) | Dual-arm calibration, Step 1 (manual): jog + save each arm's flange poses permanently to `config/flange_poses/` — see §6. |
+| [src/calibration/capture_flange_poses_dual_handguided.py](src/calibration/capture_flange_poses_dual_handguided.py) | Step 1's hand-guided twin: gravity-compensation bring-up instead of RViz jogging, also saves the joint configuration — see [docs/hand_guided_calibration.md](docs/hand_guided_calibration.md). |
 | [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Step 2 (automatic): replays the saved poses to solve hand-eye + checkerboard pose + ZED extrinsic — see §6. |
-| [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above). |
+| [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above); Cartesian (`ArmTarget`/`move_to()`) and joint-space (`JointTarget`/`move_to_joint()`) goal types. |
 | [src/calibration/flange_pose_store.py](src/calibration/flange_pose_store.py) | JSON schema + save/load for the permanently-stored flange pose captures. |
 | [src/calibration/calibration_log.py](src/calibration/calibration_log.py) | Append-only JSON run logs (camera/checkerboard/flange transforms + quality metrics) under `outputs/calibration_logs/`. |
 | [src/utils/se3.py](src/utils/se3.py) | Minimal immutable `SE3` rigid-transform type. |
@@ -153,6 +161,7 @@ Foxglove bridge, a `visualize_pipeline` per camera, and `debug_pose_axes`.
 scripts/launch_host.sh            # start (and attach) the tmux session
 scripts/launch_host.sh attach     # re-attach if already running
 scripts/launch_host.sh stop       # kill the session
+scripts/launch_host.sh calibrate  # same, but ZEDs grab/publish at HD2K/15fps (see §4)
 ```
 
 tmux: `Ctrl+b` then `0..5` to switch windows, `Ctrl+b d` to detach.
@@ -203,6 +212,25 @@ the cameras move:
 ```bash
 scripts/launch_host.sh          # window 0 runs the ZED driver
 ```
+
+   For better checkerboard corner detection, launch with `calibrate` instead —
+   this grabs/publishes at the ZED2i's HD2K resolution (2208x1242 @ 15fps)
+   rather than the normal HD1080 @ 30fps used for tracking:
+
+```bash
+scripts/launch_host.sh calibrate    # same tmux session, cameras at HD2K/15fps
+```
+
+   Under the hood this passes `override_path:=config/zed_override_2k.yaml`
+   (vs. the default `config/zed_override_native.yaml`) to
+   `mv_launch`'s `zed2i_pair.launch.py` — both files live in the separate
+   `~/franka_ros2_ws` ROS workspace, not this repo. Equivalent to setting
+   `CALIBRATE_2K=1 scripts/launch_host.sh`.
+
+   If a camera fails to open (`CAMERA NOT DETECTED` in the `cams` window —
+   USB enumeration flakiness happens), calibrate with just the cameras that
+   came up, e.g. `--cam-ids zed2i_2 zed2i_3` in step 3 below (see
+   `base_to_cams_calib_3.py --help`; any subset of size N≥1 works).
 
 **2. Set the board pose** in
    [config/base_board_pose.yaml](config/base_board_pose.yaml): the translation
@@ -297,11 +325,15 @@ python3 -m src.calibration.autocalibrate_dual_realsense
 
 Step 1 still needs jogging the arm interactively via MoveIt between samples;
 see **[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for
-that part. Step 2 needs no jogging — it drives both arms itself over the
+that part — or skip jogging entirely with the hand-guided alternative
+(gravity-compensation bring-up + `capture_flange_poses_dual_handguided.py`),
+see **[docs/hand_guided_calibration.md](docs/hand_guided_calibration.md)**.
+Step 2 needs no jogging — it drives both arms itself over the
 `moveit_msgs/action/MoveGroup` action (see
 [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py)),
-including one simultaneous `both_arms` goal per pose-pair for the hand-eye
-stage.
+including one simultaneous `both_arms_flange` goal per pose-pair for the
+hand-eye stage (calibration always targets the bare flange, regardless of
+whether the Y-gripper is attached — see `moveit_dual_arm.py`'s docstring).
 
 The original single-arm, single-camera manual scripts
 (`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`)
@@ -314,66 +346,33 @@ still work standalone — see
 
 Both pipeline runners (`run_pipeline_track_multicam.py` and the RealSense
 variant) publish each tracked part as a `moveit_msgs/CollisionObject` on
-`/planning_scene`, in addition to the existing pose topics. The mesh geometry
-(from `Data/CAD_Models_centered/`) is embedded directly in the message — a
-subscriber (RViz, `move_group`, ...) needs no filesystem access to the CAD
-files at all.
+`/planning_scene`, plus each camera's calibrated pose as a static TF frame —
+so RViz can show the tracked parts and cameras alongside a mock robot without
+any real hardware.
 
-- **Identity**: each object is keyed `"{assembly_name}/{part_id}"` (e.g.
-  `plumbers_block/0`), matching the same identity already used for the
-  `pub_fused_assembly` pose topic. Repeated same-mesh parts (e.g. multiple
-  `pb_screw` instances) get one distinct `CollisionObject` per slot, all
-  sharing the same mesh geometry.
-- **Frame**: every `CollisionObject` header uses a fixed frame name from
-  `--planning-scene-frame-id` (default `world`) — **not** a tf2 lookup. Set
-  this to whatever frame your robot/world is actually spawned under if it
-  isn't `world`.
-- **Non-blocking, fail-soft**: publishing is a plain topic publish (never a
-  blocking service call), and `_publish_planning_scene_object`/
-  `_remove_planning_scene_objects` swallow all failures internally (missing
-  mesh, bad pose, publish error) after logging once — a problem here never
-  slows or crashes the detection/tracking loop.
-- **Removal**: when a track's `pose_status` transitions to `lost` (see
-  `_tick()`'s `_force_reinit_tracks` handling), its `CollisionObject` is
-  retracted from the scene with a `REMOVE` op.
+See **[docs/visualization.md](docs/visualization.md)** for the full guide:
+what gets published and why, how to bring up the RViz scene view with
+[scripts/view_scene.sh](scripts/view_scene.sh), and how to view/check the
+camera extrinsics as TF frames.
+If you need the other robot's frame, pass a different `--base-yaml`.
 
-### Viewing it in RViz
+---
 
-RViz's `PlanningScene`/`MotionPlanning` display needs a `robot_description`
-to initialize against, and needs a `move_group` (or similar) already
-maintaining a base scene before it can apply our `is_diff:=true` updates —
-otherwise it reports "no planning scene loaded" even though the topic is
-publishing correctly. There's no need for the real robot hardware for any of
-this — a mock robot is enough.
+## 8. Compliant control (Cartesian impedance / admittance)
 
-[scripts/launch_moveit_scene_viewer.launch.py](scripts/launch_moveit_scene_viewer.launch.py)
-bundles a mock `iiwa7`, `move_group`, and RViz together for exactly this:
+Two additive execution paths for the dual-arm rig, alongside the
+position-controlled MoveGroup pipeline above — a torque-mode Cartesian
+impedance controller with runtime-adjustable gains, and a software
+admittance loop on the position interface. See
+**[docs/compliant_control.md](docs/compliant_control.md)** for bring-up
+commands, the client APIs
+(`src/calibration/cartesian_impedance_dual_arm.py`,
+`src/calibration/admittance_dual_arm.py`), named gain profiles, and known
+caveats.
 
-```bash
-source /opt/ros/humble/setup.bash
-source ~/franka_ros2_ws/install/setup.bash   # wherever the lbr_fri_ros2_stack workspace lives
-ros2 launch /path/to/Masterthesis-vision/scripts/launch_moveit_scene_viewer.launch.py
-```
-
-Then in RViz: **Add → By display type → moveit_ros_visualization →
-PlanningScene**, and set its **Planning Scene Topic** to `/planning_scene`.
-Fixed Frame is already `world` in the bundled RViz config, matching
-`--planning-scene-frame-id`'s default.
-
-Notes/quirks (already hit and fixed once, so no need to rediscover them):
-- `lbr_bringup`'s own `move_group.launch.py`/`rviz.launch.py` don't expose a
-  namespace argument, but the mock robot (`lbr_bringup mock.launch.py`) runs
-  everything under `/lbr` — the bundled launch file builds `move_group`/RViz
-  as raw `Node` actions with `namespace="lbr"` instead of including those
-  launch files directly.
-- Namespacing `move_group` under `/lbr` also remaps its `/planning_scene`
-  subscription to `/lbr/planning_scene` by default, disconnecting it from the
-  bare `/planning_scene` topic the pipeline publishes on — the bundled launch
-  file remaps it back explicitly (`("/lbr/planning_scene", "/planning_scene")`,
-  same for `monitored_planning_scene`/`planning_scene_world`/
-  `collision_object`/`attached_collision_object`).
-- Collision meshes render with flat per-triangle shading that shifts as you
-  orbit the camera (`shape_msgs/Mesh` carries no vertex normals) — this is a
-  cosmetic limitation of RViz's collision-object rendering, not a sign of bad
-  geometry or a wrong pose; it doesn't affect MoveIt's actual collision
-  checking, which uses the raw triangle mesh directly.
+**New to these modes, or picking one for a calibration session?** Start
+with **[docs/calibration_control_modes.md](docs/calibration_control_modes.md)**
+instead — a walkthrough of all three dual-arm control modes (gravity
+compensation, Cartesian impedance, admittance) side by side: what each
+does, when to reach for it, and how each fits (or doesn't yet) into the
+existing calibration routine.

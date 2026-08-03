@@ -72,7 +72,8 @@ RUN pip install \
     iopath \
     opencv-python \
     h5py \
-    transformers
+    transformers \
+    optas
 
 RUN pip install \
     torch==2.7.0 \
