@@ -7,8 +7,8 @@ that publishes a canonical pose per object in the **robot base frame**.
 
 > **New here / just want to calibrate and run it?** Start with
 > **[docs/getting_started.md](docs/getting_started.md)** — a linear, student-facing
-> calibrate → run → view guide for the lab rig. There's also a one-page
-> **[cheat sheet](docs/cheatsheet.md)** (commands only) to print and tape to the rig.
+> calibrate → run → view guide for the lab rig. The one-page lab cheat sheet is
+> shared separately because it contains workstation-specific credentials.
 >
 > **For a step-by-step description of how the pipeline actually runs,
 > read [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).** This README
@@ -59,32 +59,258 @@ that publishes a canonical pose per object in the **robot base frame**.
 
 ## 2. Setup
 
+Fresh workstation setup has this order:
+
+1. Install host-side prerequisites: NVIDIA driver + NVIDIA Container Toolkit,
+   Docker, tmux, ROS 2 Humble, and the camera/robot ROS workspaces used by the
+   host launch scripts.
+2. Clone this repo, initialize submodules, clone Cutie, and apply the
+   FoundationPose patch.
+3. Build the Docker image and create the long-lived `vision` container.
+4. Download model weights/checkpoints into the paths listed below.
+5. Run the one-time build/install commands inside the container.
+6. Create/populate `Data/`, then calibrate cameras or run the saved calibration.
+
+### Host prerequisites
+
+The camera drivers and visualization run on the host, not in Docker. The launch
+scripts assume these are already available on the workstation:
+
+- NVIDIA driver new enough for CUDA 12.6 and `nvidia-smi`.
+- Docker plus the NVIDIA Container Toolkit, so `docker run --gpus all ...` works.
+- `tmux`, used by all launch scripts.
+- ROS 2 Humble on Ubuntu 22.04.
+- Host ROS overlay workspaces sourced by the scripts:
+  - [scripts/launch_host.sh](scripts/launch_host.sh) sources
+    `$HOME/franka_ros2_ws/install/setup.bash`.
+  - [scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh) sources
+    `$HOME/zed_ros2_ws/install/setup.bash`.
+
+If your workstation uses different host workspace names, edit the `SRC_HOST`
+line in the corresponding launch script. Leave the rest of this repo in its own
+checkout; the scripts compute the repo root dynamically.
+
+#### Building the host camera/robot workspaces from zero
+
+The root of this repo contains zipped copies of the lab-specific host packages:
+
+- `mv_launch.zip` — custom ROS 2 package with `zed2i_pair.launch.py`,
+  `zed_realsense_trio.launch.py`, `thesis_stack.launch.py`, and
+  `flange_pose_publisher`.
+- `fri.zip` — KUKA FRI client SDK ROS package (`fri_client_sdk`).
+- `lbr_fri_idl.zip` — KUKA FRI message definitions.
+- `lbr_fri_ros2_stack.zip` — KUKA LBR ROS 2 / MoveIt stack used by the robot
+  side.
+
+These packages are for the **host** workspaces, not the Docker container. Put
+`mv_launch` in the host overlay sourced by the launch script you use. With the
+current scripts, [scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh)
+expects it in `~/zed_ros2_ws`, while [scripts/launch_host.sh](scripts/launch_host.sh)
+expects it through `~/franka_ros2_ws`.
+
+Camera workspace example:
+
+```bash
+sudo apt install unzip python3-colcon-common-extensions python3-rosdep
+sudo apt install ros-humble-foxglove-bridge ros-humble-image-proc ros-humble-image-pipeline
+sudo rosdep init || true
+rosdep update
+
+mkdir -p ~/zed_ros2_ws/src
+cd ~/zed_ros2_ws/src
+unzip /path/to/Masterthesis-vision/mv_launch.zip
+
+cd ~/zed_ros2_ws
+source /opt/ros/humble/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --packages-select mv_launch
+source install/setup.bash
+```
+
+`mv_launch` also needs the camera driver packages to be discoverable in that same
+sourced environment:
+
+- `zed_wrapper` for the ZED cameras.
+- `realsense2_camera` for the RealSense variant.
+
+Install/build those according to the lab workstation setup or the vendor docs
+before running the host launch scripts. After unzipping `mv_launch`, check the
+hardcoded `override_path` in
+`~/zed_ros2_ws/src/mv_launch/launch/zed2i_pair.launch.py` and
+`~/zed_ros2_ws/src/mv_launch/launch/zed_realsense_trio.launch.py`; the zipped
+version points at `/home/pdzuser/zed_ros2_ws/src/mv_launch/config/zed_override_native.yaml`.
+Change it if the workspace lives somewhere else. If you put `mv_launch` in
+`~/franka_ros2_ws` for the standard 3-ZED script, check the same launch files
+under that workspace instead.
+
+Robot workspace example:
+
+```bash
+sudo apt install unzip python3-colcon-common-extensions python3-rosdep
+sudo rosdep init || true
+rosdep update
+
+mkdir -p ~/franka_ros2_ws/src
+cd ~/franka_ros2_ws/src
+unzip /path/to/Masterthesis-vision/fri.zip
+unzip /path/to/Masterthesis-vision/lbr_fri_idl.zip
+unzip /path/to/Masterthesis-vision/lbr_fri_ros2_stack.zip
+
+cd ~/franka_ros2_ws
+source /opt/ros/humble/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+colcon build
+source install/setup.bash
+```
+
+If `rosdep` reports missing MoveIt, controller, Gazebo, ZED, or RealSense system
+packages, install the reported `ros-humble-*` packages on the host and rerun the
+same `rosdep`/`colcon build` commands.
+
 ### 2.1 Third-party code (`external/`)
 
-The heavy models are pinned as submodules, not vendored. See
-[external/README.md](external/README.md) for details. In short:
+Most third-party code is pinned as submodules, not vendored. This includes
+`external/FoundationPose`, `external/dinov2`, `external/sam2`, and the custom ROS
+message package `src/fp_debug_msgs`.
 
 ```bash
 git submodule update --init --recursive
 bash external/apply_patches.sh        # applies the FoundationPose thesis patch (idempotent)
 ```
 
-**Cutie** has no public upstream and is git-ignored, so it is not pulled by the
-submodule update. Clone it separately into `external/Cutie` and check out the
-pinned commit `ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a` (see
-[external/README.md](external/README.md)).
+`src/fp_debug_msgs` is a submodule using the SSH URL
+`git@github.com:Moreno-Nautilus/fp_debug_msgs.git` on branch
+`assembly-cell-interfaces`. If submodule checkout fails there, the workstation
+needs GitHub SSH access to that repo, or the submodule URL needs to be changed to
+an accessible HTTPS URL.
+
+**Cutie** is git-ignored in this repo and is not pulled by `git submodule
+update`. Clone it separately into `external/Cutie` and check out the pinned
+commit used by this thesis code:
+
+```bash
+git clone https://github.com/hkchengrex/Cutie.git external/Cutie
+git -C external/Cutie checkout ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a
+```
+
+See [external/README.md](external/README.md) for more background on the
+third-party imports and the FoundationPose patch.
 
 ### 2.2 Docker
 
 The pipeline runs inside a CUDA container built from
 [Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda). The launch scripts assume a
-container named `vision` already exists (they `docker start`/`stop` it, they do
-not build it). Override the name with the `CONTAINER` env var.
+container named `vision` already exists: they `docker start`/`stop` it and
+`docker exec` into it, but they do not build or create it. Override the name with
+the `CONTAINER` env var if needed.
+
+Build the image from the repo root:
+
+```bash
+docker build -f Dockerfile.thesisnewcuda -t masterthesis:cu126-vision .
+```
+
+Create the long-lived container. The repo is mounted as
+`/workspace/Masterthesis-vision`:
+
+```bash
+docker create -it \
+  --name vision \
+  --gpus all \
+  --network host \
+  --ipc host \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -v "$PWD:/workspace/Masterthesis-vision" \
+  -w /workspace/Masterthesis-vision \
+  masterthesis:cu126-vision \
+  bash
+```
+
+The container uses host networking so it can see the ROS 2 camera topics
+published by the host stack. The camera drivers themselves stay on the host.
+
+The Dockerfile creates one Python environment:
+
+```text
+/opt/thesis-venv
+```
+
+This is a `python3 -m venv --system-site-packages` environment, not conda. The
+`--system-site-packages` flag is intentional: ROS 2 Python packages such as
+`rclpy`, `ament_index_python`, and the `rosidl` tooling come from Ubuntu/ROS apt
+packages in the system Python, while the ML stack is installed with pip in the
+venv.
+
+Older notes may call this environment `ros-thesis-venv`; in the current Docker
+setup the environment is `/opt/thesis-venv`.
+
+PyTorch and PyTorch3D are installed by the Dockerfile, not manually and not via
+conda:
+
+- `torch==2.7.0`, `torchvision==0.22.0`, `torchaudio==2.7.0` from the PyTorch
+  CUDA 12.6 wheel index.
+- `nvdiffrast` from `git+https://github.com/NVlabs/nvdiffrast.git`.
+- `pytorch3d` from
+  `git+https://github.com/facebookresearch/pytorch3d.git@stable`.
+
+`nvdiffrast` and `pytorch3d` are installed after Torch with
+`--no-build-isolation`, so their CUDA extensions build against the Torch version
+already present in `/opt/thesis-venv`.
+
+#### One-time build/install inside the container
+
+After creating the container, start it and run the project-local installs/builds
+once:
+
+```bash
+docker start vision
+docker exec -it vision bash
+```
+
+Inside the container:
+
+```bash
+# The launch scripts currently still use the legacy path /workspace/MasterThesis.
+# Keep this symlink on every workstation unless the launch scripts are updated.
+ln -sfn /workspace/Masterthesis-vision /workspace/MasterThesis
+
+cd /workspace/Masterthesis-vision
+source /opt/ros/humble/setup.bash
+source /opt/thesis-venv/bin/activate
+
+# SAM2 is installed editable, but without dependency resolution so pip does not
+# replace the Torch/CUDA versions pinned by the Dockerfile.
+pip install --no-deps -e external/sam2
+
+# FoundationPose's C++ helper used by Utils.py. Use build_all_conda.sh here;
+# build_all.sh assumes the upstream FoundationPose /kaolin Docker layout.
+cd external/FoundationPose
+bash build_all_conda.sh
+cd /workspace/Masterthesis-vision
+
+# fp_debug_msgs is now a ROS 2 interface package under src/ and is built by colcon.
+colcon build --packages-select fp_debug_msgs
+source install/setup.bash
+```
+
+`external/COLCON_IGNORE` is tracked on purpose, so `colcon build` only sees this
+repo's ROS packages such as `src/fp_debug_msgs`; it does not try to build all of
+`external/`.
+
+The generated `install/` directory is git-ignored, but the host launch scripts
+source it so `visualize_pipeline` can import `fp_debug_msgs`. On a fresh clone,
+run the container-side `colcon build` above before starting the host stack.
+
+Do project builds inside the container path you will run from. `colcon` and CMake
+cache absolute paths; if a stale build was created from a different path, remove
+`build/`, `install/`, and `log/`, then rebuild inside the container.
 
 ### 2.3 The `Data/` folder (you must create this)
 
 `Data/` is **git-ignored**, so cloning this repo does **not** give you the meshes
-or the reference images. Create it with this layout before running anything:
+or the reference images. Create it with this layout before running anything. If
+you want to copy my current lab `Data/` folder instead of recreating it, reach
+out to me directly.
 
 ```
 Data/
@@ -137,6 +363,43 @@ and pose. The assembly-name grouping (`cooling_manifold`, `plumbers_block`) is
 optional structure for organizing parts on disk — objects without a known
 assembly prefix are read directly from the `Data/*` root instead.
 
+### 2.4 Model weights and checkpoints
+
+These files are not committed. Download them once on a new workstation before
+the first pipeline run:
+
+| Component | Download source | Put it here |
+|---|---|---|
+| SAM2.1 | `cd external/sam2/checkpoints && ./download_ckpts.sh`, or direct base-plus checkpoint: <https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt> | `external/sam2/checkpoints/sam2.1_hiera_base_plus.pt` (the script downloads the other SAM2.1 sizes too, which is fine) |
+| FoundationPose | Official weights folder: <https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i?usp=sharing> | `external/FoundationPose/weights/2023-10-28-18-33-37/{config.yml,model_best.pth}` and `external/FoundationPose/weights/2024-01-11-20-02-45/{config.yml,model_best.pth}` |
+| Cutie | `python external/Cutie/cutie/utils/download_models.py`, or GitHub release files: <https://github.com/hkchengrex/Cutie/releases/download/v1.0/cutie-base-mega.pth> and <https://github.com/hkchengrex/Cutie/releases/download/v1.0/coco_lvis_h18_itermask.pth> | `external/Cutie/weights/cutie-base-mega.pth` and `external/Cutie/weights/coco_lvis_h18_itermask.pth` |
+| DINOv2 | Loaded by `torch.hub` from `facebookresearch/dinov2`; default pipeline model is `dinov2_vitg14`, whose backbone URL resolves to <https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_pretrain.pth> | No repo placement. It lands in the container's Torch cache, usually under `/root/.cache/torch/hub/checkpoints/`. |
+| Grounding-DINO | Hugging Face model id <https://huggingface.co/IDEA-Research/grounding-dino-base> | No repo placement. It lands in the container's Hugging Face cache, usually under `/root/.cache/huggingface/`. |
+
+The first run on a fresh machine can be slow even after the model checkpoints are
+downloaded. DINOv2 builds the reference bank by encoding every image in
+`Data/ZED_screens` (and optionally `Data/reference_renders`). The resulting cache
+is written next to the reference images as `_embedding_cache...npz`; later runs
+reuse it unless the reference images, model name, embedding mode, or render source
+change.
+
+### 2.5 Hardcoded paths and workstation-specific settings
+
+Review these on a new workstation:
+
+| Where | Default / assumption | Change when |
+|---|---|---|
+| Docker mount | `/workspace/Masterthesis-vision` | Keep this as the canonical container repo path. The current launch scripts still use `/workspace/MasterThesis`, so create the mandatory symlink shown above. |
+| Pipeline scripts | [scripts/launch_pipeline.sh](scripts/launch_pipeline.sh) and [scripts/launch_pipeline_realsense.sh](scripts/launch_pipeline_realsense.sh) source `/opt/thesis-venv/bin/activate` and the repo's `install/setup.bash` inside Docker | Only if the container path or venv path changes. |
+| Host scripts | [scripts/launch_host.sh](scripts/launch_host.sh) and [scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh) source host ROS overlays under `$HOME/..._ws/install/setup.bash` | If the host camera/robot workspace lives somewhere else. |
+| `mv_launch` ZED override file | The zipped launch files point `override_path` at `/home/pdzuser/zed_ros2_ws/src/mv_launch/config/zed_override_native.yaml` | If the host username or workspace path is different. |
+| RealSense/ZED serials | `ZED_SERIAL`, `RS1_SERIAL`, `RS2_SERIAL` defaults in [scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh) | If a physical camera is replaced or USB serial mapping changes. |
+| Object assets | `--cad-dir Data/CAD_Models_centered`, `--reference-dir Data/ZED_screens`, `--reference-renders-dir Data/reference_renders` | If `Data/` is stored elsewhere; otherwise leave defaults. |
+| Part ID mapping | `--assembly-part-ids-config Data/assembly_part_ids.json` | If you need Fabrica-style `part_id` values. If the file is absent, the code still runs but unknown slots publish `part_id=-1`. |
+| Calibration files | `config/camera_extrinsics_base.yaml`, `config/camera_extrinsics_realsense.yaml`, `config/base_board_pose.yaml`, `config/robot_bases.yaml`, `config/flange_poses/*.json` | When cameras, checkerboard placement, active robot, robot-base offset, or RealSense hand-eye calibration change. |
+| ROS topics | Camera topic defaults live in `ALL_CAMERAS` inside the pipeline runners and in the visualizer commands inside the host launch scripts | If camera driver namespaces or launch files change. |
+| Remote lab info | `docs/getting_started.md` mentions the lab PC address and SSH user | If you clone to a different workstation or network. |
+
 ---
 
 ## 3. Running the pipeline
@@ -156,6 +419,12 @@ scripts/launch_host.sh stop       # kill the session
 ```
 
 tmux: `Ctrl+b` then `0..5` to switch windows, `Ctrl+b d` to detach.
+
+If the wrapper cannot stop it for some reason, the raw tmux command is:
+
+```bash
+tmux kill-session -t mv_host
+```
 
 ### 3.2 Pipeline node — the locked baseline ([scripts/launch_pipeline.sh](scripts/launch_pipeline.sh))
 
@@ -179,6 +448,27 @@ reseed/PCA/damping. `accurate-track` adds the rotation reseed + cautious PCA +
 light damping preset for better settled screw-axis estimates. The exact pinned
 flags are listed in the launch file and the init-only baseline is explained in
 [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).
+
+The preset modes run inside tmux session `mv_pipeline`. Stop through the wrapper
+when possible:
+
+```bash
+scripts/launch_pipeline.sh stop
+```
+
+Raw fallback:
+
+```bash
+tmux kill-session -t mv_pipeline
+```
+
+For the RealSense variant, the sessions are `mv_host_realsense` and
+`mv_pipeline_realsense`, so the equivalent raw fallbacks are:
+
+```bash
+tmux kill-session -t mv_host_realsense
+tmux kill-session -t mv_pipeline_realsense
+```
 
 ### Output
 

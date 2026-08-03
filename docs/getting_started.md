@@ -9,8 +9,8 @@ mounted and plugged in. If you are setting up a *fresh machine* instead, do the
 one-time setup in the [README](../README.md#2-setup) (submodules, Cutie, Docker,
 `Data/`) first, then come back here.
 
->  **Just want the commands?** There's a one-page
-> [cheat sheet](cheatsheet.md) to print and tape next to the rig.
+>  **Just want the commands?** The one-page lab cheat sheet is shared
+> separately because it contains workstation-specific credentials.
 >
 >  **Working from your own laptop, not at the rig?** Jump to
 > [§5 Remote access](#5-remote-access-from-your-own-laptop) first, then follow the
@@ -290,7 +290,7 @@ Foxglove Studio itself runs on your own machine.
 ### 5.1 SSH into the desktop PC
 
 ```bash
-ssh moreno@10.5.6.204      # PW on Cheatsheet
+ssh moreno@10.5.6.204      # password is on the separately shared lab sheet
 ```
 
 Open a **second** SSH session the same way for the pipeline, so the host stack and the
@@ -348,7 +348,8 @@ scripts/launch_pipeline.sh accurate-track --fused-track-rot-lowpass 0.3  # smoot
 
 ## 7. Where to read more
 
-- **[Cheat sheet](cheatsheet.md)** — one-page, commands-only summary to print.
+- **Lab cheat sheet** — one-page, commands-only summary shared separately because
+  it contains workstation-specific credentials.
 - **[Franka_Perception.json](Franka_Perception.json)** — the shared Foxglove layout (import via *Layouts → Import from file…*).
 - **[README](../README.md)** — full repo layout, every launch flag, and from-scratch setup.
 - **[docs/pipeline_walkthrough.md](pipeline_walkthrough.md)** — how the algorithm works, stage by stage (GDINO → SAM → DINO → fusion → FoundationPose → ICP, then tracking).
