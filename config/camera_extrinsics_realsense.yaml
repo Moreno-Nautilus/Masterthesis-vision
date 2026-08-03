@@ -1,0 +1,83 @@
+# Extrinsics for the 1-ZED + 2-RealSense trio pipeline.
+#
+# LAYOUT (every entry below, for all cam_ids):
+#   R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # 3x3 rotation, flattened ROW-MAJOR (not column-major)
+#   t: [tx,ty,tz]                                 # meters
+# Convention: p_dst = R @ p_cam + t  (R/t map points from the camera's
+# optical frame into "dst"; "dst" differs by entry, see below).
+# See src/calibration/io_extrinsics.py (load/save_extrinsics_yaml) for the
+# code that reads/writes this exact layout.
+#
+# zed2i_1 keeps the normal meaning: a STATIC camera-to-base transform,
+# copied as-is from config/camera_extrinsics_base.yaml. "base" here is the
+# active robot's lbr_link_0 frame (see config/robot_bases.yaml:
+# active_robot -- currently robot_b), i.e. dst = lbr_link_0.
+#
+# realsense_1 / realsense_2 mean something different: they are mounted on
+# the robot end-effector, so they move with the arm. For these two entries,
+# R/t describe the STATIC camera-to-flange offset (the fixed mechanical
+# mount transform), NOT a camera-to-base transform -- dst = lbr_link_ee of
+# that same active robot. At runtime the pipeline composes this offset with
+# the live flange pose (subscribed from a PoseStamped topic, see
+# --flange-pose-topic) to get the current camera-to-base extrinsic every
+# frame:
+#
+#   T_base_cam(t) = T_base_flange(t) @ T_flange_cam
+#
+# PLACEHOLDER VALUES: realsense_1 / realsense_2 below are pure identity
+# (camera optical frame == flange frame, no offset at all). Replace R/t with
+# your real hand-eye calibration (camera optical frame relative to the
+# flange frame, lbr_link_ee) before trusting any fused pose from these two
+# cameras — identity is almost certainly wrong, it's a placeholder so the
+# pipeline can run end-to-end before calibration exists.
+#
+# RealSense USB serial numbers (for zed_realsense_trio.launch.py
+# rs1_serial:=/rs2_serial:=), recorded here for convenience:
+#   realsense_1: 260322275185
+#   realsense_2: 260522275434
+
+realsense_1:
+  R:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  t:
+  - 0.0
+  - 0.0
+  - 0.0
+realsense_2:
+  R:
+  - -0.7035180330728221
+  - 0.6064101522519233
+  - -0.3705794171121041
+  - -0.7104195013650753
+  - -0.6141301607254079
+  - 0.34372703962240503
+  - -0.019144430562059
+  - 0.5050850155500396
+  - 0.8628572407097659
+  t:
+  - 0.04822088853440753
+  - -0.029119031966159226
+  - 0.07017758691589546
+zed2i_1:
+  R:
+  - -0.98305904327408
+  - -0.15541365087829384
+  - 0.09716745626870306
+  - -0.1790583561869697
+  - 0.7010643749690525
+  - -0.6902512928121703
+  - 0.03915383144305058
+  - -0.6959564205249723
+  - -0.7170157865859002
+  t:
+  - -0.17743503724584297
+  - 0.7057189434412777
+  - 0.4862059721899694

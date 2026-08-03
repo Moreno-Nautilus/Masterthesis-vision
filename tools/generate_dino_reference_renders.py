@@ -143,10 +143,13 @@ def main() -> None:
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Gather every mesh in the CAD dir across the supported formats.
+    # Gather every mesh in the CAD dir across the supported formats. Meshes may
+    # live directly under cad_root or one level down inside an assembly
+    # subfolder (e.g. cad_root/cooling_manifold/cooling_screw.obj).
     mesh_files = []
     for ext in ("*.obj", "*.stl", "*.ply"):
         mesh_files.extend(sorted(cad_root.glob(ext)))
+        mesh_files.extend(sorted(cad_root.glob(f"*/{ext}")))
 
     # Optionally restrict to a caller-named subset of objects.
     if args.object_ids:
@@ -157,10 +160,13 @@ def main() -> None:
         raise SystemExit(f"No mesh files found in {cad_root}")
 
     # Render each object into its own subfolder and tally the views written.
+    # Renders are mirrored under the same assembly subfolder as the mesh
+    # (or directly under out_root if the mesh has no assembly parent).
     total = 0
     for mesh_path in mesh_files:
         obj_id = mesh_path.stem
-        obj_out = out_root / obj_id
+        assembly_dir = mesh_path.parent.name if mesh_path.parent != cad_root else None
+        obj_out = (out_root / assembly_dir / obj_id) if assembly_dir else (out_root / obj_id)
         n = render_object_views(
             mesh_path=mesh_path,
             out_dir=obj_out,

@@ -14,6 +14,19 @@ that publishes a canonical pose per object in the **robot base frame**.
 > read [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).** This README
 > covers setup, how to launch things, and what each piece of code does; the
 > walkthrough explains the algorithm itself.
+>
+> **Experimenting with the 1-ZED + 2-RealSense (end-effector) variant?** See
+> **[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**
+> for the full step-by-step run sequence, or [§6 below](#6-realsense-trio-variant)
+> for a quick reference — a separate, parallel pipeline (own
+> scripts/config/launch files); nothing above is affected by it.
+>
+> **Just want to view tracked objects / camera poses in RViz?** See
+> **[docs/visualization.md](docs/visualization.md)** for the MoveIt2 planning
+> scene view and camera-extrinsics TF frames — the 2D per-camera overlays
+> (Foxglove) are covered in
+> [docs/getting_started.md §1](docs/getting_started.md#watch-the-result-in-foxglove)
+> instead.
 
 ---
 
@@ -35,8 +48,14 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/perception/tracking/realtime_tracker.py](src/perception/tracking/realtime_tracker.py) | Per-object tracker state (pose + ICP refinement) used in `track` mode. In the multicam loop the runner drives one shared Cutie session per camera and feeds each object's mask into its own `RealtimeTracker`; the canonical pose comes from the fused multi-camera ICP. |
 | [src/perception/tracking/cutie_tracker.py](src/perception/tracking/cutie_tracker.py) | Cutie (video object segmentation) wrapper. |
 | [src/perception/tracking/icp_refiner.py](src/perception/tracking/icp_refiner.py) | Generic ICP refiner used by `RealtimeTracker`; the fused base-frame ICP and rotation grid live in the multicam runner/helpers. |
-| [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **3-camera extrinsic calibration** (checkerboard → base frame) — see §4. |
+| [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **N-camera extrinsic calibration** (checkerboard → base frame) — see §4. Defaults to the 3-ZED trio; accepts `--cam-ids` for any subset (e.g. the RealSense-trio rig's single `zed2i_1`). |
 | [src/calibration/io_extrinsics.py](src/calibration/io_extrinsics.py) | Load/save extrinsics YAML (`R` row-major + `t`) ↔ `SE3`. |
+| [src/calibration/capture_flange_poses_dual.py](src/calibration/capture_flange_poses_dual.py) | Dual-arm calibration, Step 1 (manual): jog + save each arm's flange poses permanently to `config/flange_poses/` — see §6. |
+| [src/calibration/capture_flange_poses_dual_handguided.py](src/calibration/capture_flange_poses_dual_handguided.py) | Step 1's hand-guided twin: gravity-compensation bring-up instead of RViz jogging, also saves the joint configuration — see [docs/hand_guided_calibration.md](docs/hand_guided_calibration.md). |
+| [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Step 2 (automatic): replays the saved poses to solve hand-eye + checkerboard pose + ZED extrinsic — see §6. |
+| [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above); Cartesian (`ArmTarget`/`move_to()`) and joint-space (`JointTarget`/`move_to_joint()`) goal types. |
+| [src/calibration/flange_pose_store.py](src/calibration/flange_pose_store.py) | JSON schema + save/load for the permanently-stored flange pose captures. |
+| [src/calibration/calibration_log.py](src/calibration/calibration_log.py) | Append-only JSON run logs (camera/checkerboard/flange transforms + quality metrics) under `outputs/calibration_logs/`. |
 | [src/utils/se3.py](src/utils/se3.py) | Minimal immutable `SE3` rigid-transform type. |
 | [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py) | Renders synthetic reference views from the CAD meshes (optional DINO reference source). |
 | [debug_pose_axes.py](debug_pose_axes.py) | Publishes RViz/Foxglove axis markers for the poses on `/perception/fp/pose_base/...`. |
@@ -79,31 +98,52 @@ or the reference images. Create it with this layout before running anything:
 Data/
 ├── CAD_Models/              # raw object meshes (.obj or .stl)
 ├── CAD_Models_centered/     # origin-centered meshes — USED BY THE PIPELINE (--cad-dir)
+│   ├── cooling_manifold/    # one subfolder per assembly
+│   │   ├── cooling_base.obj
+│   │   ├── cooling_f.obj
+│   │   └── cooling_screw.obj
+│   └── plumbers_block/
+│       ├── pb_base.obj
+│       ├── pb_pipe.obj
+│       ├── pb_screw.obj
+│       └── pb_top.obj
 ├── ZED_screens/             # REAL reference crops, one folder per object (--reference-dir)
-│   ├── pb_screw/  *.png
-│   ├── pb_pipe/   *.png
-│   ├── cooling_f/ *.png
-│   └── ... (one subfolder per object_id)
+│   ├── cooling_manifold/
+│   │   ├── cooling_base/ *.png
+│   │   ├── cooling_f/    *.png
+│   │   └── cooling_screw/ *.png
+│   ├── plumbers_block/
+│   │   ├── pb_base/ *.png
+│   │   ├── pb_pipe/ *.png
+│   │   ├── pb_screw/ *.png
+│   │   └── pb_top/  *.png
+│   └── blue_cube/ *.png   # objects with no assembly stay directly under the root
 └── reference_renders/       # OPTIONAL synthetic renders (--reference-renders-dir)
-    └── <object_id>/ *.png
+    ├── cooling_manifold/<object_id>/ *.png
+    └── plumbers_block/<object_id>/ *.png
 ```
 
-- **`CAD_Models_centered/<object_id>.obj` or `<object_id>.stl`** — the mesh
+- **`CAD_Models_centered/<assembly_name>/<object_id>.obj` or `.stl`** — the mesh
   FoundationPose registers against. The default `--cad-dir` points here; the
-  `object_id` is the filename stem. Meshes are assumed to be in centimeters
+  `object_id` is the filename stem. Meshes belonging to a known assembly
+  (`cooling_manifold`, `plumbers_block`) live in that assembly's subfolder;
+  objects with no assembly (cubes, screwdrivers) may sit directly under
+  `CAD_Models_centered/`. Meshes are assumed to be in centimeters
   (`--mesh-scale 0.01`).
-- **`ZED_screens/<object_id>/`** — the **DINO reference bank**: a handful of
-  cropped photos of each object. DINOv2 embeds these once at startup and every
-  candidate crop is classified against them. This is the default reference source
-  (`--reference-source real`).
-- **`reference_renders/<object_id>/`** — optional CAD-rendered alternative/extra
-  reference views, produced by
+- **`ZED_screens/<assembly_name>/<object_id>/`** — the **DINO reference bank**:
+  a handful of cropped photos of each object. DINOv2 embeds these once at
+  startup and every candidate crop is classified against them. This is the
+  default reference source (`--reference-source real`).
+- **`reference_renders/<assembly_name>/<object_id>/`** — optional CAD-rendered
+  alternative/extra reference views, produced by
   [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py).
   Used when `--reference-source renders` or `both`.
 
 The folder names under `ZED_screens/` / `reference_renders/` and the mesh
 filenames must use the **same `object_id`** so labels line up across detection
-and pose.
+and pose. The assembly-name grouping (`cooling_manifold`, `plumbers_block`) is
+optional structure for organizing parts on disk — objects without a known
+assembly prefix are read directly from the `Data/*` root instead.
 
 ---
 
@@ -121,6 +161,7 @@ Foxglove bridge, a `visualize_pipeline` per camera, and `debug_pose_axes`.
 scripts/launch_host.sh            # start (and attach) the tmux session
 scripts/launch_host.sh attach     # re-attach if already running
 scripts/launch_host.sh stop       # kill the session
+scripts/launch_host.sh calibrate  # same, but ZEDs grab/publish at HD2K/15fps (see §4)
 ```
 
 tmux: `Ctrl+b` then `0..5` to switch windows, `Ctrl+b d` to detach.
@@ -150,9 +191,10 @@ flags are listed in the launch file and the init-only baseline is explained in
 
 ### Output
 
-Per detected object the pipeline publishes a base-frame `PoseStamped` on
-`/perception/fp/pose_base/fused/<track_id>`; with logging flags, it writes CSV
-rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
+Per detected object the pipeline publishes a base-frame `fp_debug_msgs/DebugPoseItem`
+(identified by `assembly_name`/`part_id`) on the shared
+`/perception/fp/pose_base/fused/assembly` topic; with logging flags, it writes
+CSV rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
 `init_renders/`.
 
 ---
@@ -170,6 +212,25 @@ the cameras move:
 ```bash
 scripts/launch_host.sh          # window 0 runs the ZED driver
 ```
+
+   For better checkerboard corner detection, launch with `calibrate` instead —
+   this grabs/publishes at the ZED2i's HD2K resolution (2208x1242 @ 15fps)
+   rather than the normal HD1080 @ 30fps used for tracking:
+
+```bash
+scripts/launch_host.sh calibrate    # same tmux session, cameras at HD2K/15fps
+```
+
+   Under the hood this passes `override_path:=config/zed_override_2k.yaml`
+   (vs. the default `config/zed_override_native.yaml`) to
+   `mv_launch`'s `zed2i_pair.launch.py` — both files live in the separate
+   `~/franka_ros2_ws` ROS workspace, not this repo. Equivalent to setting
+   `CALIBRATE_2K=1 scripts/launch_host.sh`.
+
+   If a camera fails to open (`CAMERA NOT DETECTED` in the `cams` window —
+   USB enumeration flakiness happens), calibrate with just the cameras that
+   came up, e.g. `--cam-ids zed2i_2 zed2i_3` in step 3 below (see
+   `base_to_cams_calib_3.py --help`; any subset of size N≥1 works).
 
 **2. Set the board pose** in
    [config/base_board_pose.yaml](config/base_board_pose.yaml): the translation
@@ -217,3 +278,101 @@ per-tick breakdown, in two halves:
   with its accept/hold/lost gates; this section also covers the `fast-track` vs
   `accurate-track` presets and the optional rotation fixes (rot-reseed, PCA
   shaft-axis, rotation damping).
+
+---
+
+## 6. RealSense trio variant
+
+Experimental parallel pipeline: `zed2i_1` (static) + 2 end-effector-mounted Intel
+RealSense D405 cameras — a separate set of scripts/config/launch files that don't
+touch anything above.
+
+**For the full start-to-finish run sequence** (tested and verified working —
+tf2/robot setup, host stack, pipeline, what a healthy run looks like, and every
+bug already hit and fixed along the way), see
+**[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**.
+
+Quick reference once you've read that once:
+
+```bash
+# terminal 1 — tf2 for the flange pose (real robot, or identity placeholder — see docs §1 Step 1)
+ros2 launch lbr_bringup hardware.launch.py model:=iiwa7
+
+# terminal 2 — host camera stack (ZED + both RealSense + flange_pose_publisher)
+scripts/launch_host_realsense.sh
+
+# terminal 3 — the pipeline itself (needs a real terminal, not a backgrounded/piped shell)
+scripts/launch_pipeline_realsense.sh init-only
+```
+
+**Hand-eye calibration for the two RealSense cameras** (camera-to-flange
+offset) plus the checkerboard-in-base-frame and ZED calibration are now a
+**two-script dual-arm routine** — see
+**[docs/getting_started_realsense.md §4](docs/getting_started_realsense.md#4-hand-eye-calibration-camera-to-flange-offset)**
+for the full walkthrough, or
+**[docs/calibration_cheatsheet.md](docs/calibration_cheatsheet.md)** for the
+condensed command sequence:
+
+```bash
+# Step 1 (manual, per arm) — jog + save flange poses, nothing calibrated yet
+python3 -m src.calibration.capture_flange_poses_dual --arm left
+python3 -m src.calibration.capture_flange_poses_dual --arm right
+
+# Step 2 (automatic replay) — drives both arms itself, solves hand-eye +
+# checkerboard pose + ZED extrinsic, in one run
+python3 -m src.calibration.autocalibrate_dual_realsense
+```
+
+Step 1 still needs jogging the arm interactively via MoveIt between samples;
+see **[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for
+that part — or skip jogging entirely with the hand-guided alternative
+(gravity-compensation bring-up + `capture_flange_poses_dual_handguided.py`),
+see **[docs/hand_guided_calibration.md](docs/hand_guided_calibration.md)**.
+Step 2 needs no jogging — it drives both arms itself over the
+`moveit_msgs/action/MoveGroup` action (see
+[src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py)),
+including one simultaneous `both_arms_flange` goal per pose-pair for the
+hand-eye stage (calibration always targets the bare flange, regardless of
+whether the Y-gripper is attached — see `moveit_dual_arm.py`'s docstring).
+
+The original single-arm, single-camera manual scripts
+(`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`)
+still work standalone — see
+[docs/getting_started_realsense.md §4.7](docs/getting_started_realsense.md#47-manual-single-camera-fallback-original-scripts-still-available).
+
+---
+
+## 7. MoveIt2 planning scene visualization
+
+Both pipeline runners (`run_pipeline_track_multicam.py` and the RealSense
+variant) publish each tracked part as a `moveit_msgs/CollisionObject` on
+`/planning_scene`, plus each camera's calibrated pose as a static TF frame —
+so RViz can show the tracked parts and cameras alongside a mock robot without
+any real hardware.
+
+See **[docs/visualization.md](docs/visualization.md)** for the full guide:
+what gets published and why, how to bring up the RViz scene view with
+[scripts/view_scene.sh](scripts/view_scene.sh), and how to view/check the
+camera extrinsics as TF frames.
+If you need the other robot's frame, pass a different `--base-yaml`.
+
+---
+
+## 8. Compliant control (Cartesian impedance / admittance)
+
+Two additive execution paths for the dual-arm rig, alongside the
+position-controlled MoveGroup pipeline above — a torque-mode Cartesian
+impedance controller with runtime-adjustable gains, and a software
+admittance loop on the position interface. See
+**[docs/compliant_control.md](docs/compliant_control.md)** for bring-up
+commands, the client APIs
+(`src/calibration/cartesian_impedance_dual_arm.py`,
+`src/calibration/admittance_dual_arm.py`), named gain profiles, and known
+caveats.
+
+**New to these modes, or picking one for a calibration session?** Start
+with **[docs/calibration_control_modes.md](docs/calibration_control_modes.md)**
+instead — a walkthrough of all three dual-arm control modes (gravity
+compensation, Cartesian impedance, admittance) side by side: what each
+does, when to reach for it, and how each fits (or doesn't yet) into the
+existing calibration routine.

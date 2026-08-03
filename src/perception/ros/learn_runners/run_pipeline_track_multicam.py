@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import array
 import csv
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -14,15 +15,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import rclpy
-from geometry_msgs.msg import Pose, PoseStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped
+from moveit_msgs.msg import CollisionObject, PlanningScene, PlanningSceneWorld
+from shape_msgs.msg import Mesh, MeshTriangle
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Header
+from std_srvs.srv import SetBool, Trigger
 from fp_debug_msgs.msg import DebugCandidate, DebugFrame, DebugMaskCrop, DebugPoseItem
 from concurrent.futures import ThreadPoolExecutor
 
 from src.calibration.io_extrinsics import load_extrinsics_yaml
+from src.utils.robot_bases import get_active_robot_base, get_dual_arm_base_link
 from src.perception.learned.DINO.dino_identifier import (
     DINOIdentifier,
     DINOIdentifierConfig,
@@ -85,7 +91,6 @@ FAST_CUTIE_PROFILE_OVERRIDES = {
     "fused_track_min_translation_jump_m": 0.02,
     "fused_track_min_rotation_jump_deg": 10.0,
     "skip_per_cam_icp_tracking": True,
-    "debug_frame_publish": False,
     "debug_per_cam_pose_publish": False,
     "debug_verbose_logs": False,
     "debug_logging": False,
@@ -164,6 +169,77 @@ FAST_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
 )
+
+
+# Assembly subfolder name (under Data/CAD_Models*, Data/ZED_screens, Data/reference_renders)
+# for each known object_id prefix. Objects with no matching prefix (e.g. blue_cube,
+# screwdriver_1) live directly under the Data root and have no assembly.
+ASSEMBLY_PREFIXES = {
+    "cooling": "cooling_manifold",
+    "pb": "plumbers_block",
+}
+
+
+def resolve_assembly_name(object_id: str) -> str:
+    """Map an object_id (e.g. 'cooling_screw', 'pb_pipe') to its assembly name.
+
+    Returns "" if object_id does not belong to a known assembly.
+    """
+    prefix = str(object_id).split("_", 1)[0]
+    return ASSEMBLY_PREFIXES.get(prefix, "")
+
+
+class PartIdAssigner:
+    """Maps (assembly_name, object_id) detections to stable Fabrica part_ids.
+
+    Fabrica lists assembly parts as assembly/0, assembly/1, ... with repeated
+    object_ids where the same part occurs multiple times (e.g. plumbers_block
+    slot 1 and slot 4 are both pb_screw). The config (assembly_part_ids.json)
+    gives, per assembly, the object_id at each slot index (== part_id). Since
+    duplicate-object slots are physically interchangeable, each new tracked
+    instance of that object_id simply claims the lowest not-yet-claimed slot;
+    the claim is keyed by track_id so it stays stable for the life of that
+    track (including across re-init, which reuses track_id via centroid
+    matching in _resolve_track_id_for_new_detection).
+    """
+
+    def __init__(self, config_path: str):
+        self._slots_by_assembly: dict[str, list[str]] = {}
+        path = Path(config_path)
+        if path.is_file():
+            with path.open("r") as f:
+                raw = json.load(f)
+            self._slots_by_assembly = {k: list(v) for k, v in raw.items()}
+        # track_id -> (assembly_name, part_id), so claims are scoped per assembly.
+        self._claim_by_track: dict[str, tuple[str, int]] = {}
+
+    def resolve(self, assembly_name: str, object_id: str, track_id: str) -> int:
+        """Return the stable part_id for track_id, claiming a free slot on first use.
+
+        Returns -1 if assembly_name is unknown or has no matching slot for object_id.
+        """
+        if track_id in self._claim_by_track:
+            claimed_assembly, claimed_part_id = self._claim_by_track[track_id]
+            if claimed_assembly == assembly_name:
+                return claimed_part_id
+
+        slots = self._slots_by_assembly.get(assembly_name, [])
+        claimed_in_assembly = {
+            part_id for (a, part_id) in self._claim_by_track.values() if a == assembly_name
+        }
+        for part_id, slot_object_id in enumerate(slots):
+            if slot_object_id == object_id and part_id not in claimed_in_assembly:
+                self._claim_by_track[track_id] = (assembly_name, part_id)
+                return part_id
+        return -1
+
+    def part_id_for_track(self, track_id: str) -> Optional[tuple[str, int]]:
+        """Return the (assembly_name, part_id) already claimed by track_id, if any."""
+        return self._claim_by_track.get(track_id)
+
+    def release(self, track_id: str) -> None:
+        """Drop a stale track_id's slot claim so it can be reused."""
+        self._claim_by_track.pop(track_id, None)
 
 
 # All known cameras and their ROS topics; --num-cameras selects the leading subset.
@@ -1013,6 +1089,12 @@ class FoundationPoseTrackerNode(Node):
 
         self.pub_pose_base: dict[str, Any] = {}
         self.pub_debug_frame: dict[str, Any] = {}
+        # Single shared topic for every tracked/detected part's fused (camera-
+        # agnostic) pose; each part is published as its own message on it,
+        # identified by assembly_name + part_id.
+        self.pub_fused_assembly = self.create_publisher(
+            DebugPoseItem, "/perception/fp/pose_base/fused/assembly", FAST_QOS
+        )
 
 
         # Load Cutie once before the first tracking tick to avoid a hot-loop stall.
@@ -1033,11 +1115,35 @@ class FoundationPoseTrackerNode(Node):
                     DebugFrame, f"/perception/fp/debug_frame/{cid}", FAST_QOS
                 )
 
+        # All models are loaded above and stay resident for the node's lifetime.
+        # `_tracking_active` gates only the tick's detect/track work, so start/stop
+        # via the services below never touches SAM/DINO/GDINO/FoundationPose/Cutie.
+        #
+        # _tick runs in the node's default (mutually-exclusive) callback group and
+        # can block for a long time doing GPU work; without their own reentrant
+        # group these service callbacks would queue behind it on every executor
+        # thread and could time out on the client side before ever running.
+        self._tracking_control_cbgroup = ReentrantCallbackGroup()
+        self._tracking_active = not bool(getattr(args, "start_paused", False))
+        self._set_tracking_active_srv = self.create_service(
+            SetBool,
+            "~/set_tracking_active",
+            self._on_set_tracking_active,
+            callback_group=self._tracking_control_cbgroup,
+        )
+        self._reset_tracking_srv = self.create_service(
+            Trigger,
+            "~/reset_tracking",
+            self._on_reset_tracking,
+            callback_group=self._tracking_control_cbgroup,
+        )
+
         # Timer drives the init/track state machine; the grabber runs in the same executor.
         self.timer = self.create_timer(args.timer_period_s, self._tick)
         self.get_logger().info(
             f"FoundationPoseTrackerNode started | run_mode={self.args.run_mode} "
-            f"profile={getattr(self.args, 'tracking_profile', None) or 'none'}"
+            f"profile={getattr(self.args, 'tracking_profile', None) or 'none'} "
+            f"tracking_active={self._tracking_active}"
         )
         self._fused_warmup_count = {}       # track_id -> frames since init
         self._median_pose_buffers = {}      # track_id -> MedianPoseBuffer
@@ -1057,7 +1163,24 @@ class FoundationPoseTrackerNode(Node):
         self._last_known_track_centroids: dict[str, np.ndarray] = {}
         # track_id -> object_id reverse map.
         self._track_id_to_object_id: dict[str, str] = {}
+        # track_id -> init-cycle counter it was last matched/claimed in. Lets
+        # _prune_stale_track_ids() evict ids that haven't been seen in a
+        # while, so a centroid-match miss (jitter/occlusion) doesn't leak a
+        # permanent dict entry every time _process_multicam_init re-runs
+        # from a cold self.track_states in init_only mode.
+        self._track_id_last_seen_cycle: dict[str, int] = {}
+        self._init_cycle_counter: int = 0
         self._claimed_track_ids_this_init: set[str] = set()
+
+        # Fabrica part_id assignment (assembly_name, object_id) -> stable slot index.
+        self._part_id_assigner = PartIdAssigner(args.assembly_part_ids_config)
+
+        # MoveIt2 planning scene: one CollisionObject per tracked part, keyed
+        # by "{assembly_name}/{part_id}" to match the fused-pose topic identity.
+        self._planning_scene_pub = self.create_publisher(PlanningScene, "/planning_scene", 1)
+        self._collision_mesh_cache: dict[str, Mesh] = {}
+        self._published_collision_ids: set[str] = set()
+        self._planning_scene_missing_mesh_warned: set[str] = set()
 
         self._track_pose_log_path: Optional[Path] = None
         if bool(getattr(args, "log_track_poses", False)):
@@ -1130,24 +1253,80 @@ class FoundationPoseTrackerNode(Node):
                 best_tid = tid
         if best_tid is not None and best_dist <= match_radius_m:
             self._claimed_track_ids_this_init.add(best_tid)
+            self._track_id_last_seen_cycle[best_tid] = self._init_cycle_counter
             return best_tid
         tid = self._allocate_track_id(object_id)
         self._claimed_track_ids_this_init.add(tid)
+        self._track_id_last_seen_cycle[tid] = self._init_cycle_counter
         return tid
+
+    # Number of consecutive init cycles a track_id may go unmatched before
+    # its bookkeeping (centroid, object_id, part-id slot claim) is evicted.
+    _TRACK_ID_STALE_AFTER_CYCLES = 10
+
+    def _prune_stale_track_ids(self) -> None:
+        """Evict track_ids not seen in _TRACK_ID_STALE_AFTER_CYCLES cycles.
+
+        Without this, every centroid-match "miss" in _resolve_track_id_for_new_detection
+        (pose jitter, momentary occlusion, symmetry-grid flips) permanently
+        grows _last_known_track_centroids/_track_id_to_object_id/_claim_by_track,
+        since init_only mode never persists self.track_states across ticks
+        and so has no other way to forget a stale id.
+        """
+        cutoff = self._init_cycle_counter - self._TRACK_ID_STALE_AFTER_CYCLES
+        stale = [
+            tid for tid, last_seen in self._track_id_last_seen_cycle.items()
+            if last_seen < cutoff
+        ]
+        for tid in stale:
+            self._track_id_last_seen_cycle.pop(tid, None)
+            self._last_known_track_centroids.pop(tid, None)
+            self._track_id_to_object_id.pop(tid, None)
+            self._part_id_assigner.release(tid)
 
     @staticmethod
     def _build_mesh_map(cad_dir: str) -> dict[str, str]:
-        """Map common object_id spellings to CAD mesh paths."""
+        """Map common object_id spellings to CAD mesh paths.
+
+        Meshes may live directly under cad_dir or one level down inside an
+        assembly subfolder (e.g. cad_dir/cooling_manifold/cooling_screw.obj).
+        """
         cad_root = Path(cad_dir)
         mesh_map: dict[str, str] = {}
         if cad_root.is_dir():
             for ext in ("*.obj", "*.stl"):
-                for mesh_file in cad_root.glob(ext):
+                for mesh_file in list(cad_root.glob(ext)) + list(cad_root.glob(f"*/{ext}")):
                     name = mesh_file.stem
                     mesh_map[name] = str(mesh_file)
                     mesh_map[name.lower()] = str(mesh_file)
                     mesh_map[name.capitalize()] = str(mesh_file)
         return mesh_map
+
+    @staticmethod
+    def _load_mesh_as_msg(mesh_path: str, mesh_scale: float) -> Mesh:
+        """Load a CAD mesh and convert it to shape_msgs/Mesh for a MoveIt CollisionObject.
+
+        Centers and scales the mesh the same way FoundationPoseWrapper does
+        (see pose_foundation.py _build_estimator) so the collision geometry
+        matches what pose estimation actually tracked against.
+        """
+        import trimesh
+
+        mesh = trimesh.load(mesh_path, force="mesh")
+        mesh.vertices -= mesh.centroid
+        if mesh_scale != 1.0:
+            mesh.apply_scale(mesh_scale)
+
+        msg = Mesh()
+        msg.triangles = [
+            MeshTriangle(vertex_indices=[int(i) for i in face])
+            for face in mesh.faces
+        ]
+        msg.vertices = [
+            Point(x=float(v[0]), y=float(v[1]), z=float(v[2]))
+            for v in mesh.vertices
+        ]
+        return msg
 
     def _safe_to_base_pose(self, cam_id: str, T_object_camera: np.ndarray) -> np.ndarray:
         """Best-effort conversion for debug logging; fall back to the input pose."""
@@ -1494,6 +1673,7 @@ class FoundationPoseTrackerNode(Node):
         cam_id: str,
         states: list[ObjectTrackState],
         include_masks: bool,
+        stamp,
         ) -> list[DebugPoseItem]:
         """Convert tracked state into debug pose overlays."""
         out: list[DebugPoseItem] = []
@@ -1503,7 +1683,9 @@ class FoundationPoseTrackerNode(Node):
                 continue
 
             msg = DebugPoseItem()
-            msg.object_id = str(s.object_id)
+            assembly_name = resolve_assembly_name(s.object_id)
+            msg.assembly_name = assembly_name
+            msg.part_id = self._part_id_assigner.resolve(assembly_name, s.object_id, s.track_id)
             msg.mode = str(s.mode)
             msg.score = float(s.dino_score)
 
@@ -1511,13 +1693,13 @@ class FoundationPoseTrackerNode(Node):
             T_base_dbg = self._safe_to_base_pose(cam_id, s.T_object_camera)
 
             # Store corrected base pose.
-            msg.pose_base = T_to_pose_msg(T_base_dbg)
+            msg.pose_base = T_to_pose_stamped(T_base_dbg, frame_id="base", stamp=stamp)
 
             # Recompute corrected camera-frame pose from corrected base pose.
             T_cam_base = self._resolve_T_cam_base(cam_id)
             T_cam_dbg = (T_cam_base @ T_base_dbg).astype(np.float32)
 
-            msg.pose_camera = T_to_pose_msg(T_cam_dbg)
+            msg.pose_camera = T_to_pose_stamped(T_cam_dbg, frame_id=cam_id, stamp=stamp)
 
             msg.axis_len_m = 0.03
 
@@ -1546,17 +1728,125 @@ class FoundationPoseTrackerNode(Node):
 
         return out
 
+    @staticmethod
+    def _make_fused_pose_item_msg(
+        assembly_name: str, part_id: int, T_base: np.ndarray, stamp,
+        ) -> DebugPoseItem:
+        """Build the production DebugPoseItem for the fused/assembly topic.
+
+        Only assembly_name, part_id, and pose_base are meaningful here; the
+        debug-only fields (mode, score, bbox, mask, pose_camera) are left at
+        neutral defaults since this pose is camera-agnostic.
+        """
+        msg = DebugPoseItem()
+        msg.assembly_name = assembly_name
+        msg.part_id = int(part_id)
+        msg.mode = "fused"
+        msg.score = 0.0
+        msg.has_bbox = False
+        msg.bbox_xyxy = [0, 0, 0, 0]
+        msg.has_mask = False
+        msg.mask = DebugMaskCrop()
+        msg.pose_base = T_to_pose_stamped(T_base, frame_id="base", stamp=stamp)
+        msg.pose_camera = PoseStamped()
+        msg.axis_len_m = 0.03
+        return msg
+
     def _resolve_mesh_path(self, object_id: str) -> str:
         """Resolve object_id to a CAD file, accepting direct fallback paths."""
         if object_id in self.mesh_map:
             return self.mesh_map[object_id]
 
+        cad_root = Path(self.args.cad_dir)
+        assembly_name = resolve_assembly_name(object_id)
+        candidate_dirs = [cad_root / assembly_name, cad_root] if assembly_name else [cad_root]
         for ext in (".obj", ".stl"):
-            direct = Path(self.args.cad_dir) / f"{object_id}{ext}"
-            if direct.exists():
-                return str(direct)
+            for cand_dir in candidate_dirs:
+                direct = cand_dir / f"{object_id}{ext}"
+                if direct.exists():
+                    return str(direct)
 
         raise FileNotFoundError(f"No CAD mesh for object_id='{object_id}'")
+
+    def _publish_planning_scene_object(
+        self, assembly_name: str, part_id: int, object_id: str,
+        T_base: np.ndarray, stamp,
+    ) -> None:
+        """Publish/update a MoveIt CollisionObject for a tracked part.
+
+        Keyed by "{assembly_name}/{part_id}", matching the identity already
+        used for the production fused-pose topic (_make_fused_pose_item_msg).
+        Best-effort: any failure (missing mesh, bad pose, publish error) is
+        logged at most once per object_id and swallowed so the main
+        detection/tracking loop is never slowed or crashed by this.
+        """
+        if not assembly_name or part_id < 0:
+            return
+
+        try:
+            try:
+                mesh_path = self._resolve_mesh_path(object_id)
+            except FileNotFoundError:
+                if object_id not in self._planning_scene_missing_mesh_warned:
+                    self._planning_scene_missing_mesh_warned.add(object_id)
+                    self.get_logger().warn(
+                        f"No CAD mesh for object_id='{object_id}' — skipping planning scene publish"
+                    )
+                return
+
+            mesh_msg = self._collision_mesh_cache.get(mesh_path)
+            if mesh_msg is None:
+                mesh_msg = self._load_mesh_as_msg(mesh_path, float(self.args.mesh_scale))
+                self._collision_mesh_cache[mesh_path] = mesh_msg
+
+            collision_id = f"{assembly_name}/{part_id}"
+            frame_id = getattr(self.args, "planning_scene_frame_id", "world")
+            obj = CollisionObject()
+            obj.header = Header(frame_id=frame_id, stamp=stamp)
+            obj.id = collision_id
+            obj.meshes = [mesh_msg]
+            obj.mesh_poses = [T_to_pose_msg(T_base)]
+            obj.operation = CollisionObject.ADD
+
+            self._planning_scene_pub.publish(
+                PlanningScene(is_diff=True, world=PlanningSceneWorld(collision_objects=[obj]))
+            )
+            self._published_collision_ids.add(collision_id)
+        except Exception as exc:
+            if object_id not in self._planning_scene_missing_mesh_warned:
+                self._planning_scene_missing_mesh_warned.add(object_id)
+                self.get_logger().warn(
+                    f"Planning scene publish failed for object_id='{object_id}': {exc}"
+                )
+
+    def _remove_planning_scene_objects(self, track_ids: set[str], stamp) -> None:
+        """Retract CollisionObjects for tracks that transitioned to permanently lost.
+
+        Best-effort per track_id: a failure removing one object must not stop
+        the others from being retracted or bubble up into the tick loop.
+        """
+        frame_id = getattr(self.args, "planning_scene_frame_id", "world")
+        for tid in track_ids:
+            try:
+                claim = self._part_id_assigner.part_id_for_track(tid)
+                if claim is None:
+                    continue
+                assembly_name, part_id = claim
+                collision_id = f"{assembly_name}/{part_id}"
+                if collision_id not in self._published_collision_ids:
+                    continue
+                obj = CollisionObject()
+                obj.header = Header(frame_id=frame_id, stamp=stamp)
+                obj.id = collision_id
+                obj.operation = CollisionObject.REMOVE
+                self._planning_scene_pub.publish(
+                    PlanningScene(is_diff=True, world=PlanningSceneWorld(collision_objects=[obj]))
+                )
+                self._published_collision_ids.discard(collision_id)
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"Planning scene removal failed for track_id='{tid}': {exc}"
+                )
 
     def _to_base_pose(self, cam_id: str, T_object_camera: np.ndarray) -> np.ndarray:
         """Convert object pose from camera coordinates into the shared base frame."""
@@ -3487,7 +3777,7 @@ class FoundationPoseTrackerNode(Node):
                 states = self.track_states.get(cam_id, [])
                 if not states:
                     continue
-                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
+                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False, stamp=stamp)
                 track_debug = track_debug_by_cam.get(cam_id)
                 frame = self._build_debug_frame(
                     cam_id=cam_id, stamp=stamp,
@@ -3499,11 +3789,8 @@ class FoundationPoseTrackerNode(Node):
                     self.pub_debug_frame[cam_id].publish(frame)
     
         # ── Publish fused canonical poses ──
-        if not hasattr(self, "_pub_fused_pose"):
-            self._pub_fused_pose = {}
-        if not hasattr(self, "_fused_pose_pub_by_obj"):
-            self._fused_pose_pub_by_obj: dict[str, Any] = {}
-
+        # One shared topic for every tracked/detected part; each part is its
+        # own DebugPoseItem message (assembly_name + part_id identify it).
         for tid, decision in object_decisions.items():
             accepted_pub = decision.get("accepted") and decision.get("T_base") is not None
             if accepted_pub:
@@ -3515,19 +3802,14 @@ class FoundationPoseTrackerNode(Node):
                 T_pub = None
             if T_pub is None:
                 continue
-            pub = self._fused_pose_pub_by_obj.get(tid)
-            if pub is None:
-                fused_key = f"fused/{tid}"
-                pub = self._pub_fused_pose.get(fused_key)
-                if pub is None:
-                    pub = self.create_publisher(
-                        PoseStamped, f"/perception/fp/pose_base/{fused_key}",
-                        FAST_QOS,
-                    )
-                    self._pub_fused_pose[fused_key] = pub
-                self._fused_pose_pub_by_obj[tid] = pub
-            pub.publish(
-                T_to_pose_stamped(T_pub, frame_id="base", stamp=stamp)
+            object_id = self._track_id_to_object_id.get(tid, "")
+            assembly_name = resolve_assembly_name(object_id)
+            part_id = self._part_id_assigner.resolve(assembly_name, object_id, tid)
+            self.pub_fused_assembly.publish(
+                self._make_fused_pose_item_msg(assembly_name, part_id, T_pub, stamp)
+            )
+            self._publish_planning_scene_object(
+                assembly_name, part_id, object_id, T_pub, stamp
             )
 
         t_end = time.time()
@@ -3595,6 +3877,9 @@ class FoundationPoseTrackerNode(Node):
         """
         t_start = time.time()
         _dprint("\n[TIMING] ========== MULTICAM INIT START ==========")
+
+        self._init_cycle_counter += 1
+        self._prune_stale_track_ids()
 
         # Reset the per-init-pass claim set so each fused detection picks
         # an unused (or newly allocated) track_id.
@@ -3710,9 +3995,6 @@ class FoundationPoseTrackerNode(Node):
             for c in str(getattr(self.args, "fp_skip_cameras", "")).split(",")
             if c.strip()
         }
-
-        if not hasattr(self, "_pub_fused_pose"):
-            self._pub_fused_pose: dict[str, Any] = {}
 
         for i, fused in enumerate(fused_detections):
             try:
@@ -4105,16 +4387,18 @@ class FoundationPoseTrackerNode(Node):
                     extra=f"dino={det.dino_score:.3f} cams={len(candidate_poses)}",
                 )
 
-            # Publish canonical fused pose under the track_id key so multi-
-            # instance same-class scenes get distinct topics.
+            # Publish canonical fused pose on the shared assembly topic; each
+            # part is its own message, identified by assembly_name + part_id.
             self._last_known_track_centroids[track_id_for_fused] = base_centroid.copy()
-            fused_key = f"fused/{track_id_for_fused}"
-            if fused_key not in self._pub_fused_pose:
-                self._pub_fused_pose[fused_key] = self.create_publisher(
-                    PoseStamped, f"/perception/fp/pose_base/{fused_key}", FAST_QOS,
-                )
-            self._pub_fused_pose[fused_key].publish(
-                T_to_pose_stamped(T_publish, frame_id="base", stamp=stamp)
+            assembly_name = resolve_assembly_name(fused.object_id)
+            part_id = self._part_id_assigner.resolve(
+                assembly_name, fused.object_id, track_id_for_fused
+            )
+            self.pub_fused_assembly.publish(
+                self._make_fused_pose_item_msg(assembly_name, part_id, T_publish, stamp)
+            )
+            self._publish_planning_scene_object(
+                assembly_name, part_id, fused.object_id, T_publish, stamp
             )
 
         _dprint(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms")
@@ -4127,7 +4411,7 @@ class FoundationPoseTrackerNode(Node):
             for cam_id, states in new_states_by_cam.items():
                 if not states:
                     continue
-                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False)
+                pose_items = self._states_to_pose_item_msgs(cam_id, states, include_masks=False, stamp=stamp)
                 frame = self._build_debug_frame(
                     cam_id=cam_id, stamp=stamp,
                     update_sam=False, update_dino=False,
@@ -4224,8 +4508,92 @@ class FoundationPoseTrackerNode(Node):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _clear_all_tracking_state(self, stamp) -> None:
+        """Drop every track's state/memory/planning-scene entry without touching
+        any loaded model (SAM/DINO/GDINO/FoundationPose/Cutie weights stay resident)."""
+        all_track_ids = {
+            s.track_id
+            for states in self.track_states.values()
+            for s in states
+            if getattr(s, "track_id", "")
+        }
+        for cid in list(self.track_states.keys()):
+            self.track_states[cid] = []
+        self._drop_realtime_trackers_for_track_ids(all_track_ids)
+        self._remove_planning_scene_objects(all_track_ids, stamp)
+        for tid in all_track_ids:
+            self._fused_lost_count.pop(tid, None)
+            self._fused_pose_status.pop(tid, None)
+            self._fused_last_drop_reasons.pop(tid, None)
+            self._fused_warmup_count.pop(tid, None)
+            self._fused_track_memory.pop(tid, None)
+            self._median_pose_buffers.pop(tid, None)
+            self._fused_translation_kalman.pop(tid, None)
+            self._part_id_assigner.release(tid)
+            self._track_id_to_object_id.pop(tid, None)
+        self._force_reinit_tracks.clear()
+
+    def _wait_until_tick_idle(self, timeout_s: float = 5.0) -> bool:
+        """Block (this callback's own thread only) until a concurrently running
+        _tick finishes, so service handlers never mutate track_states/Cutie
+        sessions/etc. while _tick is mid-read of the same structures. Setting
+        _tracking_active False first (done by callers) stops any *new* tick
+        from starting, so this only ever waits out a tick already in flight."""
+        deadline = time.time() + timeout_s
+        while self.busy:
+            if time.time() > deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
+    def _on_set_tracking_active(self, request, response):
+        """SetBool service: start (True) or stop (False) the tick's detect/track
+        work in place. Models stay loaded, so restarting is instant."""
+        was_active = self._tracking_active
+        self._tracking_active = bool(request.data)
+        if was_active and not self._tracking_active:
+            if not self._wait_until_tick_idle():
+                self.get_logger().warn(
+                    "Timed out waiting for in-flight tick before stopping; "
+                    "state was left untouched, retry the call"
+                )
+                self._tracking_active = was_active
+                response.success = False
+                response.message = "timed out waiting for in-flight tick"
+                return response
+            self._clear_all_tracking_state(self.get_clock().now().to_msg())
+            self.get_logger().info("Tracking stopped (models kept resident)")
+        elif not was_active and self._tracking_active:
+            self.get_logger().info("Tracking (re)started")
+        response.success = True
+        response.message = f"tracking_active={self._tracking_active}"
+        return response
+
+    def _on_reset_tracking(self, request, response):
+        """Trigger service: clear all track state/identities without changing
+        the start/stop flag, so the next active tick re-runs multicam init."""
+        was_active = self._tracking_active
+        self._tracking_active = False
+        if not self._wait_until_tick_idle():
+            self.get_logger().warn(
+                "Timed out waiting for in-flight tick before resetting; "
+                "state was left untouched, retry the call"
+            )
+            self._tracking_active = was_active
+            response.success = False
+            response.message = "timed out waiting for in-flight tick"
+            return response
+        self._clear_all_tracking_state(self.get_clock().now().to_msg())
+        self._tracking_active = was_active
+        self.get_logger().info("Tracking state reset")
+        response.success = True
+        response.message = "tracking state cleared"
+        return response
+
     def _tick(self) -> None:
         """Timer callback: choose tracking vs reinit for the latest synchronized views."""
+        if not self._tracking_active:
+            return
         if self.busy:
             return
         views = self.grabber.get_latest_views()
@@ -4257,7 +4625,10 @@ class FoundationPoseTrackerNode(Node):
                     self._fused_lost_count[tid] = 0
                     self._fused_pose_status[tid] = "fresh"
                     self._fused_last_drop_reasons.pop(tid, None)
+                    self._part_id_assigner.release(tid)
+                    self._track_id_to_object_id.pop(tid, None)
                 self._drop_realtime_trackers_for_track_ids(lost_track_ids)
+                self._remove_planning_scene_objects(lost_track_ids, stamp)
                 self._force_reinit_tracks.clear()
                 remaining_track_ids = sorted({
                     s.track_id
@@ -4334,6 +4705,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
     p.add_argument(
+        "--start-paused", action="store_true",
+        help="Load all models but don't start ticking; call the "
+             "~/set_tracking_active service (std_srvs/SetBool) to begin.",
+    )
+    p.add_argument(
         "--tracking-profile",
         choices=["fast_cutie"],
         default=None,
@@ -4345,6 +4721,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reference-dir", default="Data/ZED_screens")
     p.add_argument("--cad-dir", default="Data/CAD_Models_centered")
     p.add_argument("--output-root", default="outputs/foundationpose")
+    p.add_argument(
+        "--assembly-part-ids-config",
+        default="Data/assembly_part_ids.json",
+        help=(
+            "JSON file mapping assembly_name -> ordered list of object_ids, "
+            "one entry per Fabrica part slot (list index == part_id). "
+            "Repeated object_ids (e.g. multiple screws) get distinct slots."
+        ),
+    )
+    p.add_argument(
+        "--planning-scene-frame-id",
+        default="world",
+        help=(
+            "Fixed frame_id used for MoveIt CollisionObjects published on "
+            "/planning_scene. Does not depend on tf2 frame resolution — set "
+            "this to whatever frame the robot/world is spawned under."
+        ),
+    )
 
     # synthetic-render reference bank
     p.add_argument("--reference-source", choices=["real", "renders", "both"],
@@ -4451,12 +4845,12 @@ def parse_args() -> argparse.Namespace:
     # Soft DINO label penalty (meters of extra matching cost for a full label
     # disagreement)
     p.add_argument("--fusion-match-label-penalty-m", type=float, default=0.0)
-    p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.18)
-    p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.015)
+    p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.1)
+    p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.1)
 
     # Fused pose acceptance gates after ICP.
-    p.add_argument("--fused-track-min-fused-icp-fitness", type=float, default=0.12)
-    p.add_argument("--fused-track-max-fused-icp-rmse-m", type=float, default=0.012)
+    p.add_argument("--fused-track-min-fused-icp-fitness", type=float, default=0.1)
+    p.add_argument("--fused-track-max-fused-icp-rmse-m", type=float, default=0.15)
     p.add_argument("--fused-track-nominal-dt-s", type=float, default=0.15)
     p.add_argument("--fused-track-min-dt-s", type=float, default=0.10)
     p.add_argument("--fused-track-max-dt-s", type=float, default=0.30)
@@ -4473,8 +4867,8 @@ def parse_args() -> argparse.Namespace:
     # Tracking uses a tight init from the previous frame
     p.add_argument("--fused-track-icp-max-iteration", type=int, default=15)
     # Adaptive early-stop tolerances for tracking ICP
-    p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
-    p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
+    p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-1)
+    p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-1)
 
     # Optional fast-motion recovery: translate the ICP seed from agreeing cloud centroids.
     p.add_argument("--fused-track-centroid-recovery", action="store_true",
@@ -4592,7 +4986,7 @@ def parse_args() -> argparse.Namespace:
     # Conditional chamfer thresholds. Skip chamfer when both fitness/rmse are
     # already clean and motion is small.
     p.add_argument("--chamfer-skip-fitness-min", type=float, default=0.30)
-    p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.005)
+    p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.15)
     p.add_argument("--chamfer-skip-motion-max-m", type=float, default=0.010)
     p.add_argument("--chamfer-every-n-frames", type=int, default=1,
                    help="Run non-clean tracking Chamfer gate every N frames. 1 checks every eligible frame.")
@@ -4645,7 +5039,7 @@ def parse_args() -> argparse.Namespace:
     # bicubic-upscale DINO crops whose short side is below this many pixels
     p.add_argument("--dino-min-crop-side", type=int, default=0)
 
-    p.add_argument("--table-plane-z-min", type=float, default=0.0)
+    p.add_argument("--table-plane-z-min", type=float, default=-0.03)
     p.add_argument("--table-plane-z-max", type=float, default=0.9)
 
 
@@ -4668,6 +5062,20 @@ def main() -> None:
 
     # Extrinsics and camera topics must agree: grabber timestamps frames, tracker uses poses.
     T_map = load_extrinsics_yaml("config/camera_extrinsics_base.yaml")
+    # camera_extrinsics_base.yaml is calibrated in whichever robot was active
+    # at calibration time (config/robot_bases.yaml); shift every static
+    # camera-to-base pose into the dual-arm bringup's base_link frame (the
+    # midpoint between robot_a and robot_b, oriented like robot_a -- see
+    # get_dual_arm_base_link()) here, once, before either the grabber or the
+    # tracker node reads T_map.
+    active_robot, T_robotA_activeRobot = get_active_robot_base()
+    T_robotA_baseLink = get_dual_arm_base_link()
+    T_baseLink_activeRobot = T_robotA_baseLink.inverse().compose(T_robotA_activeRobot)
+    print(
+        f"[PIPELINE] active_robot={active_robot} (config/robot_bases.yaml) -- "
+        f"static extrinsics shifted to the dual-arm base_link frame (global reference)"
+    )
+    T_map = {cam_id: T_baseLink_activeRobot.compose(T) for cam_id, T in T_map.items()}
     cameras = select_cameras(args.num_cameras)
     print(f"[PIPELINE] Using {len(cameras)} cameras: {[c.cam_id for c in cameras]}")
     grabber = MultiCamGrabber(

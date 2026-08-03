@@ -20,6 +20,10 @@ RUN apt-get update && apt-get install -y \
     python3-setuptools \
     libgl1 \
     libglib2.0-0 \
+    libboost-system-dev \
+    libboost-program-options-dev \
+    libeigen3-dev \
+    pybind11-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN locale-gen en_US en_US.UTF-8 && \
@@ -47,7 +51,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN rosdep init || true && rosdep update
 
-RUN python3 -m venv /opt/thesis-venv
+RUN python3 -m venv --system-site-packages /opt/thesis-venv
 ENV PATH="/opt/thesis-venv/bin:${PATH}"
 
 RUN pip install --upgrade pip setuptools wheel
@@ -63,7 +67,13 @@ RUN pip install \
     open3d \
     warp-lang \
     ruamel.yaml \
-    transformations
+    transformations \
+    hydra-core \
+    iopath \
+    opencv-python \
+    h5py \
+    transformers \
+    optas
 
 RUN pip install \
     torch==2.7.0 \
@@ -71,7 +81,19 @@ RUN pip install \
     torchaudio==2.7.0 \
     --index-url https://download.pytorch.org/whl/cu126
 
+# nvdiffrast and pytorch3d compile CUDA extensions against the torch build
+# above, so they must come after it. Both come from source (no PyPI releases
+# track current torch/CUDA combos in time), hence --no-build-isolation so the
+# build sees the already-installed torch instead of a fresh isolated env.
+RUN pip install --no-cache-dir --no-build-isolation \
+    git+https://github.com/NVlabs/nvdiffrast.git
+
+RUN pip install --no-cache-dir --no-build-isolation \
+    "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
     echo "source /opt/thesis-venv/bin/activate" >> /root/.bashrc
+
+RUN echo 'if [ -f /workspace/MasterThesis/install/setup.bash ]; then source /workspace/MasterThesis/install/setup.bash; fi' >> /root/.bashrc
 
 WORKDIR /workspace/MasterThesis

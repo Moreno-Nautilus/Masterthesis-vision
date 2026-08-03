@@ -1,0 +1,147 @@
+"""Broadcast config/camera_extrinsics_*.yaml as static TF frames, so they
+show up next to the robot's own tf tree in RViz (e.g. alongside
+scripts/launch_moveit_scene_viewer.launch.py) instead of only being usable
+as raw numbers.
+
+zed2i_* entries are published as children of lbr_link_0 (their dst frame,
+see io_extrinsics.load_extrinsics_yaml docstring). realsense_1/realsense_2
+are published as children of lbr_link_ee, since those entries are a static
+camera-to-flange mount offset, not a camera-to-base transform -- see
+config/camera_extrinsics_realsense.yaml's header comment.
+
+Usage:
+    python3 -m src.calibration.publish_extrinsics_tf
+    python3 -m src.calibration.publish_extrinsics_tf --base-frame lbr_link_0 --ee-frame lbr_link_ee
+
+Then in RViz: Add -> TF, and look for zed2i_1/zed2i_2/zed2i_3 hanging off
+lbr_link_0, and realsense_1/realsense_2 hanging off lbr_link_ee.
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import StaticTransformBroadcaster
+
+from src.calibration.io_extrinsics import load_extrinsics_yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# cam_id -> which robot frame its extrinsics entry is expressed relative to.
+FLANGE_CAM_IDS = {"realsense_1", "realsense_2"}
+
+
+def _rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
+    # Same Shepperd's-method implementation as
+    # run_pipeline_track_multicam.py's rotation_matrix_to_quaternion_xyzw --
+    # duplicated (not imported) to avoid pulling the whole pipeline runner
+    # module in for one helper, and to skip scipy, whose compiled extension
+    # is ABI-incompatible with the numpy build in this ROS env.
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    q = np.empty(4, dtype=np.float64)
+    trace = np.trace(R)
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        q[3] = 0.25 * s
+        q[0] = (R[2, 1] - R[1, 2]) / s
+        q[1] = (R[0, 2] - R[2, 0]) / s
+        q[2] = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        q[3] = (R[2, 1] - R[1, 2]) / s
+        q[0] = 0.25 * s
+        q[1] = (R[0, 1] + R[1, 0]) / s
+        q[2] = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        q[3] = (R[0, 2] - R[2, 0]) / s
+        q[0] = (R[0, 1] + R[1, 0]) / s
+        q[1] = 0.25 * s
+        q[2] = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        q[3] = (R[1, 0] - R[0, 1]) / s
+        q[0] = (R[0, 2] + R[2, 0]) / s
+        q[1] = (R[1, 2] + R[2, 1]) / s
+        q[2] = 0.25 * s
+    return q / (np.linalg.norm(q) + 1e-12)
+
+
+def _make_transform(
+    parent_frame: str, child_frame: str, R, t, stamp
+) -> TransformStamped:
+    msg = TransformStamped()
+    msg.header.stamp = stamp
+    msg.header.frame_id = parent_frame
+    msg.child_frame_id = child_frame
+    msg.transform.translation.x, msg.transform.translation.y, msg.transform.translation.z = (
+        float(t[0]), float(t[1]), float(t[2])
+    )
+    qx, qy, qz, qw = _rotation_matrix_to_quaternion_xyzw(R)
+    msg.transform.rotation.x = float(qx)
+    msg.transform.rotation.y = float(qy)
+    msg.transform.rotation.z = float(qz)
+    msg.transform.rotation.w = float(qw)
+    return msg
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--base-yaml",
+        default=str(REPO_ROOT / "config" / "camera_extrinsics_base.yaml"),
+        help="Static camera-to-base extrinsics (zed2i_* entries).",
+    )
+    parser.add_argument(
+        "--realsense-yaml",
+        default=str(REPO_ROOT / "config" / "camera_extrinsics_realsense.yaml"),
+        help="Wrist-camera-to-flange + zed2i_1 extrinsics.",
+    )
+    parser.add_argument(
+        "--base-frame",
+        default="lbr_link_0",
+        help="Parent frame for camera-to-base entries (active robot's base).",
+    )
+    parser.add_argument(
+        "--ee-frame",
+        default="lbr_link_ee",
+        help="Parent frame for camera-to-flange entries (realsense_1/realsense_2).",
+    )
+    args = parser.parse_args()
+
+    rclpy.init()
+    node = Node("extrinsics_tf_publisher")
+    broadcaster = StaticTransformBroadcaster(node)
+    stamp = node.get_clock().now().to_msg()
+
+    transforms: list[TransformStamped] = []
+
+    base_extr = load_extrinsics_yaml(args.base_yaml)
+    for cam_id, T in base_extr.items():
+        transforms.append(
+            _make_transform(args.base_frame, cam_id, T.R, T.t, stamp)
+        )
+
+    realsense_extr = load_extrinsics_yaml(args.realsense_yaml)
+    for cam_id, T in realsense_extr.items():
+        if cam_id in base_extr:
+            # zed2i_1 is duplicated across both files with the same meaning;
+            # camera_extrinsics_base.yaml's copy already published above.
+            continue
+        parent = args.ee_frame if cam_id in FLANGE_CAM_IDS else args.base_frame
+        transforms.append(_make_transform(parent, cam_id, T.R, T.t, stamp))
+
+    broadcaster.sendTransform(transforms)
+    node.get_logger().info(
+        f"Published {len(transforms)} static camera TF frames: "
+        f"{[t.child_frame_id for t in transforms]}"
+    )
+    rclpy.spin(node)
+
+
+if __name__ == "__main__":
+    main()

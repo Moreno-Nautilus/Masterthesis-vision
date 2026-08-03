@@ -114,6 +114,19 @@ a checkerboard held in a known spot. The result is written to
 ### 2.1 Prerequisites
 
 - The **host stack from §1 must be running** (the cameras must be publishing).
+  For better checkerboard corner detection, (re)launch it with `calibrate`
+  instead of plain `scripts/launch_host.sh` — same tmux session, but the
+  ZEDs grab/publish at HD2K (2208x1242 @ 15fps) instead of the normal
+  HD1080 @ 30fps used for tracking:
+  ```bash
+  scripts/launch_host.sh stop        # if the normal-resolution session is up
+  scripts/launch_host.sh calibrate   # relaunch at HD2K/15fps
+  ```
+  Equivalent to `CALIBRATE_2K=1 scripts/launch_host.sh`. Under the hood this
+  passes `override_path:=config/zed_override_2k.yaml` to `mv_launch`'s
+  `zed2i_pair.launch.py` instead of the default `config/zed_override_native.yaml`
+  — both files live in the separate `~/franka_ros2_ws` ROS workspace, not this
+  repo.
 - You need the **physical checkerboard**: **8 × 11 inner corners**, **30 mm** squares.
   (These are the defaults baked into the script — see the constants below.)
 
@@ -152,6 +165,17 @@ Then, in that container shell:
 python3 -m src.calibration.base_to_cams_calib_3
 ```
 
+If a camera fails to open (`CAMERA NOT DETECTED` in the host stack's `cams`
+window — USB enumeration flakiness happens), calibrate with just the cameras
+that came up instead, e.g.:
+
+```bash
+python3 -m src.calibration.base_to_cams_calib_3 --cam-ids zed2i_2 zed2i_3
+```
+
+`--cam-ids` accepts any subset of size N≥1, in any order; the output YAML and
+printed report key off cam_id, not a fixed camera-1/2/3 slot.
+
 **Hold the checkerboard so all three cameras see it at once, and keep it steady.**
 The script collects 8 good 3-camera samples, so hold position for a few seconds. It
 will:
@@ -186,7 +210,12 @@ scripts/launch_pipeline.sh accurate-track   # detect once, then accurate (settle
 ```
 
 Each command restarts the `vision` container, sources everything, runs the node, and
-tees the log to `outputs/logs/`.
+tees the log to `outputs/logs/`. It opens a tmux session with two windows: `run`
+(the pipeline itself) and `keys` (a keyboard helper for pausing/resuming tracking
+without reloading any model — press `s`/`x`/`r`, see
+[pipeline_walkthrough.md](pipeline_walkthrough.md#keyboard-control-local-debugging)).
+Detach with `Ctrl+b d`, reattach with `scripts/launch_pipeline.sh attach`, and stop
+everything with `scripts/launch_pipeline.sh stop`.
 
 **Which one should I use?**
 
@@ -203,19 +232,27 @@ tees the log to `outputs/logs/`.
 
 ### The output — the live ROS pose stream
 
-**This is the part other students consume.** For every tracked object the node
-publishes a base-frame `geometry_msgs/PoseStamped` (frame `base`) on:
+**This is the part other students consume.** For every tracked/detected part
+the node publishes a base-frame `fp_debug_msgs/DebugPoseItem` (its
+`pose_base` field is a `geometry_msgs/PoseStamped`, frame `base`) on one
+shared topic:
 
 ```
-/perception/fp/pose_base/fused/<track_id>
+/perception/fp/pose_base/fused/assembly
 ```
+
+Every part gets its own message on this topic — there is no per-object topic
+name to look up. A message is identified by its `assembly_name` (e.g.
+`plumbers_block`) and `part_id` (an int matching the Fabrica part-slot
+convention in `Data/assembly_part_ids.json`, e.g. `pb_screw` might be part_id
+`1` or `4` depending on which physical screw it is). Subscribe once and filter
+by `assembly_name`/`part_id` in your callback.
 
 Subscribe to it from your own ROS node, or inspect it from a sourced ROS shell:
 
 ```bash
 source /opt/ros/humble/setup.bash
-ros2 topic list | grep /perception/fp/pose_base     # list the per-object topics
-ros2 topic echo /perception/fp/pose_base/fused/<track_id>
+ros2 topic echo /perception/fp/pose_base/fused/assembly
 ```
 
 Visual confirmation (not the interface, just for checking):
@@ -236,8 +273,13 @@ analysis, **not** the live interface:
 
 </details>
 
-To stop: `Ctrl+C` in the pipeline terminal. Stop the host stack with
-`scripts/launch_host.sh stop` when you're completely done.
+To stop for good: `scripts/launch_pipeline.sh stop` (kills the whole tmux
+session, both windows). Stop the host stack with `scripts/launch_host.sh stop`
+when you're completely done.
+
+To pause/resume without reloading models: switch to the `keys` tmux window
+(`Ctrl+b 1`) and press `x`/`s` instead of stopping the session — see
+[pipeline_walkthrough.md](pipeline_walkthrough.md#keyboard-control-local-debugging).
 
 ---
 
@@ -334,3 +376,4 @@ scripts/launch_pipeline.sh accurate-track --fused-track-rot-lowpass 0.3  # smoot
 - **[Franka_Perception.json](Franka_Perception.json)** — the shared Foxglove layout (import via *Layouts → Import from file…*).
 - **[README](../README.md)** — full repo layout, every launch flag, and from-scratch setup.
 - **[docs/pipeline_walkthrough.md](pipeline_walkthrough.md)** — how the algorithm works, stage by stage (GDINO → SAM → DINO → fusion → FoundationPose → ICP, then tracking).
+- **[docs/getting_started_realsense.md](getting_started_realsense.md)** — the experimental 1-ZED + 2-RealSense (end-effector-mounted) variant; a separate, parallel pipeline.
