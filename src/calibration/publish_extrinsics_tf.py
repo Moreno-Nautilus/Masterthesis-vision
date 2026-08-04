@@ -9,9 +9,18 @@ are published as children of lbr_link_ee, since those entries are a static
 camera-to-flange mount offset, not a camera-to-base transform -- see
 config/camera_extrinsics_realsense.yaml's header comment.
 
+realsense_2 has a second, CAD-derived entry in that same YAML,
+realsense_2_initial_guess_cad (a reference-only T_flange_cam computed from
+the mount's CAD, not from hand-eye calibration). By default this script
+publishes THAT one as the "realsense_2" TF frame -- in place of the
+calibrated entry -- so it can be sanity-checked against the gripper/robot in
+RViz. Pass --realsense2-source calibrated to publish the real hand-eye
+result instead.
+
 Usage:
     python3 -m src.calibration.publish_extrinsics_tf
     python3 -m src.calibration.publish_extrinsics_tf --base-frame lbr_link_0 --ee-frame lbr_link_ee
+    python3 -m src.calibration.publish_extrinsics_tf --realsense2-source calibrated
 
 Then in RViz: Add -> TF, and look for zed2i_1/zed2i_2/zed2i_3 hanging off
 lbr_link_0, and realsense_1/realsense_2 hanging off lbr_link_ee.
@@ -33,6 +42,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # cam_id -> which robot frame its extrinsics entry is expressed relative to.
 FLANGE_CAM_IDS = {"realsense_1", "realsense_2"}
+
+# Suffix marking a YAML entry as a reference-only CAD guess for the cam_id
+# it's named after (e.g. realsense_2_initial_guess_cad -> realsense_2). Never
+# published as its own TF frame -- only swapped in for its named cam_id.
+CAD_INITIAL_GUESS_SUFFIX = "_initial_guess_cad"
 
 
 def _rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
@@ -111,6 +125,15 @@ def main() -> None:
         default="lbr_link_ee",
         help="Parent frame for camera-to-flange entries (realsense_1/realsense_2).",
     )
+    parser.add_argument(
+        "--realsense2-source",
+        choices=["cad_initial_guess", "calibrated"],
+        default="cad_initial_guess",
+        help="Which T_flange_cam to publish as the realsense_2 TF frame: the "
+        "CAD-derived nominal mount transform (realsense_2_initial_guess_cad) "
+        "or the real hand-eye calibration result (realsense_2). Defaults to "
+        "the CAD guess.",
+    )
     args = parser.parse_args()
 
     rclpy.init()
@@ -128,10 +151,18 @@ def main() -> None:
 
     realsense_extr = load_extrinsics_yaml(args.realsense_yaml)
     for cam_id, T in realsense_extr.items():
+        if cam_id.endswith(CAD_INITIAL_GUESS_SUFFIX):
+            # Not published under its own name -- only swapped in below, in
+            # place of the cam_id it's a guess for.
+            continue
         if cam_id in base_extr:
             # zed2i_1 is duplicated across both files with the same meaning;
             # camera_extrinsics_base.yaml's copy already published above.
             continue
+        if cam_id == "realsense_2" and args.realsense2_source == "cad_initial_guess":
+            guess_key = cam_id + CAD_INITIAL_GUESS_SUFFIX
+            if guess_key in realsense_extr:
+                T = realsense_extr[guess_key]
         parent = args.ee_frame if cam_id in FLANGE_CAM_IDS else args.base_frame
         transforms.append(_make_transform(parent, cam_id, T.R, T.t, stamp))
 
