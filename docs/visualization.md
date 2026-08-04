@@ -132,7 +132,9 @@ ros2 run tf2_ros tf2_echo lbr_link_0 zed2i_1
 
 Note: this always publishes from `camera_extrinsics_base.yaml`, i.e. the
 frame of whichever robot is currently `active_robot` in
-`config/robot_bases.yaml` (not `camera_extrinsics_base_robot_a_frame.yaml`).
+`config/robot_bases.yaml`. The robot_a-frame re-expression of these same
+poses is not kept as its own config file -- it's logged per-run in
+`outputs/calibration_logs/camera_transforms.json` (`T_robotA_cam`) instead.
 
 ## 4. Viewing the camera rig itself (ZED2 + holder meshes)
 

@@ -35,6 +35,14 @@
 # rs1_serial:=/rs2_serial:=), recorded here for convenience:
 #   realsense_1: 260322275185
 #   realsense_2: 260522275434
+#
+# realsense_2_initial_guess_cad is NOT a cam_id read by any loader -- it's a
+# reference-only T_flange_cam derived from the mount's CAD/datasheet
+# (connector-in-camera pose + the connector-to-flange 90/90 offset), kept
+# here next to the actual calibrated realsense_2 entry so the two can be
+# diffed by eye. It differs from the calibrated realsense_2 value by ~141
+# deg of rotation and ~39mm of translation -- see git history / the
+# conversation that added this entry for the full derivation.
 
 realsense_1:
   R:
@@ -66,6 +74,21 @@ realsense_2:
   - 0.04822088853440753
   - -0.029119031966159226
   - 0.07017758691589546
+realsense_2_initial_guess_cad:
+  R:
+  - 6.123233995736766e-17
+  - -0.8660254037844386
+  - -0.5000000000000001
+  - 1.0
+  - 8.364493191492918e-17
+  - -2.2412591957561503e-17
+  - 6.123233995736766e-17
+  - -0.5000000000000001
+  - 0.8660254037844386
+  t:
+  - 0.0556666756801677
+  - 0.008999999999999992
+  - 0.07077648943349073
 zed2i_1:
   R:
   - -0.98305904327408

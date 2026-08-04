@@ -55,17 +55,6 @@ MAX_FINAL_ROTATION_STD_DEG = 1.0
 
 BASE_BOARD_YAML = "config/base_board_pose.yaml"
 OUT_YAML = "config/camera_extrinsics_base.yaml"
-# Same poses, re-expressed in robot_a's frame (global reference) -- written
-# as a separate sibling file (not extra keys in OUT_YAML) because OUT_YAML
-# uses the flat cam_id -> {R,t} format that load_extrinsics_yaml() reads
-# every top-level key from; mixing in "_robot_a_frame" keys there would get
-# silently picked up as if they were extra cameras. Reference/documentation
-# only -- the live pipeline computes this same conversion itself at runtime
-# from OUT_YAML + config/robot_bases.yaml (see run_pipeline_track_multicam.py
-# and run_pipeline_track_multicam_realsense.py), so this file is not read by
-# anything; it exists so the robot_a-frame numbers are on disk, not just
-# printed to a terminal that may not be saved.
-OUT_YAML_ROBOT_A_FRAME = "config/camera_extrinsics_base_robot_a_frame.yaml"
 DEBUG_DIR = "outputs/calibration_debug"
 # ------------------------------------------------
 
@@ -558,14 +547,6 @@ def main() -> None:
 
     save_extrinsics_yaml(out_path, T_base_cam_avg)
     print(f"\nWrote base-referenced camera extrinsics to: {out_path}")
-
-    out_path_robot_a = Path(OUT_YAML_ROBOT_A_FRAME)
-    if out_path_robot_a.exists():
-        backup_a = out_path_robot_a.with_suffix(".yaml.bak")
-        backup_a.write_text(out_path_robot_a.read_text())
-        print(f"Backed up existing YAML to: {backup_a}")
-    save_extrinsics_yaml(out_path_robot_a, T_robotA_cam)
-    print(f"Wrote robot_a-frame camera extrinsics (reference only) to: {out_path_robot_a}")
 
     print(f"Saved debug corner images to: {debug_dir}")
 
