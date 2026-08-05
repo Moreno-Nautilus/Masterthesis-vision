@@ -33,6 +33,9 @@ Visualization Manager:
     Fixed Frame: lbr_one_link_7
     Frame Rate: 30
   Value: true
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Current Tool: rviz_default_plugins/MoveCamera
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
