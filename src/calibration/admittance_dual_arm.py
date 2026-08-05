@@ -4,6 +4,14 @@ correct even though it doesn't send torque commands; see the discussion
 this module's design followed). Additive alongside moveit_dual_arm.py and
 cartesian_impedance_dual_arm.py, not a replacement.
 
+Two ways to run this: standalone, via this module's own main()
+(`python3 -m src.calibration.admittance_dual_arm`) for general hand-guiding;
+or embedded, as the default Step 1 calibration-image-gathering control
+mode -- capture_flange_poses_dual_admittance.py constructs
+AdmittanceDualArmNode itself and spins it in a background thread alongside
+its own interactive capture loop, rather than importing this main(). Both
+paths share apply_gain_profile()/log_active_gains() below.
+
 Reuses lbr_fri_ros2_stack's existing, working control law --
 lbr_demos_advanced_py.admittance_controller.AdmittanceController -- rather
 than reimplementing the Jacobian-pseudo-inverse force->velocity->position
@@ -29,35 +37,69 @@ dual_arm_controllers.yaml's joint_trajectory_controller.
 Gains (f_ext_th/dq_gains/dx_gains) are ordinary ROS parameters on this
 node, one triplet per arm (f_ext_th.<arm_key> etc.), defaulting at startup
 to config/admittance_gain_profiles.yaml's "holding" profile -- the
-"reasonable by default" values. The ONLY way to change them afterward is
-this node's own standard `~/set_parameters` service (automatic once
-parameters are declared, no custom .srv needed) -- there is no public
-Python method that mutates them directly, mirroring
-cartesian_impedance_dual_arm.py's set_gains() (same service-only
-constraint, just via the generic parameter service instead of the
-controller's own). The validating callback
-(_on_set_parameters) refuses a change and returns
-successful=False unless that arm is currently stationary, checked via the
-admittance law's own internal `_dq` (the joint velocity it is CURRENTLY
-commanding) -- exactly "is this admittance loop presently moving the arm",
-no separate velocity source needed. gain_profiles.py's
-load_admittance_profile() is a pure helper for building the values to send
-in a set_parameters request; it does not itself change anything.
+"reasonable by default" values (rotational axes retuned 2026-08-03 -- see
+that file's comments -- after hand-guiding felt too stiff rotationally).
+The ONLY way to change them afterward is through this node's registered
+parameter-set callback (_on_set_parameters) -- reachable either via the
+standard `~/set_parameters` *service* (an external caller, e.g. a
+different process/node) or, for an in-process caller that already holds
+the node object, this module's own apply_gain_profile() helper, which just
+calls the node's plain set_parameters() Python method -- rclpy invokes the
+exact same registered callback either way, no bypass. Mirrors
+cartesian_impedance_dual_arm.py's set_gains() (same
+stationary-guard constraint, just via the generic parameter mechanism
+instead of the controller's own). The validating callback refuses a change
+and returns successful=False unless that arm is currently stationary,
+checked via the admittance law's own internal `_dq` (the joint velocity it
+is CURRENTLY commanding) -- exactly "is this admittance loop presently
+moving the arm", no separate velocity source needed. gain_profiles.py's
+load_admittance_profile() is a pure helper for building the values to send;
+it does not itself change anything.
 """
 
 from __future__ import annotations
+
+import argparse
 
 import numpy as np
 import rclpy
 from lbr_fri_idl.msg import LBRJointPositionCommand, LBRState
 from rcl_interfaces.msg import ParameterValue, SetParametersResult
 from rcl_interfaces.srv import GetParameters
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from urdf_parser_py.urdf import URDF
 
 from lbr_demos_advanced_py.admittance_controller import AdmittanceController
 from src.calibration import gain_profiles
 from src.calibration.moveit_dual_arm import DEFAULT_MOVE_GROUP_NAMESPACE
+
+
+def _single_arm_urdf(robot_description: str, base_link: str, end_effector_link: str) -> str:
+    """Prune the shared dual-arm robot_description down to just the serial
+    chain base_link -> end_effector_link, so optas.RobotModel's ndof (and the
+    Jacobian function's expected input length) is that arm's own 7 joints,
+    not the combined dual-arm + gripper model's ~18. AdmittanceController
+    (lbr_demos_advanced_py, written for a single-arm rig) sizes every
+    internal array off self._robot.ndof and feeds it lbr_state's own 7-long
+    measured_joint_position/external_torque directly -- handing it the full
+    dual-arm URDF makes ndof 18 while the message stays 7-long, crashing the
+    Jacobian call with a shape mismatch (confirmed: optas' param_joints does
+    NOT shrink the Jacobian function's required input length, only a
+    genuinely smaller URDF does).
+    """
+    full = URDF.from_xml_string(robot_description)
+    chain = full.get_chain(base_link, end_effector_link, joints=True, links=True, fixed=True)
+    link_names, joint_names = chain[0::2], chain[1::2]
+
+    pruned = URDF(name=f"{full.name}_{base_link}_{end_effector_link}")
+    for link_name in link_names:
+        pruned.add_link(full.link_map[link_name])
+    for joint_name in joint_names:
+        pruned.add_joint(full.joint_map[joint_name])
+    return pruned.to_xml_string()
 
 ARM_KEYS = {
     "left": {
@@ -111,10 +153,26 @@ class AdmittanceDualArmNode(Node):
 
         self._controllers: dict[str, AdmittanceController] = {}
         self._command_pubs = {}
+        # One MutuallyExclusiveCallbackGroup PER ARM (rather than every
+        # subscription defaulting to this node's single shared group) --
+        # otherwise both arms' LBRState callbacks would serialize against
+        # each other on a single group, so a slow callback for one arm
+        # (e.g. optas' first, uncompiled Jacobian evaluation) could delay
+        # the other arm's command right behind it in the queue. Only
+        # actually buys concurrency when spun via a MultiThreadedExecutor
+        # (this module's own main() below, and
+        # capture_flange_poses_dual_admittance.py, both do) -- a plain
+        # rclpy.spin() uses a single-threaded executor internally and would
+        # still process one callback at a time regardless of grouping.
+        self._callback_groups: dict[str, MutuallyExclusiveCallbackGroup] = {
+            arm_key: MutuallyExclusiveCallbackGroup() for arm_key in arm_keys
+        }
         for arm_key in arm_keys:
             info = ARM_KEYS[arm_key]
             self._controllers[arm_key] = AdmittanceController(
-                robot_description=robot_description,
+                robot_description=_single_arm_urdf(
+                    robot_description, info["base_link"], info["end_effector_link"]
+                ),
                 base_link=info["base_link"],
                 end_effector_link=info["end_effector_link"],
             )
@@ -126,6 +184,7 @@ class AdmittanceDualArmNode(Node):
                 f"/{namespace}/{info['state_topic']}",
                 lambda msg, arm_key=arm_key: self._on_lbr_state(arm_key, msg),
                 1,
+                callback_group=self._callback_groups[arm_key],
             )
             self.get_logger().info(
                 f"admittance_dual_arm: arm_key={arm_key!r} listening on "
@@ -220,3 +279,101 @@ class AdmittanceDualArmNode(Node):
             self._apply_gains(arm_key, gains)
 
         return SetParametersResult(successful=True)
+
+
+def apply_gain_profile(
+    node: AdmittanceDualArmNode, arm_keys: tuple[str, ...], profile_name: str
+) -> None:
+    """Override the startup ("holding") profile applied by
+    AdmittanceDualArmNode.__init__ with a named profile from
+    config/admittance_gain_profiles.yaml, for every arm_key. Calling the
+    node's own set_parameters() (rather than a set_parameters *service*
+    call) still goes through the exact same _on_set_parameters
+    validation/stationary-guard as an external caller -- it's the same
+    registered callback either way (rclpy.node.Node.set_parameters()
+    invokes add_on_set_parameters_callback callbacks directly, no service
+    round-trip needed for an in-process caller). Safe to call right after
+    construction: nothing has moved yet, so every arm reads as stationary.
+    Shared by this module's own main() and
+    capture_flange_poses_dual_admittance.py so both pick up retuned
+    profiles without duplicating this logic.
+    """
+    profile = gain_profiles.load_admittance_profile(profile_name)
+    params = [
+        Parameter(f"{gain_name}.{arm_key}", value=list(profile[gain_name]))
+        for arm_key in arm_keys
+        for gain_name in GAIN_PARAM_LENGTHS
+    ]
+    results = node.set_parameters(params)
+    for param, result in zip(params, results):
+        if not result.successful:
+            raise RuntimeError(
+                f"Failed to apply gain-profile {profile_name!r} param {param.name!r}: "
+                f"{result.reason}"
+            )
+
+
+def log_active_gains(node: AdmittanceDualArmNode, arm_keys: tuple[str, ...]) -> None:
+    node.get_logger().info("*** Active admittance gains (per arm):")
+    for arm_key in arm_keys:
+        values = {
+            gain_name: node.get_parameter(f"{gain_name}.{arm_key}").value
+            for gain_name in GAIN_PARAM_LENGTHS
+        }
+        node.get_logger().info(f"*   {arm_key}: {values}")
+
+
+def main(args: list[str] | None = None) -> None:
+    """Standalone entry point -- general-purpose admittance hand-guiding for
+    the dual-arm rig, independent of any calibration capture script (for
+    that, see capture_flange_poses_dual_admittance.py, which runs this same
+    node internally alongside its own capture loop instead of calling this
+    main()). Requires `ros2 launch lbr_dual_arm_bringup admittance.launch.py`
+    already running.
+
+        python3 -m src.calibration.admittance_dual_arm
+        python3 -m src.calibration.admittance_dual_arm --arm left
+        python3 -m src.calibration.admittance_dual_arm --gain-profile insertion
+
+    --arm restricts the admittance loop to a single arm (see
+    capture_flange_poses_dual_admittance.py, which always does this --
+    running both arms' Jacobian solves concurrently roughly halves the
+    achievable control-loop rate for the arm actually being hand-guided).
+    Omit it to hand-guide both arms at once, same as before.
+    """
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument(
+        "--arm", default=None, choices=sorted(ARM_KEYS),
+        help="Restrict the admittance loop to just this arm. Defaults to both arms.",
+    )
+    parser.add_argument(
+        "--gain-profile", default=None, choices=("holding", "insertion"),
+        help="Compliance profile from config/admittance_gain_profiles.yaml, applied to "
+             "the active arm(s) at startup. Defaults to AdmittanceDualArmNode's own "
+             "startup default ('holding') if omitted.",
+    )
+    parsed = parser.parse_args(args=args)
+
+    arm_keys = (parsed.arm,) if parsed.arm is not None else tuple(ARM_KEYS)
+
+    rclpy.init()
+    node = AdmittanceDualArmNode(arm_keys=arm_keys)
+    # MultiThreadedExecutor, not plain rclpy.spin() -- required for the two
+    # arms' per-arm callback groups (see AdmittanceDualArmNode.__init__) to
+    # actually run concurrently instead of falling back to one callback at
+    # a time.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        if parsed.gain_profile is not None:
+            apply_gain_profile(node, arm_keys, parsed.gain_profile)
+        log_active_gains(node, arm_keys)
+        executor.spin()  # one control step per incoming LBRState message, per arm
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

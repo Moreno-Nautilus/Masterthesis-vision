@@ -3,18 +3,29 @@ show up next to the robot's own tf tree in RViz (e.g. alongside
 scripts/launch_moveit_scene_viewer.launch.py) instead of only being usable
 as raw numbers.
 
-zed2i_* entries are published as children of lbr_link_0 (their dst frame,
-see io_extrinsics.load_extrinsics_yaml docstring). realsense_1/realsense_2
-are published as children of lbr_link_ee, since those entries are a static
-camera-to-flange mount offset, not a camera-to-base transform -- see
+zed2i_* entries are published as children of --base-frame (their dst frame,
+see io_extrinsics.load_extrinsics_yaml docstring) -- only ever one parent,
+since they're external/room-mounted cameras calibrated against one specific
+arm's link_0, not something that needs duplicating per arm. realsense_1/
+realsense_2 are published as children of --ee-frame, since those entries are
+a static camera-to-flange mount offset, not a camera-to-base transform -- see
 config/camera_extrinsics_realsense.yaml's header comment.
+
+--ee-frame may be passed more than once (e.g. for a dual-arm rig where both
+arms carry an identical wrist-camera mount): the same calibrated
+flange-to-camera offset is then republished once per given ee-frame, with
+each pair of child frames tagged by arm name (e.g. lbr_one_realsense_1,
+lbr_two_realsense_1) instead of the bare cam_id, so they don't collide.
 
 Usage:
     python3 -m src.calibration.publish_extrinsics_tf
     python3 -m src.calibration.publish_extrinsics_tf --base-frame lbr_link_0 --ee-frame lbr_link_ee
+    python3 -m src.calibration.publish_extrinsics_tf \\
+        --base-frame lbr_one_link_0 --ee-frame lbr_one_link_ee --ee-frame lbr_two_link_ee
 
 Then in RViz: Add -> TF, and look for zed2i_1/zed2i_2/zed2i_3 hanging off
-lbr_link_0, and realsense_1/realsense_2 hanging off lbr_link_ee.
+--base-frame, and realsense_1/realsense_2 (or their arm-tagged names, if
+--ee-frame was given more than once) hanging off --ee-frame.
 """
 from __future__ import annotations
 
@@ -108,8 +119,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--ee-frame",
-        default="lbr_link_ee",
-        help="Parent frame for camera-to-flange entries (realsense_1/realsense_2).",
+        action="append",
+        default=None,
+        help="Parent frame for camera-to-flange entries (realsense_1/realsense_2). "
+        "May be given more than once to republish the same calibrated offset "
+        "under multiple arms' flanges (assumes an identical camera mount on "
+        "each); default is a single 'lbr_link_ee'.",
     )
     args = parser.parse_args()
 
@@ -126,14 +141,26 @@ def main() -> None:
             _make_transform(args.base_frame, cam_id, T.R, T.t, stamp)
         )
 
+    ee_frames = args.ee_frame or ["lbr_link_ee"]
+
     realsense_extr = load_extrinsics_yaml(args.realsense_yaml)
     for cam_id, T in realsense_extr.items():
         if cam_id in base_extr:
             # zed2i_1 is duplicated across both files with the same meaning;
             # camera_extrinsics_base.yaml's copy already published above.
             continue
-        parent = args.ee_frame if cam_id in FLANGE_CAM_IDS else args.base_frame
-        transforms.append(_make_transform(parent, cam_id, T.R, T.t, stamp))
+        if cam_id not in FLANGE_CAM_IDS:
+            transforms.append(_make_transform(args.base_frame, cam_id, T.R, T.t, stamp))
+            continue
+        for ee_frame in ee_frames:
+            # Tag the child frame by arm when publishing under more than one
+            # flange, so e.g. lbr_one's and lbr_two's realsense_1 don't both
+            # try to claim the same TF child frame name.
+            child_frame = (
+                cam_id if len(ee_frames) == 1
+                else f"{ee_frame.removesuffix('_link_ee')}_{cam_id}"
+            )
+            transforms.append(_make_transform(ee_frame, child_frame, T.R, T.t, stamp))
 
     broadcaster.sendTransform(transforms)
     node.get_logger().info(

@@ -26,6 +26,23 @@ Usage:
 Then in RViz (see docs/visualization.md §2): Add -> PlanningScene, Planning
 Scene Topic /planning_scene, Fixed Frame "world" -- the ZED2 + holder meshes
 should appear at the calibrated zed2i_1/2/3 poses alongside tracked parts.
+
+--dual-arm: camera_extrinsics_base.yaml's zed2i_* transforms are expressed
+in config/robot_bases.yaml's active_robot frame (a single arm's lbr_link_0).
+The single mock robot's URDF (iiwa7.xacro) roots itself at an actual "world"
+link, fixed-jointed to lbr_link_0 -- so publishing poses in "world" as-is
+works there. The dual-arm mock has NO "world" link at all: its URDF
+(lbr_dual_arm.xacro) roots the kinematic tree at `base_link` (the midpoint
+between robot_a/robot_b -- see src/utils/robot_bases.get_dual_arm_base_link),
+and there is no static transform publishing a "world" frame either --
+move_group genuinely has no concept of "world" there and logs
+"Unknown frame: world" for every CollisionObject stamped with it. Pass
+--dual-arm to (a) re-express every camera pose into the base_link frame,
+exactly like run_pipeline_track_multicam_realsense.py's main() does for
+tracked parts, and (b) default --frame-id to "base_link" instead of "world"
+(matching lbr_dual_arm_moveit_config's own moveit.rviz Fixed Frame) -- this
+is what lbr_dual_arm_bringup/launch/mock.launch.py (and, through it,
+scripts/launch_moveit_scene_viewer.launch.py) always invokes.
 """
 from __future__ import annotations
 
@@ -41,6 +58,7 @@ from std_msgs.msg import Header
 
 from src.calibration.io_extrinsics import load_extrinsics_yaml
 from src.calibration.publish_extrinsics_tf import _rotation_matrix_to_quaternion_xyzw
+from src.utils.robot_bases import get_active_robot_base, get_dual_arm_base_link
 from src.utils.se3 import SE3
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -116,6 +134,18 @@ class CameraScenePublisher(Node):
         holder_mesh = _load_mesh_as_msg(args.holder_mesh, args.mesh_scale)
 
         base_extr = load_extrinsics_yaml(args.base_yaml)
+        if args.dual_arm:
+            # Re-express every camera-to-active-robot-frame transform into
+            # the dual-arm bringup's own base_link frame, same as
+            # run_pipeline_track_multicam_realsense.py's main().
+            _, T_robotA_activeRobot = get_active_robot_base()
+            T_baseLink_robotA = get_dual_arm_base_link().inverse()
+            T_baseLink_activeRobot = T_baseLink_robotA.compose(T_robotA_activeRobot)
+            base_extr = {
+                cam_id: T_baseLink_activeRobot.compose(T)
+                for cam_id, T in base_extr.items()
+            }
+
         self._objects: list[CollisionObject] = []
         stamp = self.get_clock().now().to_msg()
         for cam_id, T_base_camera in base_extr.items():
@@ -167,12 +197,24 @@ def main() -> None:
     parser.add_argument("--mesh-scale", type=float, default=DEFAULT_MESH_SCALE_MM_TO_M)
     parser.add_argument(
         "--frame-id",
-        default="world",
+        default=None,
         help="Fixed frame_id for the CollisionObjects, matching "
-        "run_pipeline_track_multicam.py's --planning-scene-frame-id default.",
+        "run_pipeline_track_multicam.py's --planning-scene-frame-id default. "
+        "Defaults to 'world', or 'base_link' with --dual-arm (see module "
+        "docstring) -- pass this explicitly to override either.",
     )
     parser.add_argument("--republish-period-s", type=float, default=2.0)
+    parser.add_argument(
+        "--dual-arm",
+        action="store_true",
+        help="Re-express camera poses into the dual-arm bringup's base_link "
+        "frame instead of publishing them as-is in the active robot's own "
+        "frame, and default --frame-id to that same base_link frame -- see "
+        "module docstring.",
+    )
     args = parser.parse_args()
+    if args.frame_id is None:
+        args.frame_id = "base_link" if args.dual_arm else "world"
 
     rclpy.init()
     node = CameraScenePublisher(args)

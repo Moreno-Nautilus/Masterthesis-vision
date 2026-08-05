@@ -51,8 +51,10 @@ publishing correctly. There's no need for the real robot hardware for any of
 this — a mock robot is enough.
 
 [../scripts/launch_moveit_scene_viewer.launch.py](../scripts/launch_moveit_scene_viewer.launch.py)
-bundles a mock `iiwa7`, `move_group`, RViz, **and** a static-TF broadcast of
-the calibrated camera extrinsics (§3 below) together for exactly this:
+bundles the mock **dual-arm** robot (via `lbr_dual_arm_bringup`'s own
+`mock.launch.py`, Y-gripper attached to each flange by default), `move_group`,
+RViz, **and** a static-TF broadcast of the calibrated camera extrinsics (§3
+below) together for exactly this:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -71,21 +73,36 @@ scripts/view_scene.sh
 
 Then in RViz: **Add → By display type → moveit_ros_visualization →
 PlanningScene**, and set its **Planning Scene Topic** to `/planning_scene`.
-Fixed Frame is already `world` in the bundled RViz config, matching
-`--planning-scene-frame-id`'s default.
+Fixed Frame is already `base_link` in the bundled RViz config -- note this
+is *not* `world` (there is no `world` link in the dual-arm URDF at all), so
+`--dual-arm` is required on `publish_camera_scene_objects`/the tracking
+pipeline's `--planning-scene-frame-id` here to match; otherwise `move_group`
+logs `Unknown frame: world` for every CollisionObject and the scene never
+populates.
 
 Notes/quirks (already hit and fixed once, so no need to rediscover them):
-- `lbr_bringup`'s own `move_group.launch.py`/`rviz.launch.py` don't expose a
-  namespace argument, but the mock robot (`lbr_bringup mock.launch.py`) runs
-  everything under `/lbr` — the bundled launch file builds `move_group`/RViz
-  as raw `Node` actions with `namespace="lbr"` instead of including those
-  launch files directly.
-- Namespacing `move_group` under `/lbr` also remaps its `/planning_scene`
-  subscription to `/lbr/planning_scene` by default, disconnecting it from the
-  bare `/planning_scene` topic the pipeline publishes on — the bundled launch
-  file remaps it back explicitly (`("/lbr/planning_scene", "/planning_scene")`,
-  same for `monitored_planning_scene`/`planning_scene_world`/
-  `collision_object`/`attached_collision_object`).
+- `lbr_dual_arm_bringup`'s own `move_group.launch.py` doesn't expose a way to
+  inject remappings into its internal `move_group` node, and the mock robot
+  (`lbr_dual_arm_bringup mock.launch.py`) runs everything under
+  `/lbr_dual_arm` — the bundled launch file builds `move_group`/RViz as raw
+  `Node` actions with `namespace="lbr_dual_arm"` instead of including that
+  launch file directly.
+- Namespacing `move_group` under `/lbr_dual_arm` also remaps its
+  `/planning_scene` subscription to `/lbr_dual_arm/planning_scene` by
+  default, disconnecting it from the bare `/planning_scene` topic the
+  pipeline publishes on — the bundled launch file remaps it back explicitly
+  (`("/lbr_dual_arm/planning_scene", "/planning_scene")`, same for
+  `monitored_planning_scene`/`planning_scene_world`/`collision_object`/
+  `attached_collision_object`).
+- **Don't "simplify" this by swapping the manual `move_group`/RViz `Node`s
+  for an `IncludeLaunchDescription` of `lbr_dual_arm_bringup`'s own
+  `move_group.launch.py`.** That's not leftover duplication from folding in
+  the dual-arm setup — it's the one piece that has to stay custom, precisely
+  because that upstream launch file gives no way to inject the remap above.
+  Swap it in and `move_group`/RViz go back to listening on
+  `/lbr_dual_arm/planning_scene`; the pipeline's (and
+  `publish_camera_scene_objects`') `CollisionObject`s would just silently
+  stop showing up in RViz, with nothing erroring to point at why.
 - Collision meshes render with flat per-triangle shading that shifts as you
   orbit the camera (`shape_msgs/Mesh` carries no vertex normals) — this is a
   cosmetic limitation of RViz's collision-object rendering, not a sign of bad
@@ -102,37 +119,45 @@ can sanity-check calibration results visually instead of reading raw `R`/`t`
 numbers:
 
 - `zed2i_1` / `zed2i_2` / `zed2i_3` are published as children of
-  `lbr_link_0` (the active robot's base frame — see
-  `config/robot_bases.yaml`), matching their camera-to-base meaning.
-- `realsense_1` / `realsense_2` are published as children of `lbr_link_ee`
-  (the flange), matching their camera-to-flange mount-offset meaning — see
-  the header comment in `camera_extrinsics_realsense.yaml` and
+  `--base-frame` (the active robot's base frame — defaults to `lbr_link_0`,
+  the single-arm mock's frame name), matching their camera-to-base meaning.
+- `realsense_1` / `realsense_2` are published as children of `--ee-frame`
+  (the flange, defaults to `lbr_link_ee`), matching their camera-to-flange
+  mount-offset meaning — see the header comment in
+  `camera_extrinsics_realsense.yaml` and
   [../src/calibration/io_extrinsics.py](../src/calibration/io_extrinsics.py)
   for the full frame-semantics explanation.
 
 It's already wired into
 [../scripts/launch_moveit_scene_viewer.launch.py](../scripts/launch_moveit_scene_viewer.launch.py)
-(runs automatically alongside the mock robot/`move_group`/RViz), so nothing
-extra is needed beyond the launch command above (§2). To run it standalone
-against a different tf tree instead:
+(runs automatically alongside the mock dual-arm robot/`move_group`/RViz), so
+nothing extra is needed beyond the launch command above (§2) — the bundled
+launch file resolves `config/robot_bases.yaml`'s `active_robot` to that arm's
+own link names in the dual-arm URDF (`robot_a` → `lbr_one_link_0`/
+`lbr_one_link_ee`, `robot_b` → `lbr_two_link_0`/`lbr_two_link_ee`) and passes
+those as `--base-frame`/`--ee-frame`, since the dual-arm mock has no bare
+`lbr_link_0`/`lbr_link_ee` frames of its own. To run it standalone against a
+different tf tree instead:
 
 ```bash
 python3 -m src.calibration.publish_extrinsics_tf
-# or override the parent frame names / input YAMLs:
-python3 -m src.calibration.publish_extrinsics_tf --base-frame lbr_link_0 --ee-frame lbr_link_ee
+# or override the parent frame names / input YAMLs, e.g. for the dual-arm mock:
+python3 -m src.calibration.publish_extrinsics_tf --base-frame lbr_two_link_0 --ee-frame lbr_two_link_ee
 ```
 
-In RViz: **Add → TF**. You should see `zed2i_1/2/3` hanging off `lbr_link_0`
-and `realsense_1/2` hanging off `lbr_link_ee`, alongside the robot's own tf
-tree. To check a specific transform numerically:
+In RViz: **Add → TF**. You should see `zed2i_1/2/3` hanging off the
+`--base-frame` and `realsense_1/2` hanging off the `--ee-frame`, alongside
+the robot's own tf tree. To check a specific transform numerically:
 
 ```bash
-ros2 run tf2_ros tf2_echo lbr_link_0 zed2i_1
+ros2 run tf2_ros tf2_echo lbr_two_link_0 zed2i_1
 ```
 
 Note: this always publishes from `camera_extrinsics_base.yaml`, i.e. the
 frame of whichever robot is currently `active_robot` in
-`config/robot_bases.yaml` (not `camera_extrinsics_base_robot_a_frame.yaml`).
+`config/robot_bases.yaml`. The robot_a-frame re-expression of these same
+poses is not kept as its own config file -- it's logged per-run in
+`outputs/calibration_logs/camera_transforms.json` (`T_robotA_cam`) instead.
 
 ## 4. Viewing the camera rig itself (ZED2 + holder meshes)
 
@@ -152,10 +177,22 @@ display, at the calibrated `zed2i_1/2/3` poses from
   exists.
 - **realsense_1/realsense_2 are not published here**: they're wrist-mounted
   and move with the arm, so they have no fixed scene pose (see §3).
-- Already wired into
+- Already wired into `lbr_dual_arm_bringup/launch/mock.launch.py` (which
   [../scripts/launch_moveit_scene_viewer.launch.py](../scripts/launch_moveit_scene_viewer.launch.py)
-  alongside `publish_extrinsics_tf`; to run it standalone:
+  includes for its mock robot, alongside `publish_extrinsics_tf`); to run it
+  standalone:
 
 ```bash
 python3 -m src.calibration.publish_camera_scene_objects
 ```
+
+- **Dual-arm bringup**: `hardware.launch.py`, `mock.launch.py`,
+  `cartesian_impedance.launch.py`, and `admittance.launch.py` in
+  `lbr_dual_arm_bringup/launch/` all auto-start this publisher with
+  `--dual-arm` (re-expresses every camera pose into the dual-arm's own
+  `base_link` frame instead of the active robot's `lbr_link_0` -- see the
+  script's module docstring), so move_group's collision checking always
+  knows where the camera rig is once any of those bring-ups (or the scene
+  viewer above, via `mock.launch.py`) is running. `calibration.launch.py`
+  deliberately does **not** start it, since that's the procedure that
+  produces `camera_extrinsics_base.yaml` in the first place.
