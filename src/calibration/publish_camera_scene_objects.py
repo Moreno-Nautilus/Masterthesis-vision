@@ -6,13 +6,12 @@ _publish_planning_scene_object / docs/visualization.md), just for the fixed
 camera rig instead of a moving tracked object.
 
 Assets/ZED2.stl and Assets/zed_camer_holder.stl are the camera and holder
-meshes. There is no measured camera-to-holder mount offset yet, so
-CAMERA_TO_HOLDER below is a mock identity transform (holder frame == camera
-optical frame) -- same "identity placeholder" idea already used for
-realsense_1 in config/camera_extrinsics_realsense.yaml. Replace it with the
-real offset once the holder's mechanical drawing / a measurement is
-available; everything downstream (which cam_ids get published, at what pose)
-keeps working unchanged.
+meshes. CAMERA_TO_HOLDER below is the measured camera-to-holder mount offset
+(x=0.183081, y=0.046914, z=0.197348 m; roll=-2.617994, pitch=0.0,
+yaw=3.141593 rad, i.e. R = Rz(yaw) @ Ry(pitch) @ Rx(roll), the same
+fixed-axis roll/pitch/yaw convention as base_to_cams_calib_3.py's
+_rpy_deg_to_R) -- the holder base frame's pose expressed in the camera
+frame.
 
 Only the zed2i_* entries of camera_extrinsics_base.yaml are used: those are
 static camera-to-base transforms (dst = active robot's lbr_link_0, see
@@ -56,6 +55,8 @@ from rclpy.node import Node
 from shape_msgs.msg import Mesh, MeshTriangle
 from std_msgs.msg import Header
 
+import numpy as np
+
 from src.calibration.io_extrinsics import load_extrinsics_yaml
 from src.calibration.publish_extrinsics_tf import _rotation_matrix_to_quaternion_xyzw
 from src.utils.robot_bases import get_active_robot_base, get_dual_arm_base_link
@@ -63,10 +64,35 @@ from src.utils.se3 import SE3
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Mock placeholder: no real camera-to-holder mount offset has been measured
-# yet, so the holder is published at the same pose as the camera. See module
-# docstring.
-CAMERA_TO_HOLDER = SE3.identity()
+
+def _rpy_rad_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    # Fixed-axis roll/pitch/yaw, R = Rz(yaw) @ Ry(pitch) @ Rx(roll) -- same
+    # convention as base_to_cams_calib_3.py's _rpy_deg_to_R (there in
+    # degrees; here in radians, matching the measured holder offset below).
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(roll), -np.sin(roll)],
+        [0, np.sin(roll), np.cos(roll)],
+    ])
+    Ry = np.array([
+        [np.cos(pitch), 0, np.sin(pitch)],
+        [0, 1, 0],
+        [-np.sin(pitch), 0, np.cos(pitch)],
+    ])
+    Rz = np.array([
+        [np.cos(yaw), -np.sin(yaw), 0],
+        [np.sin(yaw), np.cos(yaw), 0],
+        [0, 0, 1],
+    ])
+    return Rz @ Ry @ Rx
+
+
+# Measured camera-to-holder mount offset -- see module docstring for the
+# source x/y/z + roll/pitch/yaw values.
+CAMERA_TO_HOLDER = SE3(
+    R=_rpy_rad_to_R(roll=-2.617994, pitch=0.0, yaw=3.141593),
+    t=np.array([0.183081, 0.046914, 0.197348]),
+)
 
 # Meshes are authored in millimeters (checked via each STL's bounding box,
 # e.g. ZED2.stl is ~175mm long, matching the real ZED2's length) --
