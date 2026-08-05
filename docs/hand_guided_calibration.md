@@ -94,11 +94,32 @@ routine anywhere in this codebase. Concretely:
   configured on the cabinet) before FRI torque commands are added on top.
   That's why every controller's `compensate_gravity` in
   `kuka_control/config/controllers.yaml` (the single-arm reference config)
-  defaults to `false` — it avoids double-compensating. The dual-arm
-  controller config below explicitly sets `compensate_gravity: true` since
-  it's the only thing computing a gravity term for this rig at all; if the
-  cabinets here already have accurate Tool Data configured, that's worth
-  revisiting.
+  defaults to `false` — it avoids double-compensating.
+
+  **Tested on real hardware (2026-08-03) — the theory above does NOT hold
+  for this rig/app combination.** First hardware run with
+  `compensate_gravity: true` produced a hard jerk on activation, which read
+  like double-compensation (cabinet's own Tool-Data term + our URDF-model
+  term stacking) — so `compensate_gravity` was flipped to `false` on the
+  theory the cabinet's own compensation would be enough on its own. It
+  wasn't: with `compensate_gravity: false` the arms **fell straight down**
+  under their own weight, proving this FRI app configuration does **not**
+  apply automatic gravity compensation the way the single-arm reference
+  config's `compensate_gravity: false` default assumes. `compensate_gravity`
+  is back to `true` on both arms — our URDF-model gravity term (`gravity_compensation.cpp`'s
+  `computeTorque()`, gated by `if (m_compensate_gravity)`) is the *only*
+  thing holding the arms up in this setup.
+
+  The actual cause of the jerk was unrelated: `effort_controller_base.cpp`'s
+  `computeJointEffortCmds()` already rate-limits how much the commanded
+  torque can change per cycle (`delta_tau_max`, default 1.0 Nm — a smooth
+  ramp to a ~50 Nm gravity torque takes ~50 ms at the 1000 Hz update rate).
+  The startup-crash fix below (`m_first_update`) originally *bypassed* that
+  ramp on the very first cycle by setting `m_efforts[i] = tau[i]` directly —
+  jumping straight to the full torque in a single 1 ms step, which is what
+  actually jerked the arm. Fixed by keeping the normal rate-limited step on
+  the first cycle too, and only skipping the crash-inducing large-jump guard
+  (see below) rather than skipping the ramp itself.
 
 ## 3. Hardware bring-up: `calibration.launch.py`
 
