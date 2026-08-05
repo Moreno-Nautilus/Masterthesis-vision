@@ -20,11 +20,19 @@
 # sensitive (lower deadband) and faster to yield, for contact-seeking /
 # alignment tasks. Illustrative starting points, not validated for a
 # specific task -- tune per-axis for real use.
+#
+# "holding"'s rotational axes (f_ext_th[3:6], dx_gains[3:6]) were retuned
+# 2026-08-03 -- hand-guiding felt too stiff rotationally on real hardware.
+# f_ext_th rotational deadband lowered 30% (0.5 -> 0.35 Nm, matches
+# translational axes' own 2026-08-03-unchanged 2.0 N) and dx_gains
+# rotational gain raised 4x (0.1 -> 0.4) so a given external torque yields
+# noticeably more task-space rotation than before. Translational axes
+# unchanged -- only rotation felt stiff.
 
 holding:
-  f_ext_th: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
+  f_ext_th: [2.0, 2.0, 2.0, 0.35, 0.35, 0.35]
   dq_gains: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-  dx_gains: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+  dx_gains: [0.1, 0.1, 0.1, 0.4, 0.4, 0.4]
 
 insertion:
   f_ext_th: [0.5, 0.5, 0.5, 0.2, 0.2, 0.2]
