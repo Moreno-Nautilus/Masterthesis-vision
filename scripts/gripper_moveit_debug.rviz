@@ -24,8 +24,9 @@ Visualization Manager:
         Trajectory Topic: display_planned_path
       Planning Request:
         Planning Group: lbr_one_gripper
-        Query Goal State: true
+        Query Goal State: false
         Query Start State: false
+        Interactive Marker Size: 0.15
       Scene Robot:
         Show Robot Visual: true
       Value: true
@@ -40,6 +41,11 @@ Visualization Manager:
     Fixed Frame: lbr_one_link_7
     Frame Rate: 30
   Value: true
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+  Current Tool: rviz_default_plugins/MoveCamera
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
