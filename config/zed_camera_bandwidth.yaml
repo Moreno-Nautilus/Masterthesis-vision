@@ -1,0 +1,20 @@
+# ZED 2i camera parameters for bandwidth optimization.
+# Resolution set to 720p for a good balance between FOV and bandwidth.
+# Use with: ros2 launch ros2_zed zed_camera.launch.py params_file:=$(pwd)/config/zed_camera_bandwidth.yaml
+
+zed2i_camera:
+  zed_node:
+    general:
+      # 720p resolution: 1280x720 (VGA is 640x480, HD is 1280x720, FHD is 1920x1080)
+      resolution: 1
+    video:
+      # Frame rate: lower values reduce bandwidth
+      # Supported: 15, 30 (default is 30)
+      fps: 15
+    depth:
+      # Depth quality: default=1 (PERFORMANCE), max=4 (ULTRA)
+      # Lower quality = faster processing and lower bandwidth
+      quality: 1
+      # Depth sensing mode: 0=STANDARD, 1=FILL (default), 2=ULTRA
+      # STANDARD uses less bandwidth than FILL/ULTRA
+      sensing_mode: 0

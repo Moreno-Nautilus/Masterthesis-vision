@@ -15,12 +15,12 @@ from typing import Optional
 
 import numpy as np
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 
 from src.utils.se3 import SE3
 from src.perception.view import View
+from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 
 import time
 
@@ -204,7 +204,7 @@ class MultiCamGrabberRealsense(Node):
                     PoseStamped,
                     c.flange_pose_topic,
                     lambda msg, cam_id=c.cam_id, key=c.robot_base_key: self._on_flange_pose(cam_id, key, msg),
-                    qos_profile_sensor_data,
+                    qos_profile_sensor_data_low_latency,
                 )
             )
 
@@ -230,7 +230,7 @@ class MultiCamGrabberRealsense(Node):
                     Image,
                     c.depth_topic,
                     lambda msg, cam_id=c.cam_id: self._on_depth(cam_id, msg),
-                    qos_profile_sensor_data,
+                    qos_profile_sensor_data_low_latency,
                 )
             )
             self._subs.append(
@@ -238,7 +238,7 @@ class MultiCamGrabberRealsense(Node):
                     CameraInfo,
                     c.info_topic,
                     lambda msg, cam_id=c.cam_id: self._on_depth_info(cam_id, msg),
-                    qos_profile_sensor_data,
+                    qos_profile_sensor_data_low_latency,
                 )
             )
 
@@ -247,7 +247,7 @@ class MultiCamGrabberRealsense(Node):
                     Image,
                     c.rgb_topic,
                     lambda msg, cam_id=c.cam_id: self._on_rgb(cam_id, msg),
-                    qos_profile_sensor_data,
+                    qos_profile_sensor_data_low_latency,
                 )
             )
             self._subs.append(
@@ -255,7 +255,7 @@ class MultiCamGrabberRealsense(Node):
                     CameraInfo,
                     c.rgb_info_topic,
                     lambda msg, cam_id=c.cam_id: self._on_rgb_info(cam_id, msg),
-                    qos_profile_sensor_data,
+                    qos_profile_sensor_data_low_latency,
                 )
             )
 

@@ -48,7 +48,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
 
@@ -271,9 +271,9 @@ class HandEyeCalibNode(Node):
         self.flange_pose: Optional[SE3] = None
         self.flange_pose_wall_t: float = 0.0
 
-        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data)
-        self.create_subscription(PoseStamped, flange_pose_topic, self._on_flange, qos_profile_sensor_data)
+        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data_low_latency)
+        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data_low_latency)
+        self.create_subscription(PoseStamped, flange_pose_topic, self._on_flange, qos_profile_sensor_data_low_latency)
 
         self._debug_pub = None
         if publish_debug:

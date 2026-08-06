@@ -79,7 +79,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 from sensor_msgs.msg import CameraInfo, Image, JointState
 
 from src.calibration.admittance_dual_arm import (
@@ -153,10 +153,10 @@ class _CaptureNode(Node):
         self.joint_positions: dict[str, float] = {}
         self.joint_state_wall_t: float = 0.0
 
-        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data)
+        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data_low_latency)
+        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data_low_latency)
         self.create_subscription(
-            PoseStamped, arm["flange_pose_topic"], self._on_flange, qos_profile_sensor_data
+            PoseStamped, arm["flange_pose_topic"], self._on_flange, qos_profile_sensor_data_low_latency
         )
         self.create_subscription(JointState, JOINT_STATES_TOPIC, self._on_joint_state, 10)
 

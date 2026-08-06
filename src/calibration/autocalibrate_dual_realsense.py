@@ -91,7 +91,7 @@ import rclpy
 import yaml
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 from sensor_msgs.msg import CameraInfo, Image
 
 from src.calibration.calibration_log import (
@@ -190,15 +190,15 @@ class _DualArmCalibNode(Node):
             rgb_topic, info_topic = _camera_topics(arm["cam_id"])
             self.create_subscription(
                 Image, rgb_topic,
-                lambda msg, k=arm_key: self._on_img(k, msg), qos_profile_sensor_data,
+                lambda msg, k=arm_key: self._on_img(k, msg), qos_profile_sensor_data_low_latency,
             )
             self.create_subscription(
                 CameraInfo, info_topic,
-                lambda msg, k=arm_key: self._on_info(k, msg), qos_profile_sensor_data,
+                lambda msg, k=arm_key: self._on_info(k, msg), qos_profile_sensor_data_low_latency,
             )
             self.create_subscription(
                 PoseStamped, arm["flange_pose_topic"],
-                lambda msg, k=arm_key: self._on_flange(k, msg), qos_profile_sensor_data,
+                lambda msg, k=arm_key: self._on_flange(k, msg), qos_profile_sensor_data_low_latency,
             )
             self.get_logger().info(
                 f"[{arm_key}] cam={arm['cam_id']} rgb={rgb_topic} info={info_topic} "
