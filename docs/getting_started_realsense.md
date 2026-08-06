@@ -515,6 +515,21 @@ script's own docstring for the full per-sample walkthrough (jog with
 MoveIt → press Enter → repeat >= 10-15 times for hand-eye, >= 5 for
 board-pose).
 
+### 4.8 Joint bundle-adjustment refinement (upgrade over Stage A's closed-form solve)
+
+Reuses samples already captured by `handeye_flange_cam_realsense.py` or Stage A
+above (no new captures needed) to jointly refine both arms' `T_flange_cam` against
+per-corner reprojection error, with soft priors tying the two arms together (same
+physical mount) and toward the CAD-derived `realsense_nominal` offset:
+
+```bash
+python3 -m src.calibration.joint_calibrate_dual_realsense -v      # dry run
+python3 -m src.calibration.joint_calibrate_dual_realsense --write
+```
+
+See [joint_handeye_calibration.md](joint_handeye_calibration.md) for the full
+explanation, quick start, and troubleshooting.
+
 ---
 
 ## 5. The live flange-pose topic — how it works

@@ -181,6 +181,27 @@ scripts/launch_pipeline_realsense.sh init-only
 
 ---
 
+## 4. Optional: joint bundle-adjustment refinement (better than Stage A alone)
+
+Reuses whatever samples Step 2 above already captured — no new captures needed.
+Jointly refines both arms' `T_flange_cam` against per-corner reprojection error
+instead of Stage A's closed-form per-arm solve, with two extra priors: the two
+arms' offsets are pulled toward each other (same physical mount) and toward the
+CAD-derived `realsense_nominal` value. Full explanation:
+[joint_handeye_calibration.md](joint_handeye_calibration.md).
+
+```bash
+python3 -m src.calibration.joint_calibrate_dual_realsense -v      # dry run, prints diagnostics
+python3 -m src.calibration.joint_calibrate_dual_realsense --write # looks sane? write it
+```
+
+✅ Checkpoint: printed `pose residual` / `reprojection error (px)` lines are small
+(sub-degree / a few mm, or well under 1px) for every arm — if not, don't `--write`;
+see the linked doc's Troubleshooting section (usually a `--loss` choice issue, not
+bad data).
+
+---
+
 ## Recalibrating later (one camera only)
 
 If just one wrist camera physically moved and you don't want to redo the
