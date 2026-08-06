@@ -203,15 +203,28 @@ class HandEyeSample:
     T_base_flange: SE3
     T_cam_board: SE3
     reproj_px: float
+    # Raw detected corner pixels + intrinsics at capture time. Optional so existing
+    # legacy sample_*.json files (e.g. realsense_2's already-captured run) still load
+    # fine -- cv2.calibrateHandEye never needed these, only T_base_flange/T_cam_board,
+    # but a reprojection-error bundle adjustment (see joint_handeye_calib) does. New
+    # captures always fill these in; a sample missing them falls back to a pose-level
+    # residual there instead of a pixel one.
+    corners_px: Optional[np.ndarray] = None
+    K: Optional[np.ndarray] = None
 
 
 def _sample_to_json_dict(s: HandEyeSample) -> dict:
-    return {
+    d = {
         "idx": s.idx,
         "reproj_px": s.reproj_px,
         "T_base_flange": {"R": s.T_base_flange.R.tolist(), "t": s.T_base_flange.t.tolist()},
         "T_cam_board": {"R": s.T_cam_board.R.tolist(), "t": s.T_cam_board.t.tolist()},
     }
+    if s.corners_px is not None:
+        d["corners_px"] = np.asarray(s.corners_px, dtype=float).tolist()
+    if s.K is not None:
+        d["K"] = np.asarray(s.K, dtype=float).reshape(3, 3).tolist()
+    return d
 
 
 def _sample_from_json_dict(d: dict) -> HandEyeSample:
@@ -220,6 +233,8 @@ def _sample_from_json_dict(d: dict) -> HandEyeSample:
         T_base_flange=SE3(np.array(d["T_base_flange"]["R"]), np.array(d["T_base_flange"]["t"])),
         T_cam_board=SE3(np.array(d["T_cam_board"]["R"]), np.array(d["T_cam_board"]["t"])),
         reproj_px=d["reproj_px"],
+        corners_px=np.array(d["corners_px"], dtype=float) if "corners_px" in d else None,
+        K=np.array(d["K"], dtype=float).reshape(3, 3) if "K" in d else None,
     )
 
 
@@ -329,7 +344,10 @@ def _try_capture_sample(node: HandEyeCalibNode, debug_dir: Path, sample_idx: int
     node.publish_debug(vis)
     cv2.imwrite(str(debug_dir / f"sample_{sample_idx:02d}.png"), vis)
 
-    sample = HandEyeSample(idx=sample_idx, T_base_flange=T_base_flange, T_cam_board=T_cam_board, reproj_px=reproj_err)
+    sample = HandEyeSample(
+        idx=sample_idx, T_base_flange=T_base_flange, T_cam_board=T_cam_board, reproj_px=reproj_err,
+        corners_px=corners, K=K,
+    )
     _save_sample_json(debug_dir, sample)
 
     print(f"  [ok] reproj={reproj_err:.3f}px  T_base_flange.t={T_base_flange.t}")

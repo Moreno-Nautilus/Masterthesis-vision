@@ -11,3 +11,9 @@
 	path = src/fp_debug_msgs
 	url = git@github.com:Moreno-Nautilus/fp_debug_msgs.git
 	branch = assembly-cell-interfaces
+[submodule "src/calibration/joint_handeye_calib"]
+	# TODO: local-only path for now (no GitHub remote created yet). Once pushed to a
+	# real remote (e.g. github.com/Moreno-Nautilus/joint_handeye_calib), update this
+	# url and run `git submodule sync` so other clones/machines can fetch it.
+	path = src/calibration/joint_handeye_calib
+	url = /home/pdzuser/repos/joint_handeye_calib
