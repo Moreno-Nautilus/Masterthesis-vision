@@ -4,7 +4,7 @@ This document explains the bandwidth-saving optimizations implemented in the cod
 
 ## Camera Configuration Summary
 
-### ZED 2i (Model: zed2i, Serial: 38580376)
+### ZED 2i (Model: zed2i, Serial: 33137761)
 - **Depth Mode:** NEURAL (AI-based, not stereo)
 - **Frame Rate:** 30 FPS
 - **Resolution:** 1080p (HD1080)
