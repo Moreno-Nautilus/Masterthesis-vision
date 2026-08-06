@@ -183,7 +183,9 @@ scripts/launch_pipeline_realsense.sh init-only
 
 ## 4. Optional: joint bundle-adjustment refinement (better than Stage A alone)
 
-Reuses whatever samples Step 2 above already captured — no new captures needed.
+**Not a capture step — offline only.** Reuses whatever samples Step 2 above
+already captured; this command never moves the robot or grabs an image, it just
+re-optimizes existing `sample_*.json` files. No new captures needed.
 Jointly refines both arms' `T_flange_cam` against per-corner reprojection error
 instead of Stage A's closed-form per-arm solve, with two extra priors: the two
 arms' offsets are pulled toward each other (same physical mount) and toward the

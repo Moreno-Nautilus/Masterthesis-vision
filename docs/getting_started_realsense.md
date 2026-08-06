@@ -517,8 +517,10 @@ board-pose).
 
 ### 4.8 Joint bundle-adjustment refinement (upgrade over Stage A's closed-form solve)
 
-Reuses samples already captured by `handeye_flange_cam_realsense.py` or Stage A
-above (no new captures needed) to jointly refine both arms' `T_flange_cam` against
+**Offline only — not a capture step.** Reuses samples already captured by
+`handeye_flange_cam_realsense.py` or Stage A above (no new captures needed); it
+never drives the robot or grabs images itself, it only re-optimizes existing
+`sample_*.json` files. It jointly refines both arms' `T_flange_cam` against
 per-corner reprojection error, with soft priors tying the two arms together (same
 physical mount) and toward the CAD-derived `realsense_nominal` offset:
 

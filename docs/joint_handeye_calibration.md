@@ -16,6 +16,15 @@ closed-form solve has no way to use:
 It reuses whatever samples `handeye_flange_cam_realsense.py` (or the dual-arm
 routine's Stage A) already captured — **no new captures needed** to try it.
 
+> **This is not a capture step.** `joint_calibrate_dual_realsense.py` never moves
+> the robot and never grabs an image — it's pure offline re-optimization over
+> `sample_*.json` files that some earlier script already wrote to
+> `outputs/calibration_debug/handeye/<cam_id>/`. If that directory is empty for the
+> arm(s) you care about, run [Step 1 + Step 2 of the dual-arm
+> routine](calibration_cheatsheet.md) (or the single-camera fallback,
+> [getting_started_realsense.md §4.7](getting_started_realsense.md#47-manual-single-camera-fallback-original-scripts-still-available))
+> first — this script has nothing to do until then.
+
 ---
 
 ## Quick start
