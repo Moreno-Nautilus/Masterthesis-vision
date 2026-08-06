@@ -1,5 +1,6 @@
-# ZED 2i camera parameters for bandwidth optimization.
+# ZED 2i camera parameters for bandwidth optimization + neural depth.
 # Resolution set to 720p for a good balance between FOV and bandwidth.
+# Frame rate: 30 FPS with neural depth estimation (AI-based, lower latency than stereo)
 # Use with: ros2 launch ros2_zed zed_camera.launch.py params_file:=$(pwd)/config/zed_camera_bandwidth.yaml
 
 zed2i_camera:
@@ -8,13 +9,12 @@ zed2i_camera:
       # 720p resolution: 1280x720 (VGA is 640x480, HD is 1280x720, FHD is 1920x1080)
       resolution: 1
     video:
-      # Frame rate: lower values reduce bandwidth
+      # Frame rate: 30 FPS for real-time performance with neural depth
       # Supported: 15, 30 (default is 30)
-      fps: 15
+      fps: 30
     depth:
-      # Depth quality: default=1 (PERFORMANCE), max=4 (ULTRA)
-      # Lower quality = faster processing and lower bandwidth
-      quality: 1
-      # Depth sensing mode: 0=STANDARD, 1=FILL (default), 2=ULTRA
-      # STANDARD uses less bandwidth than FILL/ULTRA
-      sensing_mode: 0
+      # Depth mode: 0=STANDARD, 1=FILL, 2=ULTRA, 3=NEURAL (AI-based, ZED 2/2.5/+ only)
+      # NEURAL is faster and handles occlusions better than stereo, less affected by lighting
+      mode: 3
+      # Confidence threshold for valid depth (0-100, higher=stricter)
+      confidence_threshold: 50

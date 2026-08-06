@@ -2,6 +2,21 @@
 
 This document explains the bandwidth-saving optimizations implemented in the codebase.
 
+## Camera Configuration Summary
+
+### ZED 2i (Model: zed2i, Serial: 38580376)
+- **Depth Mode:** NEURAL (AI-based, not stereo)
+- **Frame Rate:** 30 FPS
+- **Resolution:** 1080p (HD1080)
+- **Status:** Automatically launched with RealSense cameras via `zed_realsense_trio.launch.py`
+
+### RealSense Cameras
+- **Models:** D405 (wrist-mounted on both arms)
+- **Serials:** realsense_1=260322275185, realsense_2=260522275434
+- **Frame Rate:** 30 FPS (matched to ZED)
+- **Resolution:** 640×480 (QVGA)
+- **Status:** Automatically launched with ZED via `zed_realsense_trio.launch.py`
+
 ## Changes Made
 
 ### 1. QoS Profile Depth Reduction (Implemented)
@@ -30,13 +45,16 @@ All ROS image/camera subscriptions now use `qos_profile_sensor_data_low_latency`
 Two configuration files have been created to override camera defaults:
 
 #### ZED 2i Configuration
-**File:** `config/zed_camera_bandwidth.yaml`
+**File:** `config/zed_camera_bandwidth.yaml` (or directly in `/home/pdzuser/zed_ros2_ws/src/mv_launch/config/zed_override_native.yaml`)
 
 Default settings:
-- **Resolution:** 720p (1280×720) — good balance between FOV and bandwidth
-- **Frame rate:** 15 FPS (vs. 30 default)
-- **Depth quality:** PERFORMANCE (lower quality = faster + lower bandwidth)
-- **Depth sensing mode:** STANDARD (uses less bandwidth than FILL/ULTRA)
+- **Resolution:** 1080p (HD1080) for maximum detail
+- **Frame rate:** 30 FPS (real-time with neural depth)
+- **Depth mode:** NEURAL (AI-based depth estimation, not stereo)
+  - Lower latency than stereo depth
+  - Better handling of occlusions and textureless areas
+  - More robust to lighting variations
+- **Confidence threshold:** 50 (valid depth only above this score)
 
 **Usage:**
 ```bash
@@ -48,10 +66,11 @@ ros2 launch ros2_zed zed_camera.launch.py params_file:=$(pwd)/config/zed_camera_
 **File:** `config/realsense_camera_bandwidth.yaml`
 
 Default settings:
-- **Resolution:** 640×480 (QVGA) — as requested
-- **Frame rate:** 15 FPS (vs. 30 default)
-- **Decimation filter:** Enabled (reduces depth map size 2×)
-- **IMU streams:** Disabled (if not needed)
+- **Resolution:** 640×480 (QVGA)
+- **Frame rate:** 30 FPS (synchronized with ZED neural depth)
+- **Depth filtering:** Disabled (preserves quality at 640×480 resolution)
+- **IMU streams:** Disabled (accel/gyro not used in pipeline)
+- **Auto-exposure:** Enabled for stable image capture
 
 **Usage:**
 ```bash
@@ -59,19 +78,27 @@ Default settings:
 ros2 launch realsense2_camera rs_launch.py param_file:=$(pwd)/config/realsense_camera_bandwidth.yaml
 ```
 
-## Expected Bandwidth Reduction
+## Bandwidth Impact
 
+### RealSense Optimization
 | Factor | Reduction |
 |--------|-----------|
 | Resolution (640×480 vs 1280×720) | ~75% |
-| Frame rate (15 FPS vs 30 FPS) | 50% |
-| **Combined video bandwidth** | **~87%** |
+| Frame rate | No reduction (30 FPS for sync) |
+| **Combined RealSense video** | **~75%** |
 | QoS buffering overhead | ~80% |
 
-### Example Numbers
+### Example Numbers (per RealSense D405)
 - **Before:** 1280×720 RGB @ 30 FPS ≈ 27 Mbps + depth
-- **After:** 640×480 RGB @ 15 FPS ≈ 3.5 Mbps (uncompressed)
-- With JPEG compression: ~0.5-1 Mbps per camera
+- **After:** 640×480 RGB @ 30 FPS ≈ 6.8 Mbps (uncompressed)
+- With JPEG compression: ~1-2 Mbps per camera
+
+### ZED 2i (Neural vs Stereo)
+- **Neural depth mode:** Lower latency, better occlusion handling (no FPS penalty)
+- **1080p @ 30 FPS:** Full resolution maintained for detail
+- **Combined 3 cameras (1 ZED + 2 RealSense):**
+  - Uncompressed: ~41 Mbps (27 Mbps ZED + 6.8 Mbps × 2 RealSense)
+  - With JPEG: ~30-40 Mbps (depends on quality)
 
 ## Additional Bandwidth-Saving Options
 
@@ -152,9 +179,29 @@ docker stats <container>  # Monitor network I/O
 ros2 topic list -v
 ```
 
+## Launch Configuration
+
+### Default Setup (Recommended)
+The standard host launch script already includes all cameras:
+
+```bash
+scripts/launch_host_realsense.sh
+```
+
+This launches:
+- **1 × ZED 2i** (zed2i_1) — tripod-mounted, static extrinsics
+  - 1080p @ 30 FPS with neural depth
+  - Uses `/home/pdzuser/zed_ros2_ws/src/mv_launch/config/zed_override_native.yaml`
+  
+- **2 × RealSense D405** (realsense_1, realsense_2) — wrist-mounted, dynamic extrinsics
+  - 640×480 @ 30 FPS via default realsense2_camera params
+  - Automatically rectified for alignment
+
+All three cameras are synchronized at 30 FPS by the pipeline.
+
 ## Testing the Changes
 
-The QoS depth reduction is automatically active for all calibration and pipeline scripts. To test with one of the configuration files:
+The QoS depth reduction is automatically active for all calibration and pipeline scripts. To test with alternative configurations:
 
 ```bash
 # Terminal 1: Launch hardware (or mock)
