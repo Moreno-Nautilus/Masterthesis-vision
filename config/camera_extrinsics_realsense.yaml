@@ -37,15 +37,20 @@
 #   realsense_1: 260322275185
 #   realsense_2: 260522275434
 #
-# realsense_nominal is a THIRD, separate kind of entry: a CAD-derived (not
-# hand-eye calibrated) camera-to-flange offset for the RealSense mount,
-# provided for comparison/visualization while realsense_1 has no real
-# calibration yet. Not consumed by the tracking pipeline (run_pipeline_track_
-# multicam_realsense.py only looks up "realsense_1"/"realsense_2" by name),
-# only published as an extra TF frame by publish_extrinsics_tf.py. Derived by
-# composing T_cam_connector (Rx(-60 deg), t=(-9.00, 83.597, -33.4609) mm) with
-# T_connector_flange (Ry(90 deg) . Rx(90 deg), zero translation), then
-# inverting the result to get T_flange_cam.
+# realsense_nominal and realsense_2_initial_guess_cad both hold the SAME
+# CAD-derived (not hand-eye calibrated) camera-to-flange offset for the
+# RealSense mount, just consumed by different code under different names:
+#   - realsense_nominal: read by calibrate_handeye.py / the joint_handeye_calib
+#     bundle-adjustment package as the CAD prior for its solver.
+#   - realsense_2_initial_guess_cad: NOT a cam_id read by any loader -- it's
+#     swapped in for "realsense_2" by publish_extrinsics_tf.py's default
+#     --realsense2-source cad_initial_guess, so the CAD guess can be
+#     sanity-checked against the gripper/robot in RViz, or diffed by eye
+#     against the actual calibrated realsense_2 entry below (they currently
+#     differ by ~141 deg of rotation and ~39mm of translation -- see git
+#     history for the full derivation).
+# Neither is consumed by the tracking pipeline (run_pipeline_track_multicam_
+# realsense.py only looks up "realsense_1"/"realsense_2" by name).
 
 realsense_nominal:
   R:
@@ -92,6 +97,21 @@ realsense_2:
   - 0.04822088853440753
   - -0.029119031966159226
   - 0.07017758691589546
+realsense_2_initial_guess_cad:
+  R:
+  - 6.123233995736766e-17
+  - -0.8660254037844386
+  - -0.5000000000000001
+  - 1.0
+  - 8.364493191492918e-17
+  - -2.2412591957561503e-17
+  - 6.123233995736766e-17
+  - -0.5000000000000001
+  - 0.8660254037844386
+  t:
+  - 0.0556666756801677
+  - 0.008999999999999992
+  - 0.07077648943349073
 zed2i_1:
   R:
   - -0.98305904327408
