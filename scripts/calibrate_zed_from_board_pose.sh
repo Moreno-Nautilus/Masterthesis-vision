@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Stage C of src/calibration/autocalibrate_dual_realsense.py: calibrate the
-# single static ZED (zed2i_1) against the checkerboard pose Stage B just
-# computed (config/base_board_pose.yaml).
+# ZED calibration stage of src/calibration/autocalibrate_dual_realsense.py:
+# calibrate the single static ZED (zed2i_1) against the checkerboard pose
+# the board-pose stage just computed (config/base_board_pose.yaml).
 #
 # This is a thin wrapper, not a separate calibration implementation --
 # src/calibration/base_to_cams_calib_3.py was generalized to accept an

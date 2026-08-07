@@ -28,14 +28,13 @@ All ROS image/camera subscriptions now use `qos_profile_sensor_data_low_latency`
 - **Old depth:** 5 frames buffered (default `qos_profile_sensor_data`)
 - **New depth:** 1 frame buffered (`qos_profile_sensor_data_low_latency`)
 
-**Files updated:**
+**Files updated (originally; `capture_flange_poses_dual*.py` since merged into
+`capture_handeye_data.py`, `handeye_flange_cam_realsense.py` since trimmed to
+a helpers-only module with no subscriptions of its own):**
 - `src/perception/ros/multicam_grabber.py`
 - `src/perception/ros/multicam_grabber_realsense.py`
-- `src/calibration/capture_flange_poses_dual.py`
-- `src/calibration/capture_flange_poses_dual_handguided.py`
-- `src/calibration/capture_flange_poses_dual_admittance.py`
+- `src/calibration/capture_handeye_data.py`
 - `src/calibration/autocalibrate_dual_realsense.py`
-- `src/calibration/handeye_flange_cam_realsense.py`
 - `src/calibration/board_pose_from_flange_realsense.py`
 
 **Impact:** ~80% reduction in ROS middleware buffering overhead. Reduces memory usage and network stack load.

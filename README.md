@@ -50,9 +50,9 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/perception/tracking/icp_refiner.py](src/perception/tracking/icp_refiner.py) | Generic ICP refiner used by `RealtimeTracker`; the fused base-frame ICP and rotation grid live in the multicam runner/helpers. |
 | [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **N-camera extrinsic calibration** (checkerboard → base frame) — see §4. Defaults to the 3-ZED trio; accepts `--cam-ids` for any subset (e.g. the RealSense-trio rig's single `zed2i_1`). |
 | [src/calibration/io_extrinsics.py](src/calibration/io_extrinsics.py) | Load/save extrinsics YAML (`R` row-major + `t`) ↔ `SE3`. |
-| [src/calibration/capture_flange_poses_dual.py](src/calibration/capture_flange_poses_dual.py) | Dual-arm calibration, Step 1 (manual): jog + save each arm's flange poses permanently to `config/flange_poses/` — see §6. |
-| [src/calibration/capture_flange_poses_dual_handguided.py](src/calibration/capture_flange_poses_dual_handguided.py) | Step 1's hand-guided twin: gravity-compensation bring-up instead of RViz jogging, also saves the joint configuration — see [docs/hand_guided_calibration.md](docs/hand_guided_calibration.md). |
-| [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Step 2 (automatic): replays the saved poses to solve hand-eye + checkerboard pose + ZED extrinsic — see §6. |
+| [src/calibration/capture_handeye_data.py](src/calibration/capture_handeye_data.py) | Dual-arm calibration, Stage A (manual or replay): position each arm via `--controller {moveit,admittance,handguided}`, save its flange pose/joint config and checkerboard image/detection — see §6. |
+| [src/calibration/calibrate_handeye.py](src/calibration/calibrate_handeye.py) | Stage B (offline, no hardware): solves `T_flange_cam` from Stage A's saved data, `--method direct` or `--method joint` — see §6. |
+| [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Stage C (automatic replay): solves checkerboard pose + ZED extrinsic, run after Stage A/B — see §6. |
 | [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above); Cartesian (`ArmTarget`/`move_to()`) and joint-space (`JointTarget`/`move_to_joint()`) goal types. |
 | [src/calibration/flange_pose_store.py](src/calibration/flange_pose_store.py) | JSON schema + save/load for the permanently-stored flange pose captures. |
 | [src/calibration/calibration_log.py](src/calibration/calibration_log.py) | Append-only JSON run logs (camera/checkerboard/flange transforms + quality metrics) under `outputs/calibration_logs/`. |
@@ -307,28 +307,32 @@ scripts/launch_pipeline_realsense.sh init-only
 
 **Hand-eye calibration for the two RealSense cameras** (camera-to-flange
 offset) plus the checkerboard-in-base-frame and ZED calibration are now a
-**two-script dual-arm routine** — see
+**three-stage dual-arm routine** — see
 **[docs/getting_started_realsense.md §4](docs/getting_started_realsense.md#4-hand-eye-calibration-camera-to-flange-offset)**
 for the full walkthrough, or
 **[docs/calibration_cheatsheet.md](docs/calibration_cheatsheet.md)** for the
 condensed command sequence:
 
 ```bash
-# Step 1 (manual, per arm) — jog + save flange poses, nothing calibrated yet
-python3 -m src.calibration.capture_flange_poses_dual --arm left
-python3 -m src.calibration.capture_flange_poses_dual --arm right
+# Stage A (manual, both arms by default) — position each arm, save its
+# flange pose/joint config and a checkerboard capture; nothing solved yet
+python3 -m src.calibration.capture_handeye_data
 
-# Step 2 (automatic replay) — drives both arms itself, solves hand-eye +
-# checkerboard pose + ZED extrinsic, in one run
+# Stage B (offline, no hardware) — solves T_flange_cam from Stage A's data
+python3 -m src.calibration.calibrate_handeye --write
+
+# Stage C (automatic replay) — drives both arms itself, solves checkerboard
+# pose + ZED extrinsic
 python3 -m src.calibration.autocalibrate_dual_realsense
 ```
 
-Step 1 still needs jogging the arm interactively via MoveIt between samples;
-see **[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for
-that part — or skip jogging entirely with the hand-guided alternative
-(gravity-compensation bring-up + `capture_flange_poses_dual_handguided.py`),
-see **[docs/hand_guided_calibration.md](docs/hand_guided_calibration.md)**.
-Step 2 needs no jogging — it drives both arms itself over the
+Stage A's default `--controller moveit` needs jogging the arm interactively
+via MoveIt between samples; see
+**[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for that
+part — or skip jogging entirely with `--controller admittance` or
+`--controller handguided`, see
+**[docs/calibration_control_modes.md](docs/calibration_control_modes.md)**.
+Stage C needs no jogging — it drives both arms itself over the
 `moveit_msgs/action/MoveGroup` action (see
 [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py)),
 including one simultaneous `both_arms_flange` goal per pose-pair for the

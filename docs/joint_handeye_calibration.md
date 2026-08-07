@@ -1,49 +1,47 @@
 # Joint Bundle-Adjustment Hand-Eye Calibration (dual-arm, CAD-prior)
 
-An alternative to Stage A of the dual-arm routine
-([getting_started_realsense.md §4.0](getting_started_realsense.md#40-two-script-dual-arm-routine-current-workflow)):
-instead of solving each arm's `T_flange_cam` independently via closed-form
-`cv2.calibrateHandEye` (AX=XB), this jointly refines **both** arms at once against
-every checkerboard corner's reprojection error, with two extra priors that the
-closed-form solve has no way to use:
+`calibrate_handeye.py --method joint` (the default): instead of solving each
+arm's `T_flange_cam` independently via closed-form `cv2.calibrateHandEye`
+(AX=XB, `--method direct`), this jointly refines **both** arms at once
+against every checkerboard corner's reprojection error, with two extra
+priors that the closed-form solve has no way to use:
 
-1. Both arms carry the same physical camera mount, so their `T_flange_cam` values
-   should be close to each other — a soft prior pulls them together.
+1. Both arms carry the same physical camera mount, so their `T_flange_cam`
+   values should be close to each other — a soft prior pulls them together.
 2. A CAD-derived nominal offset already exists (`realsense_nominal` in
-   `config/camera_extrinsics_realsense.yaml`) — used as both the initial guess and a
-   second soft prior.
+   `config/camera_extrinsics_realsense.yaml`) — used as both the initial
+   guess and a second soft prior.
 
-It reuses whatever samples `handeye_flange_cam_realsense.py` (or the dual-arm
-routine's Stage A) already captured — **no new captures needed** to try it.
+It reads whatever samples `capture_handeye_data.py` already captured under
+`outputs/calibration_debug/handeye/<cam_id>/` — see
+[calibration_cheatsheet.md](calibration_cheatsheet.md) for Stage A/B of the
+routine this fits into.
 
-> **This is not a capture step.** `joint_calibrate_dual_realsense.py` never moves
-> the robot and never grabs an image — it's pure offline re-optimization over
-> `sample_*.json` files that some earlier script already wrote to
-> `outputs/calibration_debug/handeye/<cam_id>/`. If that directory is empty for the
-> arm(s) you care about, run [Step 1 + Step 2 of the dual-arm
-> routine](calibration_cheatsheet.md) (or the single-camera fallback,
-> [getting_started_realsense.md §4.7](getting_started_realsense.md#47-manual-single-camera-fallback-original-scripts-still-available))
-> first — this script has nothing to do until then.
+> **This is not a capture step.** `calibrate_handeye.py` never moves the
+> robot and never grabs an image — it's pure offline re-optimization over
+> `sample_*.json` files that `capture_handeye_data.py` already wrote. If
+> that directory is empty for the arm(s) you care about, run Stage A first
+> ([calibration_cheatsheet.md](calibration_cheatsheet.md)) — this script has
+> nothing to do until then.
 
 ---
 
 ## Quick start
 
 Assumes you already have captured samples for at least one arm under
-`outputs/calibration_debug/handeye/<cam_id>/` (either from a prior
-`handeye_flange_cam_realsense.py` run, or Stage A of `autocalibrate_dual_realsense.py`).
+`outputs/calibration_debug/handeye/<cam_id>/` (from `capture_handeye_data.py`).
 
 ```bash
 # Dry run first -- prints the solved T_flange_cam + diagnostics, doesn't touch
-# config/camera_extrinsics_realsense.yaml.
-python3 -m src.calibration.joint_calibrate_dual_realsense -v
+# config/camera_extrinsics_realsense.yaml. --method joint is the default.
+python3 -m src.calibration.calibrate_handeye -v
 ```
 
 Check the printed diagnostics (see [Interpreting the output](#interpreting-the-output)
 below) look sane, then write the result:
 
 ```bash
-python3 -m src.calibration.joint_calibrate_dual_realsense --write
+python3 -m src.calibration.calibrate_handeye --write
 ```
 
 ✅ Checkpoint: `pose residual` / `reprojection error (px)` lines are small (a
@@ -55,7 +53,7 @@ Works fine with only **one** arm's data present (e.g. only `realsense_2` capture
 far): it just solves that arm alone with the CAD-nominal prior; the cross-arm prior
 kicks in automatically once both arms have samples.
 
-Useful flags:
+Useful flags (all `--method joint`-specific):
 
 ```bash
 --cam-ids realsense_1              # solve just one arm instead of both
@@ -65,6 +63,10 @@ Useful flags:
 --loss cauchy --f-scale 2.0        # opt into robust loss -- see the gotcha below first
 ```
 
+For the original closed-form solve instead, pass `--method direct`
+(no priors, no tuning knobs, per-arm independent) — see
+[calibration_cheatsheet.md](calibration_cheatsheet.md).
+
 ---
 
 ## Where this lives
@@ -73,9 +75,9 @@ The actual bundle-adjustment solver is **not** in this repo — it's a standalon
 Python package/git submodule at
 [`src/calibration/joint_handeye_calib/`](../src/calibration/joint_handeye_calib/)
 (own tests, own README, own commit history — see that README for the math/API
-details). `src/calibration/joint_calibrate_dual_realsense.py` is the thin
-integration script that loads this repo's sample data and CAD nominal transform,
-calls into that package, and writes the result into
+details). `src/calibration/calibrate_handeye.py`'s `--method joint` path is the
+thin integration code that loads this repo's sample data and CAD nominal
+transform, calls into that package, and writes the result into
 `config/camera_extrinsics_realsense.yaml` using the same
 `update_extrinsics_yaml_preserving_header` helper the other calibration scripts use
 (backs up the previous file to `.yaml.bak` first).
@@ -85,7 +87,7 @@ calls into that package, and writes the result into
 migrate by pushing that directory to a real remote, updating the url in
 `.gitmodules`, and running `git submodule sync` once one exists.
 
-## Why not just use Stage A's closed-form solve?
+## Why not just use the closed-form solve (`--method direct`)?
 
 `cv2.calibrateHandEye` only ever sees the *solved* board pose per sample (via PnP),
 and solves each camera completely independently — it has no way to use a CAD prior,
@@ -111,11 +113,11 @@ capture pipeline doesn't currently produce. Intrinsics are taken as fixed, per-s
 
 ## Reprojection vs. pose-level residuals (mixed sample fidelity)
 
-`handeye_flange_cam_realsense.py` now persists the raw detected checkerboard corner
+`capture_handeye_data.py` persists the raw detected checkerboard corner
 pixels + intrinsics (`corners_px`, `K`) alongside each sample, in addition to the
-solved board pose it always saved. Samples with these fields feed a true 2D
+solved board pose it always saves. Samples with these fields feed a true 2D
 reprojection residual; **older captures that don't have them** (e.g. any
-`realsense_2` samples captured before this was added) automatically fall back to a
+`sample_*.json` written by a pre-refactor capture script) automatically fall back to a
 6-DOF pose-level residual on the already-solved board pose instead. Both kinds mix
 freely in the same solve — nothing needs recapturing to benefit from the joint,
 multi-arm, CAD-prior solve.
@@ -147,19 +149,17 @@ it as a strong prior for both arms.)
 ## Troubleshooting
 
 **Result looks wildly wrong (tens of degrees / centimeters of pose residual), but
-the same samples solve fine with `handeye_flange_cam_realsense.py`'s
-`cv2.calibrateHandEye`:** almost certainly the `--loss` choice. The default is
-`linear` for exactly this reason — a robust loss (`soft_l1`/`cauchy`, closer to what
-the reference paper uses) down-weights *every* residual near-uniformly when the
-initial guess is more than a few degrees off (nothing looks like a "good" inlier to
-anchor to yet), which can stall the solver within a few dozen iterations, far from
-the optimum. This was caught during verification: `cauchy` converged to 50-70° of
-error on a real capture session starting from the CAD nominal guess, where `linear`
-converged to <1°. Don't pass `--loss cauchy`/`soft_l1` unless you have a specific
-outlier-rejection need and have verified convergence from your actual initial guess
-looks correct.
+the same samples solve fine with `--method direct`'s `cv2.calibrateHandEye`:**
+almost certainly the `--loss` choice. The default is `linear` for exactly this
+reason — a robust loss (`soft_l1`/`cauchy`, closer to what the reference paper
+uses) down-weights *every* residual near-uniformly when the initial guess is more
+than a few degrees off (nothing looks like a "good" inlier to anchor to yet), which
+can stall the solver within a few dozen iterations, far from the optimum. This was
+caught during verification: `cauchy` converged to 50-70° of error on a real capture
+session starting from the CAD nominal guess, where `linear` converged to <1°. Don't
+pass `--loss cauchy`/`soft_l1` unless you have a specific outlier-rejection need and
+have verified convergence from your actual initial guess looks correct.
 
 **Only one arm prints results:** the other arm has no `sample_*.json` files under
 `outputs/calibration_debug/handeye/<cam_id>/` yet — capture some with
-`handeye_flange_cam_realsense.py --cam-id <cam_id>` (or Step 1 of the dual-arm
-routine) first.
+`capture_handeye_data.py` (Stage A of the routine) first.

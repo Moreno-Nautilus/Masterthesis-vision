@@ -5,11 +5,10 @@ mechanism autocalibrate_dual_realsense.py now uses instead of Cartesian
 ArmTarget/move_to().
 
 IMPORTANT SCOPE NOTE: this does NOT replay real calibration poses. Those
-only exist once capture_flange_poses_dual_handguided.py has actually been
-run against the real hand-guided rig (joint_positions in
-config/flange_poses/{left,right}.json is empty for every capture on this
-checkout right now -- those captures predate that field / were made with
-the old MoveIt-jogged capture_flange_poses_dual.py). Instead this script
+only exist once capture_handeye_data.py has actually been run against the
+real rig (joint_positions in config/flange_poses/{left,right}.json is empty
+for any capture made before that field existed, e.g. via the retired
+MoveIt-jogged-only capture_flange_poses_dual.py). Instead this script
 builds SYNTHETIC joint targets from whatever configuration the mock robot
 currently reports (its home/default state) plus a small per-joint
 perturbation, and checks that:

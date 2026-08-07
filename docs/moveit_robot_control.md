@@ -11,9 +11,9 @@ MoveIt — nothing here is specific to this repo. Most of
 `/left/ee_pose`, `/right/ee_pose`, or single-arm `/iiwa/ee_pose` — see
 [getting_started_realsense.md §5](getting_started_realsense.md#5-the-live-flange-pose-topic--how-it-works));
 the exception is `src/calibration/moveit_dual_arm.py`, used by
-`autocalibrate_dual_realsense.py` to replay saved calibration poses
-automatically through the same MoveGroup action this page's RViz panel
-drives interactively.
+`capture_handeye_data.py --mode replay` and `autocalibrate_dual_realsense.py`
+to replay saved calibration poses automatically through the same MoveGroup
+action this page's RViz panel drives interactively.
 
 > **Note on the robot**: despite the `franka_ros2_ws` directory name, the arm
 > is a **KUKA LBR iiwa** (`iiwa7` by default), driven by `lbr_fri_ros2_stack`.
@@ -98,6 +98,17 @@ workflow, unmodified.
 ros2 run tf2_ros tf2_echo lbr_one_link_0 lbr_one_link_ee
 ```
 
+> **Frame note**: `lbr_one_link_ee` is the canonical KUKA flange frame,
+> `0.035 m` above `lbr_one_link_7` along local Z. With `use_gripper:=true`,
+> the Y-gripper's `lbr_one_gripper_base_link` mounts directly on
+> `lbr_one_link_ee` (not `link_7`), so the two coincide —
+> `lbr_one_gripper_tcp` is a further fixed `0.1455 m` from that same shared
+> frame. This is why `link_ee` stays a stable reference for hand-eye
+> calibration regardless of `use_gripper`: it doesn't move when the gripper
+> is attached or removed. See `lbr_dual_arm_description`'s
+> `doc/lbr_dual_arm_description.rst` ("Frame Conventions") for the full
+> joint chain.
+
 Compare against the pose you commanded. This is also exactly what
 `flange_pose_publisher` republishes as `/left/ee_pose` (`/right/ee_pose` for
 the other arm) for the calibration scripts to consume — if this echoes
@@ -124,7 +135,7 @@ running independently of these ROS nodes.
   `move_group.launch.py`, `mock.launch.py`, plus `calibration.launch.py` for
   hand-guided/gravity-compensation calibration), if you need to check or
   override their arguments (`use_gripper`, `mode`, `robot_name`, ...).
-- **[hand_guided_calibration.md](hand_guided_calibration.md)** — the
+- **[calibration_control_modes.md](calibration_control_modes.md)** — the
   gravity-compensation alternative to this page's RViz jogging: hand-guide
   the arm instead of dragging the interactive marker, and
   `moveit_dual_arm.py`'s joint-space (`JointTarget`/`move_to_joint()`) goals

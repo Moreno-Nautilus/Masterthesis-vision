@@ -24,18 +24,44 @@
 #
 #   T_base_cam(t) = T_base_flange(t) @ T_flange_cam
 #
-# PLACEHOLDER VALUES: realsense_1 / realsense_2 below are pure identity
-# (camera optical frame == flange frame, no offset at all). Replace R/t with
-# your real hand-eye calibration (camera optical frame relative to the
-# flange frame, lbr_link_ee) before trusting any fused pose from these two
-# cameras — identity is almost certainly wrong, it's a placeholder so the
-# pipeline can run end-to-end before calibration exists.
+# PLACEHOLDER VALUE: realsense_1 below is still pure identity (camera optical
+# frame == flange frame, no offset at all) -- not yet hand-eye calibrated.
+# realsense_2 has a real online hand-eye calibration. Replace realsense_1's
+# R/t with its real hand-eye calibration (camera optical frame relative to
+# the flange frame, lbr_link_ee) before trusting any fused pose from it --
+# identity is almost certainly wrong, it's a placeholder so the pipeline can
+# run end-to-end before calibration exists.
 #
 # RealSense USB serial numbers (for zed_realsense_trio.launch.py
 # rs1_serial:=/rs2_serial:=), recorded here for convenience:
 #   realsense_1: 260322275185
 #   realsense_2: 260522275434
+#
+# realsense_nominal is a THIRD, separate kind of entry: a CAD-derived (not
+# hand-eye calibrated) camera-to-flange offset for the RealSense mount,
+# provided for comparison/visualization while realsense_1 has no real
+# calibration yet. Not consumed by the tracking pipeline (run_pipeline_track_
+# multicam_realsense.py only looks up "realsense_1"/"realsense_2" by name),
+# only published as an extra TF frame by publish_extrinsics_tf.py. Derived by
+# composing T_cam_connector (Rx(-60 deg), t=(-9.00, 83.597, -33.4609) mm) with
+# T_connector_flange (Ry(90 deg) . Rx(90 deg), zero translation), then
+# inverting the result to get T_flange_cam.
 
+realsense_nominal:
+  R:
+  - 0.0
+  - -0.866
+  - -0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - -0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009000
+  - 0.070776
 realsense_1:
   R:
   - 1.0

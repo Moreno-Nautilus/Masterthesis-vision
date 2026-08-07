@@ -2,9 +2,8 @@
 
 Two new, additive execution paths for the dual-LBR rig, alongside the
 existing position-controlled MoveGroup pipeline described in
-[moveit_robot_control.md](moveit_robot_control.md) and
-[hand_guided_calibration.md](hand_guided_calibration.md) — neither of those
-changed; nothing here replaces `joint_trajectory_controller` as the default.
+[moveit_robot_control.md](moveit_robot_control.md) — unchanged by this;
+nothing here replaces `joint_trajectory_controller` as the default.
 
 > Picking a mode for a calibration session, or want gravity compensation
 > covered alongside these two? See
@@ -43,7 +42,7 @@ ros2 launch lbr_dual_arm_bringup cartesian_impedance.launch.py use_gripper:=true
 ```
 
 Torque-mode twin of `hardware.launch.py`, same shape as
-`calibration.launch.py` (see hand_guided_calibration.md §3) but spawning
+`calibration.launch.py` (see [calibration_control_modes.md §1](calibration_control_modes.md#1-gravity-compensation--hand-guiding-the-arm-into-place)) but spawning
 `cartesian_impedance_lbr_one`/`_two` instead of `gravity_compensation_lbr_one`/`_two`.
 Config: `lbr_dual_arm_description/ros2_control/dual_arm_cartesian_impedance_controllers.yaml`.
 Bring up `move_group.launch.py` separately if you need a plan (§1.3) — this

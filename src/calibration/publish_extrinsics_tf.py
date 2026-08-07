@@ -43,7 +43,9 @@ from src.calibration.io_extrinsics import load_extrinsics_yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # cam_id -> which robot frame its extrinsics entry is expressed relative to.
-FLANGE_CAM_IDS = {"realsense_1", "realsense_2"}
+# realsense_nominal is the CAD-derived (not hand-eye calibrated) mount
+# offset -- see config/camera_extrinsics_realsense.yaml's header comment.
+FLANGE_CAM_IDS = {"realsense_1", "realsense_2", "realsense_nominal"}
 
 
 def _rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
