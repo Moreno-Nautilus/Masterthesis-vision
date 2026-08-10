@@ -87,7 +87,12 @@ class DINOIdentifier:
 
     def _build_model(self) -> torch.nn.Module:
         # Pull the requested DINOv2 backbone from torch.hub onto the device.
-        model = torch.hub.load("facebookresearch/dinov2", self.cfg.model_name)
+        # Pin the ref to "main" so torch.hub skips its GitHub network probe
+        # (torch.hub._parse_repo_info hits https://github.com/.../tree/main/
+        # to resolve an unspecified ref, which flakes/fails without internet)
+        # and goes straight to the already-cloned local hub cache dir
+        # (~/.cache/torch/hub/facebookresearch_dinov2_main).
+        model = torch.hub.load("facebookresearch/dinov2:main", self.cfg.model_name)
         model = model.to(self.device)
         model.eval()
         return model

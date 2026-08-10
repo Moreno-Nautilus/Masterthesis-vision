@@ -19,11 +19,23 @@
 #   scripts/launch_pipeline_realsense.sh --debug-logging   # runs pipeline runner with given args
 #
 # Named presets (init-only/fast-track/accurate-track/baseline) run inside a
-# tmux session with two windows so the tracker's start/stop/reset services
+# tmux session with three windows so the tracker's start/stop/reset services
 # are one keypress away without reopening a shell:
-#   window 0 "run"  — the pipeline itself (this is what you were seeing before)
-#   window 1 "keys" — tracking_keyboard_control.py (s=start, x=stop, r=reset)
-# Switch windows: Ctrl+b then 0/1 (or n/p). Detach without killing: Ctrl+b d.
+#   window 0 "run"       — the pipeline itself (this is what you were seeing before)
+#   window 1 "keys"      — tracking_keyboard_control.py (s=start, x=stop, r=reset)
+#   window 2 "cam-scene" — publish_camera_scene_objects.py --dual-arm: publishes
+#                          the ZED camera + holder meshes as CollisionObjects on
+#                          /planning_scene, in the same base_link frame as the
+#                          tracked-part CollisionObjects the pipeline itself
+#                          publishes. This is a plain topic publisher (no
+#                          robot_state_publisher, no move_group) so it never
+#                          duplicates the robot on a shared ROS network — for
+#                          that reason it's also fine to run alongside a real
+#                          MoveIt elsewhere on the network. The interactive
+#                          mock-robot RViz viewer (scripts/view_scene.sh) is a
+#                          separate, local-only visualization workflow and is
+#                          untouched by this.
+# Switch windows: Ctrl+b then 0/1/2 (or n/p). Detach without killing: Ctrl+b d.
 #   scripts/launch_pipeline_realsense.sh stop              # kill that tmux session
 #   scripts/launch_pipeline_realsense.sh attach            # attach if already running
 #
@@ -45,7 +57,11 @@ SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/thesis-venv/bin/acti
 
 COMMON_ARGS=(
     --num-cameras 3
-    --flange-pose-topic /iiwa/ee_pose
+    # Dual-arm bringup has no "world" link (see docs/visualization.md §2) --
+    # base_link matches publish_camera_scene_objects.py --dual-arm's own
+    # default, so tracked-part and camera-holder CollisionObjects land in the
+    # same frame.
+    --planning-scene-frame-id base_link
     --gdino-device cpu
     --gdino-box-threshold 0.30
     --gdino-text-threshold 0.20
@@ -121,7 +137,7 @@ ACCURATE_TRACK_ARGS=(
 )
 
 usage() {
-    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 DISABLE_DEBUG_FRAMES=0
@@ -178,6 +194,14 @@ if (( DISABLE_DEBUG_FRAMES )); then
     set -- "$@" --no-debug-frame-publish
 fi
 
+# Plain CollisionObject publisher for the fixed ZED camera + holder meshes
+# (no robot_state_publisher, no move_group -- see src/calibration/
+# publish_camera_scene_objects.py) -- safe to run alongside the pipeline on a
+# shared ROS network without duplicating the robot. --dual-arm both
+# re-expresses the camera poses into base_link and defaults --frame-id to
+# base_link, matching COMMON_ARGS' --planning-scene-frame-id above.
+CAM_SCENE_CMD="$SRC && exec python3 -m src.calibration.publish_camera_scene_objects --dual-arm"
+
 echo "[*] restarting container: $CONTAINER"
 docker stop "$CONTAINER" >/dev/null
 docker start "$CONTAINER" >/dev/null
@@ -206,9 +230,17 @@ elif [ -n "$MODE_NAME" ]; then
     tmux new-window -t "$SESSION" -n keys -c "$REPO_DIR"
     tmux send-keys -t "$SESSION:keys" "docker exec -it \"$CONTAINER\" bash -lc $(printf '%q' "$KEYS_CMD")" Enter
 
+    tmux new-window -t "$SESSION" -n cam-scene -c "$REPO_DIR"
+    tmux send-keys -t "$SESSION:cam-scene" "docker exec -it \"$CONTAINER\" bash -lc $(printf '%q' "$CAM_SCENE_CMD")" Enter
+
     tmux select-window -t "$SESSION:run"
     exec tmux attach -t "$SESSION"
 else
+    # Custom args, no tmux: start the camera-scene publisher detached in the
+    # background (docker restart above already ensures no stale copy is left
+    # running from a previous invocation), then run the pipeline itself in
+    # the foreground as before.
+    docker exec -d "$CONTAINER" bash -lc "$CAM_SCENE_CMD"
     exec docker exec -it "$CONTAINER" bash -lc \
         "$SRC && exec python3 -m src.perception.ros.learn_runners.run_pipeline_track_multicam_realsense \"\$@\"" \
         -- "$@"

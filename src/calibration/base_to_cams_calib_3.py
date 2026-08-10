@@ -14,7 +14,7 @@ from sensor_msgs.msg import Image, CameraInfo
 import yaml
 
 from src.utils.se3 import SE3
-from src.calibration.io_extrinsics import save_extrinsics_yaml
+from src.calibration.io_extrinsics import save_extrinsics_yaml, update_extrinsics_yaml_preserving_header
 from src.calibration.calibration_log import log_camera_transform
 from src.utils.robot_bases import get_active_robot_base
 
@@ -66,6 +66,14 @@ OUT_YAML = "config/camera_extrinsics_base.yaml"
 # to a terminal that may not be saved" justification for a second YAML no
 # longer held.
 DEBUG_DIR = "outputs/calibration_debug"
+# The realsense-trio tracking pipeline (run_pipeline_track_multicam_
+# realsense.py) reads zed2i_1 from this file, not from OUT_YAML -- its
+# zed2i_1 entry must be kept identical to OUT_YAML's (same dst frame:
+# active robot's lbr_link_0, see io_extrinsics.load_extrinsics_yaml), or the
+# pipeline silently tracks against a stale extrinsic. Synced automatically
+# below via update_extrinsics_yaml_preserving_header() whenever this script
+# recalibrates zed2i_1.
+TRACKING_PIPELINE_YAML = "config/camera_extrinsics_realsense.yaml"
 # ------------------------------------------------
 
 
@@ -562,6 +570,22 @@ def main() -> None:
         "call below -- no longer written to a separate YAML, see T_robotA_cam "
         "comment near OUT_YAML.)"
     )
+
+    # Keep the realsense-trio pipeline's copy of zed2i_1 in sync -- both
+    # files store the same dst frame (active robot's lbr_link_0), so this is
+    # a direct copy, no re-projection between robot_a/robot_b/base_link
+    # needed here; that resolution happens at pipeline runtime (see
+    # run_pipeline_track_multicam_realsense.py's use of get_active_robot_base
+    # / get_dual_arm_base_link).
+    synced = {c: T for c, T in T_base_cam_avg.items() if c == "zed2i_1"}
+    if synced:
+        rs_path = Path(TRACKING_PIPELINE_YAML)
+        if rs_path.exists():
+            backup = rs_path.with_suffix(".yaml.bak")
+            backup.write_text(rs_path.read_text())
+            print(f"Backed up existing YAML to: {backup}")
+        update_extrinsics_yaml_preserving_header(rs_path, synced)
+        print(f"Synced {list(synced)} into: {rs_path}")
 
     print(f"Saved debug corner images to: {debug_dir}")
 

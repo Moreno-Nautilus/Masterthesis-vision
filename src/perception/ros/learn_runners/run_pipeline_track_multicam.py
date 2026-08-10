@@ -2168,11 +2168,20 @@ class FoundationPoseTrackerNode(Node):
 
         try:
             T_base = self._to_base_pose(cam_id, T_camera)
+            x_base = float(T_base[0, 3])
+            y_base = float(T_base[1, 3])
             z_base = float(T_base[2, 3])
             z_lo = float(getattr(self.args, "table_plane_z_min", 0.0))
             z_hi = float(getattr(self.args, "table_plane_z_max", 0.9))
             if z_base < z_lo or z_base > z_hi:
                 return False, f"bad_z_base z={z_base:.3f} (table window [{z_lo:.3f}, {z_hi:.3f}])"
+            x_lo = float(getattr(self.args, "workspace_x_min", 0.10))
+            if x_base < x_lo:
+                return False, f"bad_x_base x={x_base:.3f} (min {x_lo:.3f})"
+            y_lo = float(getattr(self.args, "workspace_y_min", -0.4))
+            y_hi = float(getattr(self.args, "workspace_y_max", 0.4))
+            if y_base < y_lo or y_base > y_hi:
+                return False, f"bad_y_base y={y_base:.3f} (window [{y_lo:.3f}, {y_hi:.3f}])"
         except Exception:
             pass
 
@@ -5041,6 +5050,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--table-plane-z-min", type=float, default=-0.03)
     p.add_argument("--table-plane-z-max", type=float, default=0.9)
+    p.add_argument("--workspace-x-min", type=float, default=0.10)
+    p.add_argument("--workspace-y-min", type=float, default=-0.4)
+    p.add_argument("--workspace-y-max", type=float, default=0.4)
 
 
     p.add_argument("--icp-mask-close-kernel", type=int, default=0)

@@ -91,7 +91,7 @@ from src.calibration.board_pose_from_flange_realsense import (
     _rotation_matrix_to_rpy_deg,
     _save_sample_json as _save_board_sample_json,
 )
-from src.calibration.moveit_dual_arm import ArmTarget, DualArmMoveitClient, JointTarget
+from src.calibration.moveit_dual_arm import DualArmMoveitClient, JointTarget
 from src.perception.ros.multicam_grabber_realsense import _pose_msg_to_se3
 from src.utils.robot_bases import get_active_robot_base, load_robot_bases
 from src.utils.se3 import SE3
@@ -466,26 +466,35 @@ def main() -> None:
     # first goal too soon after move_group.launch.py comes up fails instantly
     # ("IKConstraintSampler received dirty robot state" in move_group's own log),
     # which looks like a generic planning failure everywhere else. Poll with
-    # plan_only goals (no motion) using the first board-pose sample as the probe
-    # until that settles, or bail with a clear error instead of a confusing one
-    # from deep inside the board-pose stage.
+    # plan_only_joint goals (no motion) at each arm's own saved joint
+    # configuration, one arm's own group at a time -- matching what the
+    # board-pose stage below actually sends (_move_single_arm), since a
+    # Cartesian probe on the both_arms_flange composite group hits a separate,
+    # structural MoveIt limitation (deterministic failure regardless of
+    # readiness -- see moveit_dual_arm.wait_for_valid_state_joint's docstring)
+    # that looks identical to "not ready yet" but never resolves.
     print("Confirming move_group's current-state monitor is ready (plan-only probe)...")
-    probe_targets = [
-        ArmTarget(
-            group_name=ARM_KEYS["left"]["group_name"], base_frame=ARM_KEYS["left"]["base_frame"],
-            tip_link=ARM_KEYS["left"]["flange_frame"], T_armBase_flange=left_board[0].T_armBase_flange,
-        ),
-        ArmTarget(
-            group_name=ARM_KEYS["right"]["group_name"], base_frame=ARM_KEYS["right"]["base_frame"],
-            tip_link=ARM_KEYS["right"]["flange_frame"], T_armBase_flange=right_board[0].T_armBase_flange,
-        ),
-    ]
-    if not node.moveit.wait_for_valid_state(probe_targets, group_name="both_arms_flange"):
+    left_probe = JointTarget(
+        group_name=ARM_KEYS["left"]["group_name"], joint_positions=left_board[0].joint_positions,
+        label="left probe",
+    )
+    right_probe = JointTarget(
+        group_name=ARM_KEYS["right"]["group_name"], joint_positions=right_board[0].joint_positions,
+        label="right probe",
+    )
+    if not node.moveit.wait_for_valid_state_joint([left_probe]):
         raise RuntimeError(
-            "move_group never became ready to plan for 'both_arms_flange' -- see the "
-            "warnings above and move_group's own ~/.ros/log/move_group_*.log for "
-            "the real reason (dirty robot state vs. an actual planning failure "
-            "on the first probe pose)."
+            "move_group never became ready to plan for "
+            f"'{ARM_KEYS['left']['group_name']}' -- see the warnings above and "
+            "move_group's own ~/.ros/log/move_group_*.log for the real reason "
+            "(dirty robot state vs. an actual planning failure on the first probe pose)."
+        )
+    if not node.moveit.wait_for_valid_state_joint([right_probe]):
+        raise RuntimeError(
+            "move_group never became ready to plan for "
+            f"'{ARM_KEYS['right']['group_name']}' -- see the warnings above and "
+            "move_group's own ~/.ros/log/move_group_*.log for the real reason "
+            "(dirty robot state vs. an actual planning failure on the first probe pose)."
         )
 
     try:

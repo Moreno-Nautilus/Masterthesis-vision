@@ -366,6 +366,57 @@ class DualArmMoveitClient:
             deadline_sleep = min(retry_interval_s, max(remaining, 0.0))
             self._spin_sleep(deadline_sleep)
 
+    def wait_for_valid_state_joint(
+        self,
+        targets: list[JointTarget],
+        group_name: Optional[str] = None,
+        timeout_s: float = STARTUP_READY_TIMEOUT_S,
+        retry_interval_s: float = STARTUP_READY_RETRY_INTERVAL_S,
+    ) -> bool:
+        """wait_for_valid_state()'s joint-space twin -- see that docstring.
+        Use this instead of wait_for_valid_state() when the probe target's
+        own group is a multi-chain composite (e.g. both_arms_flange): a
+        Cartesian probe on such a group hits a structural MoveIt limitation
+        (IKConstraintSampler received dirty robot state, deterministically,
+        regardless of move_group's actual readiness -- see
+        docs/calibration_cheatsheet.md / mock_reachability_check.py), which
+        looks identical to the transient startup condition this method
+        exists to wait out. Joint-space goals through the same composite
+        group don't hit that limitation."""
+        if not targets:
+            raise ValueError("targets must be non-empty")
+
+        group = group_name or targets[0].group_name
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+        while True:
+            attempt += 1
+            ok, error_code = self.plan_only_joint(targets, group_name=group_name)
+            if ok:
+                if attempt > 1:
+                    self._node.get_logger().info(
+                        f"move_group ready for group={group} after {attempt} attempts."
+                    )
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._node.get_logger().error(
+                    f"move_group still not ready for group={group} after "
+                    f"{timeout_s:.0f}s (last error_code={error_code}). Giving up -- "
+                    f"if this is running in a Docker container, check that move_group's "
+                    f"own log doesn't show DDS discovery still in progress."
+                )
+                return False
+
+            self._node.get_logger().warn(
+                f"[attempt {attempt}] group={group} not plannable yet "
+                f"(error_code={error_code}) -- retrying in {retry_interval_s:.1f}s "
+                f"({remaining:.0f}s left)..."
+            )
+            deadline_sleep = min(retry_interval_s, max(remaining, 0.0))
+            self._spin_sleep(deadline_sleep)
+
     def _spin_sleep(self, duration_s: float) -> None:
         end = time.monotonic() + duration_s
         while time.monotonic() < end:

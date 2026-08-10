@@ -124,6 +124,9 @@ class _FlangeComposedExtrinsicsMap:
         T = self._resolve(cam_id)
         return default if T is None else T
 
+    def is_dynamic(self, cam_id: str) -> bool:
+        return cam_id in self._dynamic_cam_ids
+
 
 # ROS node that buffers each camera's latest RGB/depth/intrinsics and serves
 # time-synced View sets, with dynamic (end-effector-mounted) camera support.

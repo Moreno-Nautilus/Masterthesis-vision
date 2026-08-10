@@ -19,8 +19,14 @@ squares) is on hand, and you're starting from nothing running.
 #
 # Default Stage A controller (moveit/RViz-jogged) needs hardware.launch.py.
 # Swap for `admittance.launch.py` or `calibration.launch.py` if you're using
-# --controller admittance / handguided instead — see step 1 below.
+# --controller admittance / handguided instead — see step 1 below and
+# calibration_control_modes.md for full launch-param reference.
 ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
+
+# Only have/control one arm? Add arms:=lbr_one (left) or arms:=lbr_two
+# (right) to hardware.launch.py / admittance.launch.py / calibration.launch.py
+# — the other arm loads as a mock component, no pendant/hardware needed for it:
+ros2 launch lbr_dual_arm_bringup admittance.launch.py arms:=lbr_one use_gripper:=true
 ```
 
 ```bash
@@ -30,8 +36,9 @@ ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
 ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true use_gripper:=true
 ```
 
-Then on **both pendants** (left first, then right): start the `LBRServer`
-app to open the FRI connections Terminal 1 is waiting on.
+Then on **each pendant you're actually using** (left first, then right, if
+both): start the `LBRServer` app to open the FRI connection Terminal 1 is
+waiting on. With `arms:=lbr_one`/`lbr_two`, only that one pendant needs it.
 
 ```bash
 # Terminal 3 — host camera stack (ZED + both RealSense + flange_pose_publisher x2)
