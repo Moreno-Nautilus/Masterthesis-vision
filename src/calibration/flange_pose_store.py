@@ -37,7 +37,7 @@ ARM_KEYS = {
         "base_frame": "lbr_one_link_0",
         "flange_frame": "lbr_one_link_ee",
         "flange_pose_topic": "/left/ee_pose",
-        "group_name": "arm_one",
+        "group_name": "arm_one_flange",
         "robot_base_key": "robot_a",
     },
     "right": {
@@ -45,7 +45,7 @@ ARM_KEYS = {
         "base_frame": "lbr_two_link_0",
         "flange_frame": "lbr_two_link_ee",
         "flange_pose_topic": "/right/ee_pose",
-        "group_name": "arm_two",
+        "group_name": "arm_two_flange",
         "robot_base_key": "robot_b",
     },
 }
@@ -57,6 +57,16 @@ class FlangePoseCapture:
     T_armBase_flange: SE3
     captured_at_unix_s: float
     note: str = ""
+    # Raw joint configuration (joint name -> position, radians) at capture
+    # time, e.g. {"lbr_one_A1": 0.12, ..., "lbr_one_A7": -0.4}. Empty for
+    # captures made before this field existed (see _capture_from_dict).
+    # T_armBase_flange alone is ambiguous for MoveIt reconstruction on this
+    # redundant 7-DOF arm -- re-solving IK for the same Cartesian pose can
+    # land on a different elbow configuration than the one physically
+    # captured. Saved by capture_flange_poses_dual_handguided.py so a later
+    # MoveIt-based replay can target the exact recorded joint state (a
+    # JointConstraint goal) instead of re-deriving it via IK.
+    joint_positions: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -83,6 +93,7 @@ def _capture_to_dict(c: FlangePoseCapture) -> dict:
             "R": c.T_armBase_flange.R.tolist(),
             "t": c.T_armBase_flange.t.tolist(),
         },
+        "joint_positions": dict(c.joint_positions),
     }
 
 
@@ -94,6 +105,8 @@ def _capture_from_dict(d: dict) -> FlangePoseCapture:
         T_armBase_flange=SE3(
             np.array(d["T_armBase_flange"]["R"]), np.array(d["T_armBase_flange"]["t"])
         ),
+        # .get(..., {}) -- absent for captures saved before this field existed.
+        joint_positions=dict(d.get("joint_positions", {})),
     )
 
 

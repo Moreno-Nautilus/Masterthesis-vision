@@ -114,6 +114,19 @@ a checkerboard held in a known spot. The result is written to
 ### 2.1 Prerequisites
 
 - The **host stack from §1 must be running** (the cameras must be publishing).
+  For better checkerboard corner detection, (re)launch it with `calibrate`
+  instead of plain `scripts/launch_host.sh` — same tmux session, but the
+  ZEDs grab/publish at HD2K (2208x1242 @ 15fps) instead of the normal
+  HD1080 @ 30fps used for tracking:
+  ```bash
+  scripts/launch_host.sh stop        # if the normal-resolution session is up
+  scripts/launch_host.sh calibrate   # relaunch at HD2K/15fps
+  ```
+  Equivalent to `CALIBRATE_2K=1 scripts/launch_host.sh`. Under the hood this
+  passes `override_path:=config/zed_override_2k.yaml` to `mv_launch`'s
+  `zed2i_pair.launch.py` instead of the default `config/zed_override_native.yaml`
+  — both files live in the separate `~/franka_ros2_ws` ROS workspace, not this
+  repo.
 - You need the **physical checkerboard**: **8 × 11 inner corners**, **30 mm** squares.
   (These are the defaults baked into the script — see the constants below.)
 
@@ -151,6 +164,17 @@ Then, in that container shell:
 ```bash
 python3 -m src.calibration.base_to_cams_calib_3
 ```
+
+If a camera fails to open (`CAMERA NOT DETECTED` in the host stack's `cams`
+window — USB enumeration flakiness happens), calibrate with just the cameras
+that came up instead, e.g.:
+
+```bash
+python3 -m src.calibration.base_to_cams_calib_3 --cam-ids zed2i_2 zed2i_3
+```
+
+`--cam-ids` accepts any subset of size N≥1, in any order; the output YAML and
+printed report key off cam_id, not a fixed camera-1/2/3 slot.
 
 **Hold the checkerboard so all three cameras see it at once, and keep it steady.**
 The script collects 8 good 3-camera samples, so hold position for a few seconds. It

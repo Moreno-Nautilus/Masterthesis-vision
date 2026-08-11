@@ -1,0 +1,38 @@
+# Named stiffness profiles for cartesian_impedance_dual_arm.py's
+# set_gains() (CartesianImpedanceDualArmClient), applied to the running
+# cartesian_impedance_lbr_one/_two controller instances via
+# set_parameters -- live-rereadable every control cycle (see the
+# updateGainsFromParameters() patch in
+# kuka_lbr_control/controllers/cartesian_impedance_controller), no
+# controller restart needed. Only apply these while the target arm is
+# stationary -- set_gains() enforces this itself.
+#
+# stiffness.* are N/m (trans_*) and Nm/rad (rot_*), w.r.t. compliance_ref_link
+# (the arm's own flange, lbr_{one,two}_link_ee -- see
+# dual_arm_cartesian_impedance_controllers.yaml). nullspace_stiffness biases
+# the redundant elbow toward whatever nullspace_desired_configuration was
+# last set (via CartesianImpedanceDualArmClient.set_nullspace_target())
+# (see cartesian_impedance_dual_arm.py's move_to_joint_compliant()) -- these
+# are illustrative starting points, not validated for a specific task; tune
+# per-axis for real use (e.g. lower stiffness only along an insertion axis
+# rather than isotropically, as done here for simplicity).
+
+holding:
+  stiffness:
+    trans_x: 1000.0
+    trans_y: 1000.0
+    trans_z: 1000.0
+    rot_x: 30.0
+    rot_y: 30.0
+    rot_z: 30.0
+  nullspace_stiffness: 5.0
+
+insertion:
+  stiffness:
+    trans_x: 150.0
+    trans_y: 150.0
+    trans_z: 150.0
+    rot_x: 20.0
+    rot_y: 20.0
+    rot_z: 20.0
+  nullspace_stiffness: 0.0

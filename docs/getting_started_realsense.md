@@ -342,17 +342,29 @@ The original single-arm, single-camera manual scripts
 camera by hand — the dual-arm routine reuses their PnP/AX=XB solving code
 directly, it doesn't replace or remove them.
 
+**Hand-guided alternative to step 1**: `capture_flange_poses_dual_handguided.py`
+does the same job as `capture_flange_poses_dual.py` but expects the arm to
+be physically hand-guided (gravity-compensation mode,
+`ros2 launch lbr_dual_arm_bringup calibration.launch.py`) instead of jogged
+in RViz, and additionally saves the joint configuration so step 2's replay
+reproduces the exact captured posture (not just an equivalent Cartesian
+pose) via joint-space MoveGroup goals. See
+[hand_guided_calibration.md](hand_guided_calibration.md) for the full
+writeup. The two capture scripts' outputs are not interchangeable for
+`autocalibrate_dual_realsense.py` — pick one and use it for both arms.
+
 ### 4.1 Bring everything up
 
 Real dual-arm hardware bringup (**not** `mock.launch.py` — Stage A/B need
 real, varied flange motion) plus MoveIt, in two terminals:
 
 ```bash
-# Terminal 1
-ros2 launch lbr_dual_arm_bringup hardware.launch.py
+# Terminal 1 — use_gripper defaults to true (Y-gripper attached); pass
+# use_gripper:=false for the bare flange instead.
+ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
 
-# Terminal 2
-ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true
+# Terminal 2 — use_gripper must match Terminal 1's value.
+ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true use_gripper:=true
 ```
 
 Then start the `LBRServer` app on **both** pendants (left, then right) to

@@ -1,24 +1,36 @@
 """Automatic dual-arm RealSense calibration -- Step 2 of the "turned up a
 notch" routine (see docs/getting_started_realsense.md section 4).
 
-Consumes the flange poses saved by capture_flange_poses_dual.py
+Consumes the flange poses saved by capture_flange_poses_dual_handguided.py
 (config/flange_poses/left.json, config/flange_poses/right.json -- 7 each
-recommended) and drives BOTH arms there automatically via MoveIt (single
-"both_arms" MoveGroup goal per pose-pair, see moveit_dual_arm.py), instead of
+recommended) and drives BOTH arms there automatically via MoveIt, instead of
 requiring an operator to jog the arm to each pose by hand like the original
 handeye_flange_cam_realsense.py / board_pose_from_flange_realsense.py.
 
+Replay is joint-space (JointTarget / move_to_joint(), a JointConstraint per
+joint -- see moveit_dual_arm.py), not Cartesian: it drives to the EXACT
+joint configuration recorded at capture time, not just some configuration
+MoveGroup's IK sampler finds that reaches an equivalent flange pose. This
+matters because the LBR arm is 7-DOF for a 6-DOF pose task, so a
+Cartesian-only replay could land the elbow somewhere different than it
+physically was during capture. Every capture used here therefore MUST have
+non-empty joint_positions (see _require_joint_positions below) -- captures
+made before that field existed, or via the old MoveIt-jogged
+capture_flange_poses_dual.py, don't have it and will be rejected with a
+clear error; re-capture with capture_flange_poses_dual_handguided.py.
+
 The checkerboard must stay fixed in the same place it was in during
-capture_flange_poses_dual.py for all of this to be valid -- these are the
-SAME physical poses, replayed, not new ones.
+capture_flange_poses_dual_handguided.py for all of this to be valid -- these
+are the SAME physical poses, replayed, not new ones.
 
 Three stages, run in order, each gated on the previous succeeding:
 
   Stage A -- Hand-eye (T_flange_cam), BOTH arms, jointly.
     Uses the first `--num-handeye-poses` (default 5) saved captures per arm.
-    For pose-pair i: moves arm_one to left capture[i] and arm_two to right
-    capture[i] in ONE simultaneous both_arms MoveGroup goal, waits for
-    settle, captures a checkerboard-in-camera PnP solve from EACH arm's own
+    For pose-pair i: moves arm_one to left capture[i]'s saved joint
+    configuration and arm_two to right capture[i]'s in ONE simultaneous
+    both_arms_flange MoveGroup goal (joint-space), waits for settle, captures a
+    checkerboard-in-camera PnP solve from EACH arm's own
     wrist RealSense, and stashes (T_armBase_flange, T_cam_board) pairs per
     arm exactly like handeye_flange_cam_realsense.py did manually. Once
     both arms have >= min samples, solves AX=XB independently per arm (the
@@ -35,8 +47,9 @@ Three stages, run in order, each gated on the previous succeeding:
     Runs only once BOTH cameras from Stage A have a real (non-identity)
     T_flange_cam. Uses the LAST `--num-board-poses` (default 2) saved
     captures per arm (4 samples total: 2 arms x 2 poses), moving each arm
-    to its saved pose (single-arm goals this time -- no need for
-    simultaneous motion since each sample only needs ONE camera) and
+    to its saved joint configuration (single-arm joint-space goals this
+    time -- no need for simultaneous motion since each sample only needs
+    ONE camera) and
     computing T_base_board = T_base_flange @ T_flange_cam @ T_cam_board per
     sample, same formula as board_pose_from_flange_realsense.py. All
     samples (both arms combined) are averaged together since they're all
@@ -58,7 +71,7 @@ Run (inside the 'vision' container), with lbr_dual_arm_bringup's
 hardware.launch.py AND move_group.launch.py already up (real hardware, not
 mock -- Stage A/B need real varied flange motion), the host camera stack
 (scripts/launch_host_realsense.sh) up, and the checkerboard placed exactly
-where it was during capture_flange_poses_dual.py:
+where it was during capture_flange_poses_dual_handguided.py:
 
     python3 -m src.calibration.autocalibrate_dual_realsense
 """
@@ -108,7 +121,7 @@ from src.calibration.board_pose_from_flange_realsense import (
     _rotation_matrix_to_rpy_deg,
     _save_sample_json as _save_board_sample_json,
 )
-from src.calibration.moveit_dual_arm import ArmTarget, DualArmMoveitClient
+from src.calibration.moveit_dual_arm import ArmTarget, DualArmMoveitClient, JointTarget
 from src.perception.ros.multicam_grabber_realsense import _pose_msg_to_se3
 from src.utils.robot_bases import get_active_robot_base, load_robot_bases
 from src.utils.se3 import SE3
@@ -228,6 +241,19 @@ class _DualArmCalibNode(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
 
+def _require_joint_positions(captures: list[FlangePoseCapture], arm_key: str) -> None:
+    missing = [c.idx for c in captures if not c.joint_positions]
+    if missing:
+        raise RuntimeError(
+            f"{arm_key}: capture idx={missing} have no saved joint_positions -- "
+            f"autocalibrate_dual_realsense.py drives to saved poses via joint-space "
+            f"MoveGroup goals (JointTarget), not Cartesian IK, so every capture used here "
+            f"needs joint_positions. These were likely captured before that field existed, "
+            f"or via the old MoveIt-jogged capture_flange_poses_dual.py -- re-capture with "
+            f"capture_flange_poses_dual_handguided.py."
+        )
+
+
 def _move_both_arms(
     node: _DualArmCalibNode,
     left_capture: FlangePoseCapture,
@@ -236,25 +262,27 @@ def _move_both_arms(
     left = ARM_KEYS["left"]
     right = ARM_KEYS["right"]
     targets = [
-        ArmTarget(
-            group_name=left["group_name"], base_frame=left["base_frame"],
-            tip_link=left["flange_frame"], T_armBase_flange=left_capture.T_armBase_flange,
+        JointTarget(
+            group_name=left["group_name"], joint_positions=left_capture.joint_positions,
+            label=f"left idx={left_capture.idx}",
         ),
-        ArmTarget(
-            group_name=right["group_name"], base_frame=right["base_frame"],
-            tip_link=right["flange_frame"], T_armBase_flange=right_capture.T_armBase_flange,
+        JointTarget(
+            group_name=right["group_name"], joint_positions=right_capture.joint_positions,
+            label=f"right idx={right_capture.idx}",
         ),
     ]
-    return node.moveit.move_to(targets, group_name="both_arms")
+    ok, _record = node.moveit.move_to_joint(targets, group_name="both_arms_flange")
+    return ok
 
 
 def _move_single_arm(node: _DualArmCalibNode, arm_key: str, capture: FlangePoseCapture) -> bool:
     arm = ARM_KEYS[arm_key]
-    target = ArmTarget(
-        group_name=arm["group_name"], base_frame=arm["base_frame"],
-        tip_link=arm["flange_frame"], T_armBase_flange=capture.T_armBase_flange,
+    target = JointTarget(
+        group_name=arm["group_name"], joint_positions=capture.joint_positions,
+        label=f"{arm_key} idx={capture.idx}",
     )
-    return node.moveit.move_to([target])
+    ok, _record = node.moveit.move_to_joint([target])
+    return ok
 
 
 def _try_capture_board_from_cam(
@@ -291,7 +319,7 @@ def _run_stage_a_handeye(
     if n_pairs < min_samples:
         raise RuntimeError(
             f"Not enough hand-eye pose pairs: have {n_pairs}, need >= {min_samples} per arm. "
-            f"Run capture_flange_poses_dual.py for both arms first."
+            f"Run capture_flange_poses_dual_handguided.py for both arms first."
         )
 
     debug_dirs = {
@@ -305,10 +333,10 @@ def _run_stage_a_handeye(
 
     for i in range(n_pairs):
         left_cap, right_cap = left_poses[i], right_poses[i]
-        print(f"\n[pair {i + 1}/{n_pairs}] moving both arms simultaneously (both_arms goal)...")
+        print(f"\n[pair {i + 1}/{n_pairs}] moving both arms simultaneously (both_arms_flange goal)...")
         if not _move_both_arms(node, left_cap, right_cap):
             raise RuntimeError(
-                f"MoveGroup failed to reach pose pair {i} for both_arms -- aborting Stage A."
+                f"MoveGroup failed to reach pose pair {i} for both_arms_flange -- aborting Stage A."
             )
         node.spin_briefly(SETTLE_S)
 
@@ -554,6 +582,11 @@ def main() -> None:
     left_board = left_all[args.num_handeye_poses: args.num_handeye_poses + args.num_board_poses]
     right_board = right_all[args.num_handeye_poses: args.num_handeye_poses + args.num_board_poses]
 
+    _require_joint_positions(left_handeye, "left")
+    _require_joint_positions(right_handeye, "right")
+    _require_joint_positions(left_board, "left")
+    _require_joint_positions(right_board, "right")
+
     rclpy.init()
     node = _DualArmCalibNode(publish_debug=not args.no_debug_topic, robot_namespace=args.robot_namespace)
 
@@ -586,9 +619,9 @@ def main() -> None:
             tip_link=ARM_KEYS["right"]["flange_frame"], T_armBase_flange=right_handeye[0].T_armBase_flange,
         ),
     ]
-    if not node.moveit.wait_for_valid_state(probe_targets, group_name="both_arms"):
+    if not node.moveit.wait_for_valid_state(probe_targets, group_name="both_arms_flange"):
         raise RuntimeError(
-            "move_group never became ready to plan for 'both_arms' -- see the "
+            "move_group never became ready to plan for 'both_arms_flange' -- see the "
             "warnings above and move_group's own ~/.ros/log/move_group_*.log for "
             "the real reason (dirty robot state vs. an actual planning failure "
             "on pose-pair 0)."

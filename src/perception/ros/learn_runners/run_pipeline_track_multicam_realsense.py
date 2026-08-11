@@ -27,6 +27,7 @@ import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped
 from moveit_msgs.msg import CollisionObject, PlanningScene, PlanningSceneWorld
 from shape_msgs.msg import Mesh, MeshTriangle
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -1172,12 +1173,24 @@ class FoundationPoseTrackerNode(Node):
         # All models are loaded above and stay resident for the node's lifetime.
         # `_tracking_active` gates only the tick's detect/track work, so start/stop
         # via the services below never touches SAM/DINO/GDINO/FoundationPose/Cutie.
+        #
+        # _tick runs in the node's default (mutually-exclusive) callback group and
+        # can block for a long time doing GPU work; without their own reentrant
+        # group these service callbacks would queue behind it on every executor
+        # thread and could time out on the client side before ever running.
+        self._tracking_control_cbgroup = ReentrantCallbackGroup()
         self._tracking_active = not bool(getattr(args, "start_paused", False))
         self._set_tracking_active_srv = self.create_service(
-            SetBool, "~/set_tracking_active", self._on_set_tracking_active
+            SetBool,
+            "~/set_tracking_active",
+            self._on_set_tracking_active,
+            callback_group=self._tracking_control_cbgroup,
         )
         self._reset_tracking_srv = self.create_service(
-            Trigger, "~/reset_tracking", self._on_reset_tracking
+            Trigger,
+            "~/reset_tracking",
+            self._on_reset_tracking,
+            callback_group=self._tracking_control_cbgroup,
         )
 
         # Timer drives the init/track state machine; the grabber runs in the same executor.
@@ -4575,12 +4588,34 @@ class FoundationPoseTrackerNode(Node):
             self._track_id_to_object_id.pop(tid, None)
         self._force_reinit_tracks.clear()
 
+    def _wait_until_tick_idle(self, timeout_s: float = 5.0) -> bool:
+        """Block (this callback's own thread only) until a concurrently running
+        _tick finishes, so service handlers never mutate track_states/Cutie
+        sessions/etc. while _tick is mid-read of the same structures. Setting
+        _tracking_active False first (done by callers) stops any *new* tick
+        from starting, so this only ever waits out a tick already in flight."""
+        deadline = time.time() + timeout_s
+        while self.busy:
+            if time.time() > deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
     def _on_set_tracking_active(self, request, response):
         """SetBool service: start (True) or stop (False) the tick's detect/track
         work in place. Models stay loaded, so restarting is instant."""
         was_active = self._tracking_active
         self._tracking_active = bool(request.data)
         if was_active and not self._tracking_active:
+            if not self._wait_until_tick_idle():
+                self.get_logger().warn(
+                    "Timed out waiting for in-flight tick before stopping; "
+                    "state was left untouched, retry the call"
+                )
+                self._tracking_active = was_active
+                response.success = False
+                response.message = "timed out waiting for in-flight tick"
+                return response
             self._clear_all_tracking_state(self.get_clock().now().to_msg())
             self.get_logger().info("Tracking stopped (models kept resident)")
         elif not was_active and self._tracking_active:
@@ -4592,7 +4627,19 @@ class FoundationPoseTrackerNode(Node):
     def _on_reset_tracking(self, request, response):
         """Trigger service: clear all track state/identities without changing
         the start/stop flag, so the next active tick re-runs multicam init."""
+        was_active = self._tracking_active
+        self._tracking_active = False
+        if not self._wait_until_tick_idle():
+            self.get_logger().warn(
+                "Timed out waiting for in-flight tick before resetting; "
+                "state was left untouched, retry the call"
+            )
+            self._tracking_active = was_active
+            response.success = False
+            response.message = "timed out waiting for in-flight tick"
+            return response
         self._clear_all_tracking_state(self.get_clock().now().to_msg())
+        self._tracking_active = was_active
         self.get_logger().info("Tracking state reset")
         response.success = True
         response.message = "tracking state cleared"

@@ -59,55 +59,82 @@ compatibility symlink once inside the container:
 ln -sfn /workspace/Masterthesis-vision /workspace/MasterThesis
 ```
 
-## One-Time Container Builds
+## How these submodules actually get imported
 
-The Docker image provides `/opt/thesis-venv`, Torch, PyTorch3D, nvdiffrast, ROS 2
-Humble, and the common Python dependencies. After the container is created and
-the repo is mounted, run the repo-local setup once inside the container:
+None of these repos are meant to be `pip install`-ed the normal way (which would
+try to pull their own pinned torch/numpy/etc. and clash with the versions this
+project actually runs — see [Dockerfile.thesisnewcuda](../Dockerfile.thesisnewcuda)).
+Instead:
+
+| Repo | How it becomes importable |
+|------|---------------------------|
+| `external/FoundationPose` | No `setup.py`. Imported by adding the repo root to `sys.path` at runtime — see `_ensure_repo_on_path()` in [../src/perception/learned/FP/pose_foundation.py](../src/perception/learned/FP/pose_foundation.py). |
+| `external/Cutie` | Same pattern, done at import time in [../src/perception/tracking/cutie_tracker.py](../src/perception/tracking/cutie_tracker.py) (module-level `sys.path.insert` before any `cutie.*` import). |
+| `external/sam2` | Has a real `setup.py`, so it's `pip install`-ed **editable**, **without its pinned deps** (see below). |
+| `external/dinov2` | Built via `colcon build` (it's set up as an `ament_python`-identifiable package) — see the workspace build step below. |
+
+Because `FoundationPose`/`Cutie` rely on `sys.path` tricks against the *live*
+checkout and `sam2` is installed *editable*, none of this can happen at `docker
+build` time — the Dockerfile has no `COPY`, the repo only exists inside the
+container via the runtime bind mount (`-v <repo>:/workspace/MasterThesis`). So
+after the container is up, from `/workspace/MasterThesis`, run once (or after any
+`external/` update):
 
 ```bash
-ln -sfn /workspace/Masterthesis-vision /workspace/MasterThesis
-
-cd /workspace/Masterthesis-vision
-source /opt/ros/humble/setup.bash
-source /opt/thesis-venv/bin/activate
-
 pip install --no-deps -e external/sam2
+```
 
-cd external/FoundationPose
-bash build_all_conda.sh
-cd /workspace/Masterthesis-vision
+`--no-deps` is deliberate: `sam2`'s `setup.py` pins `torch>=2.5.1` etc., which our
+installed torch/numpy already satisfy — letting pip resolve deps here risks it
+touching versions the rest of the stack depends on.
 
-colcon build --packages-select fp_debug_msgs
+### The venv: why `--system-site-packages`
+
+`/opt/thesis-venv` (created in the Dockerfile) uses
+`python3 -m venv --system-site-packages`, not a fully isolated venv. This is
+required for ROS 2: `rclpy`, `catkin_pkg`, `ament_index_python`, and the
+`rosidl`/`colcon` build tooling are apt/Debian packages installed against the
+*system* Python (`/usr/lib/python3/dist-packages`), not pip packages — there's no
+supported way to `pip install rclpy`. A normal isolated venv can't see any of
+that. `--system-site-packages` lets the venv layer the pip-only ML stack (torch,
+open3d, sam2, ...) on top of the system ROS install instead of replacing it.
+
+The cost: pip packages in the venv can shadow apt packages of the same import
+name with a different, possibly incompatible, build. This already bit us once —
+apt's `python3-opencv` (built against system NumPy 1.21) got shadowed by pip's
+NumPy 2.x, crashing `cv2` on import (`_ARRAY_API not found`). Fixed by installing
+`opencv-python` from pip too, so both `cv2` and `numpy` resolve to matching pip
+builds. If a similar "works on host, breaks in container" or
+`AttributeError: module 'X' has no attribute 'Y'` shows up for a package that
+exists both via apt and pip, suspect this shadowing first.
+
+### `mycpp` and `fp_debug_msgs`: build inside the container, not the host
+
+`external/FoundationPose/mycpp` (a pybind11 module) and `../src/fp_debug_msgs`
+(a ROS 2 `rosidl` message package) are `colcon`-built, ROS-style packages. They
+**must** be built inside the container, from the container's own path
+(`/workspace/MasterThesis`), not on the host:
+
+```bash
+cd /workspace/MasterThesis
+colcon build
 source install/setup.bash
 ```
 
-Use `build_all_conda.sh` for FoundationPose even though the environment is a
-venv; the upstream `build_all.sh` assumes the original FoundationPose `/kaolin`
-Docker layout. The script builds FoundationPose's local C++/CUDA helpers,
-including the `mycpp` module imported by `Utils.py`.
+Building on the host instead bakes host paths (e.g.
+`/home/<user>/Masterthesis-vision/...`) into `build/*/CMakeCache.txt`, which then
+breaks (`CMake Error: ... directory ... is different than the directory ...
+where CMakeCache.txt was created`) the next time `colcon build` runs inside the
+container, since the mount point differs
+(`/workspace/MasterThesis` ≠ the host path). If you hit that error, wipe and
+rebuild clean inside the container:
 
-`external/COLCON_IGNORE` is tracked on purpose. It prevents `colcon build` from
-trying to identify or build all third-party code under `external/`; only this
-repo's ROS packages, such as `src/fp_debug_msgs`, should be built by colcon.
-The resulting git-ignored `install/` directory is also sourced by the host launch
-scripts so their visualizer windows can import `fp_debug_msgs`.
-
-## Python Environment
-
-`/opt/thesis-venv` is created in the Dockerfile with:
-
-```text
-python3 -m venv --system-site-packages /opt/thesis-venv
+```bash
+rm -rf build install log
+colcon build
 ```
 
-That is intentional. ROS Python packages such as `rclpy`,
-`ament_index_python`, and the `rosidl` tooling come from Ubuntu/ROS apt packages
-in the system Python. The venv layers the pip ML stack on top while still seeing
-those ROS packages.
-
-## Weights
-
-Model weights are not stored in git. The main README lists the download links
-and exact target paths for SAM2, FoundationPose, Cutie, DINOv2, and
-Grounding-DINO.
+`external/sam2` and `external/FoundationPose/bundlesdf/mycuda` carry
+`COLCON_IGNORE` markers (untracked, container-local files — not committed to the
+submodules) so `colcon build` doesn't also try and fail to identify them as
+colcon packages; they're installed via pip/sys.path as described above instead.

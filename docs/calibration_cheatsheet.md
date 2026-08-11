@@ -12,12 +12,22 @@ squares) is on hand, and you're starting from nothing running.
 
 ```bash
 # Terminal 1 — hardware interface (both arms)
-ros2 launch lbr_dual_arm_bringup hardware.launch.py
+# use_gripper defaults to true (Y-gripper attached, arm_one/arm_two tipped at
+# the gripper TCP); pass use_gripper:=false for the bare flange instead.
+#
+# Default Step 1 (admittance-guided capture): swap this for
+#   ros2 launch lbr_dual_arm_bringup admittance.launch.py use_gripper:=true
+# instead — see Step 1 below. hardware.launch.py is only needed here for the
+# RViz-jogging alternative (and always for Step 2's replay).
+ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
 ```
 
 ```bash
-# Terminal 2 — MoveIt + RViz (needed for Step 1 jogging AND Step 2's automatic moves)
-ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true
+# Terminal 2 — MoveIt + RViz (needed for Step 1 RViz-jogging AND Step 2's
+# automatic moves; NOT needed for the default admittance-guided or
+# gravity-compensation hand-guided Step 1 alternatives).
+# use_gripper must match Terminal 1's value.
+ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true use_gripper:=true
 ```
 
 Then on **both pendants** (left first, then right): start the `LBRServer` app
@@ -45,25 +55,72 @@ can see it and **do not move it again** until Step 2 finishes.
 
 ## 1. Capture flange poses (manual, ~5 min per arm)
 
+**Default: admittance-guided capture.** Bring the rig up in software-
+admittance mode (position interface, no torque mode needed) instead of
+`hardware.launch.py`:
+
+```bash
+ros2 launch lbr_dual_arm_bringup admittance.launch.py use_gripper:=true
+```
+
 Inside the `vision` container:
 
 ```bash
-python3 -m src.calibration.capture_flange_poses_dual --arm left
+python3 -m src.calibration.capture_flange_poses_dual_admittance --arm left
 ```
 
-For each of 7 prompts: jog the **left** arm in RViz's MotionPlanning panel
-(drag marker → **Plan & Execute**) to a pose where the checkerboard is fully
-visible to `realsense_1`, vary orientation on at least the first 5, let it
-settle, press **Enter**.
+This script runs the admittance control loop itself for the whole session —
+**only the arm you passed `--arm` for is compliant** (the other arm's
+position controller just holds its last commanded pose; running both arms'
+admittance loops concurrently was found to roughly halve the achievable
+control-loop rate for the arm you're actually guiding, which is what made
+it feel stuck/rigid before this fix). For each of 7 prompts: physically
+push the **left** arm to a pose where the checkerboard is fully visible to
+`realsense_1`, vary orientation on at least the first 5, let it settle,
+press **Enter**.
+
+Ctrl-C when done with the left arm, then (either in the same terminal or a
+fresh launch of `admittance.launch.py` — a completely separate session is
+fine, nothing carries over between arms):
 
 ```bash
-python3 -m src.calibration.capture_flange_poses_dual --arm right
+python3 -m src.calibration.capture_flange_poses_dual_admittance --arm right
 ```
 
-Same again for the **right** arm / `realsense_2`.
+Same again for the **right** arm / `realsense_2`. This is the standard
+routine: **one arm at a time, left then right**, and it's fine to split
+across two entirely separate launch sessions rather than one continuous
+one. Add `--gain-profile insertion` to either command if the default
+("holding") still feels too stiff. Also saves the joint configuration
+alongside the Cartesian pose, so
+Step 2's replay reproduces the exact captured posture (see
+[calibration_control_modes.md §3](calibration_control_modes.md#3-admittance--force-driven-compliance-on-the-position-interface)).
 
 ✅ Checkpoint: `config/flange_poses/left.json` and `right.json` each have 7
 entries. (`--append` if you need to add more later without starting over.)
+
+**Alternatives**, both still supported — pick one and use it for both arms
+(captures from different capture scripts are not interchangeable, see
+below):
+
+- **RViz jogging** (the original flow): bring up `hardware.launch.py` +
+  `move_group.launch.py` (Step 0 above) and run
+  `python3 -m src.calibration.capture_flange_poses_dual --arm left` — for
+  each prompt, drag the interactive marker in RViz's MotionPlanning panel
+  and click **Plan & Execute** instead of physically pushing the arm.
+- **Gravity-compensation hand-guiding**: bring the rig up in gravity-
+  compensation mode (`ros2 launch lbr_dual_arm_bringup calibration.launch.py`)
+  and physically push each arm into place, then run
+  `python3 -m src.calibration.capture_flange_poses_dual_handguided --arm left`
+  (same for `right`) — same interaction as admittance-guided capture, just
+  torque-mode compliance from the hardware controller instead of the
+  software admittance loop.
+
+`capture_flange_poses_dual_admittance.py` and
+`capture_flange_poses_dual_handguided.py` both save joint positions (unlike
+`capture_flange_poses_dual.py`'s plain RViz-jogging captures) — required by
+`autocalibrate_dual_realsense.py`'s joint-space replay (see
+[hand_guided_calibration.md](hand_guided_calibration.md)).
 
 ---
 
