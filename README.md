@@ -20,13 +20,6 @@ that publishes a canonical pose per object in the **robot base frame**.
 > for the full step-by-step run sequence, or [§6 below](#6-realsense-trio-variant)
 > for a quick reference — a separate, parallel pipeline (own
 > scripts/config/launch files); nothing above is affected by it.
->
-> **Just want to view tracked objects / camera poses in RViz?** See
-> **[docs/visualization.md](docs/visualization.md)** for the MoveIt2 planning
-> scene view and camera-extrinsics TF frames — the 2D per-camera overlays
-> (Foxglove) are covered in
-> [docs/getting_started.md §1](docs/getting_started.md#watch-the-result-in-foxglove)
-> instead.
 
 ---
 
@@ -51,9 +44,8 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **N-camera extrinsic calibration** (checkerboard → base frame) — see §4. Defaults to the 3-ZED trio; accepts `--cam-ids` for any subset (e.g. the RealSense-trio rig's single `zed2i_1`). |
 | [src/calibration/io_extrinsics.py](src/calibration/io_extrinsics.py) | Load/save extrinsics YAML (`R` row-major + `t`) ↔ `SE3`. |
 | [src/calibration/capture_flange_poses_dual.py](src/calibration/capture_flange_poses_dual.py) | Dual-arm calibration, Step 1 (manual): jog + save each arm's flange poses permanently to `config/flange_poses/` — see §6. |
-| [src/calibration/capture_flange_poses_dual_handguided.py](src/calibration/capture_flange_poses_dual_handguided.py) | Step 1's hand-guided twin: gravity-compensation bring-up instead of RViz jogging, also saves the joint configuration — see [docs/hand_guided_calibration.md](docs/hand_guided_calibration.md). |
 | [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Step 2 (automatic): replays the saved poses to solve hand-eye + checkerboard pose + ZED extrinsic — see §6. |
-| [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above); Cartesian (`ArmTarget`/`move_to()`) and joint-space (`JointTarget`/`move_to_joint()`) goal types. |
+| [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above). |
 | [src/calibration/flange_pose_store.py](src/calibration/flange_pose_store.py) | JSON schema + save/load for the permanently-stored flange pose captures. |
 | [src/calibration/calibration_log.py](src/calibration/calibration_log.py) | Append-only JSON run logs (camera/checkerboard/flange transforms + quality metrics) under `outputs/calibration_logs/`. |
 | [src/utils/se3.py](src/utils/se3.py) | Minimal immutable `SE3` rigid-transform type. |
@@ -371,6 +363,43 @@ and pose. The assembly-name grouping (`cooling_manifold`, `plumbers_block`) is
 optional structure for organizing parts on disk — objects without a known
 assembly prefix are read directly from the `Data/*` root instead.
 
+### 2.4 Model weights and checkpoints
+
+These files are not committed. Download them once on a new workstation before
+the first pipeline run:
+
+| Component | Download source | Put it here |
+|---|---|---|
+| SAM2.1 | `cd external/sam2/checkpoints && ./download_ckpts.sh`, or direct base-plus checkpoint: <https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt> | `external/sam2/checkpoints/sam2.1_hiera_base_plus.pt` (the script downloads the other SAM2.1 sizes too, which is fine) |
+| FoundationPose | Official weights folder: <https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i?usp=sharing> | `external/FoundationPose/weights/2023-10-28-18-33-37/{config.yml,model_best.pth}` and `external/FoundationPose/weights/2024-01-11-20-02-45/{config.yml,model_best.pth}` |
+| Cutie | `python external/Cutie/cutie/utils/download_models.py`, or GitHub release files: <https://github.com/hkchengrex/Cutie/releases/download/v1.0/cutie-base-mega.pth> and <https://github.com/hkchengrex/Cutie/releases/download/v1.0/coco_lvis_h18_itermask.pth> | `external/Cutie/weights/cutie-base-mega.pth` and `external/Cutie/weights/coco_lvis_h18_itermask.pth` |
+| DINOv2 | Loaded by `torch.hub` from `facebookresearch/dinov2`; default pipeline model is `dinov2_vitg14`, whose backbone URL resolves to <https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_pretrain.pth> | No repo placement. It lands in the container's Torch cache, usually under `/root/.cache/torch/hub/checkpoints/`. |
+| Grounding-DINO | Hugging Face model id <https://huggingface.co/IDEA-Research/grounding-dino-base> | No repo placement. It lands in the container's Hugging Face cache, usually under `/root/.cache/huggingface/`. |
+
+The first run on a fresh machine can be slow even after the model checkpoints are
+downloaded. DINOv2 builds the reference bank by encoding every image in
+`Data/ZED_screens` (and optionally `Data/reference_renders`). The resulting cache
+is written next to the reference images as `_embedding_cache...npz`; later runs
+reuse it unless the reference images, model name, embedding mode, or render source
+change.
+
+### 2.5 Hardcoded paths and workstation-specific settings
+
+Review these on a new workstation:
+
+| Where | Default / assumption | Change when |
+|---|---|---|
+| Docker mount | `/workspace/Masterthesis-vision` | Keep this as the canonical container repo path. The current launch scripts still use `/workspace/MasterThesis`, so create the mandatory symlink shown above. |
+| Pipeline scripts | [scripts/launch_pipeline.sh](scripts/launch_pipeline.sh) and [scripts/launch_pipeline_realsense.sh](scripts/launch_pipeline_realsense.sh) source `/opt/thesis-venv/bin/activate` and the repo's `install/setup.bash` inside Docker | Only if the container path or venv path changes. |
+| Host scripts | [scripts/launch_host.sh](scripts/launch_host.sh) and [scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh) source host ROS overlays under `$HOME/..._ws/install/setup.bash` | If the host camera/robot workspace lives somewhere else. |
+| `mv_launch` ZED override file | The zipped launch files point `override_path` at `/home/pdzuser/zed_ros2_ws/src/mv_launch/config/zed_override_native.yaml` | If the host username or workspace path is different. |
+| RealSense/ZED serials | `ZED_SERIAL`, `RS1_SERIAL`, `RS2_SERIAL` defaults in [scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh) | If a physical camera is replaced or USB serial mapping changes. |
+| Object assets | `--cad-dir Data/CAD_Models_centered`, `--reference-dir Data/ZED_screens`, `--reference-renders-dir Data/reference_renders` | If `Data/` is stored elsewhere; otherwise leave defaults. |
+| Part ID mapping | `--assembly-part-ids-config Data/assembly_part_ids.json` | If you need Fabrica-style `part_id` values. If the file is absent, the code still runs but unknown slots publish `part_id=-1`. |
+| Calibration files | `config/camera_extrinsics_base.yaml`, `config/camera_extrinsics_realsense.yaml`, `config/base_board_pose.yaml`, `config/robot_bases.yaml`, `config/flange_poses/*.json` | When cameras, checkerboard placement, active robot, robot-base offset, or RealSense hand-eye calibration change. |
+| ROS topics | Camera topic defaults live in `ALL_CAMERAS` inside the pipeline runners and in the visualizer commands inside the host launch scripts | If camera driver namespaces or launch files change. |
+| Remote lab info | `docs/getting_started.md` mentions the lab PC address and SSH user | If you clone to a different workstation or network. |
+
 ---
 
 ## 3. Running the pipeline
@@ -387,7 +416,6 @@ Foxglove bridge, a `visualize_pipeline` per camera, and `debug_pose_axes`.
 scripts/launch_host.sh            # start (and attach) the tmux session
 scripts/launch_host.sh attach     # re-attach if already running
 scripts/launch_host.sh stop       # kill the session
-scripts/launch_host.sh calibrate  # same, but ZEDs grab/publish at HD2K/15fps (see §4)
 ```
 
 tmux: `Ctrl+b` then `0..5` to switch windows, `Ctrl+b d` to detach.
@@ -465,25 +493,6 @@ the cameras move:
 ```bash
 scripts/launch_host.sh          # window 0 runs the ZED driver
 ```
-
-   For better checkerboard corner detection, launch with `calibrate` instead —
-   this grabs/publishes at the ZED2i's HD2K resolution (2208x1242 @ 15fps)
-   rather than the normal HD1080 @ 30fps used for tracking:
-
-```bash
-scripts/launch_host.sh calibrate    # same tmux session, cameras at HD2K/15fps
-```
-
-   Under the hood this passes `override_path:=config/zed_override_2k.yaml`
-   (vs. the default `config/zed_override_native.yaml`) to
-   `mv_launch`'s `zed2i_pair.launch.py` — both files live in the separate
-   `~/franka_ros2_ws` ROS workspace, not this repo. Equivalent to setting
-   `CALIBRATE_2K=1 scripts/launch_host.sh`.
-
-   If a camera fails to open (`CAMERA NOT DETECTED` in the `cams` window —
-   USB enumeration flakiness happens), calibrate with just the cameras that
-   came up, e.g. `--cam-ids zed2i_2 zed2i_3` in step 3 below (see
-   `base_to_cams_calib_3.py --help`; any subset of size N≥1 works).
 
 **2. Set the board pose** in
    [config/base_board_pose.yaml](config/base_board_pose.yaml): the translation
@@ -578,15 +587,11 @@ python3 -m src.calibration.autocalibrate_dual_realsense
 
 Step 1 still needs jogging the arm interactively via MoveIt between samples;
 see **[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for
-that part — or skip jogging entirely with the hand-guided alternative
-(gravity-compensation bring-up + `capture_flange_poses_dual_handguided.py`),
-see **[docs/hand_guided_calibration.md](docs/hand_guided_calibration.md)**.
-Step 2 needs no jogging — it drives both arms itself over the
+that part. Step 2 needs no jogging — it drives both arms itself over the
 `moveit_msgs/action/MoveGroup` action (see
 [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py)),
-including one simultaneous `both_arms_flange` goal per pose-pair for the
-hand-eye stage (calibration always targets the bare flange, regardless of
-whether the Y-gripper is attached — see `moveit_dual_arm.py`'s docstring).
+including one simultaneous `both_arms` goal per pose-pair for the hand-eye
+stage.
 
 The original single-arm, single-camera manual scripts
 (`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`)
@@ -599,33 +604,66 @@ still work standalone — see
 
 Both pipeline runners (`run_pipeline_track_multicam.py` and the RealSense
 variant) publish each tracked part as a `moveit_msgs/CollisionObject` on
-`/planning_scene`, plus each camera's calibrated pose as a static TF frame —
-so RViz can show the tracked parts and cameras alongside a mock robot without
-any real hardware.
+`/planning_scene`, in addition to the existing pose topics. The mesh geometry
+(from `Data/CAD_Models_centered/`) is embedded directly in the message — a
+subscriber (RViz, `move_group`, ...) needs no filesystem access to the CAD
+files at all.
 
-See **[docs/visualization.md](docs/visualization.md)** for the full guide:
-what gets published and why, how to bring up the RViz scene view with
-[scripts/view_scene.sh](scripts/view_scene.sh), and how to view/check the
-camera extrinsics as TF frames.
-If you need the other robot's frame, pass a different `--base-yaml`.
+- **Identity**: each object is keyed `"{assembly_name}/{part_id}"` (e.g.
+  `plumbers_block/0`), matching the same identity already used for the
+  `pub_fused_assembly` pose topic. Repeated same-mesh parts (e.g. multiple
+  `pb_screw` instances) get one distinct `CollisionObject` per slot, all
+  sharing the same mesh geometry.
+- **Frame**: every `CollisionObject` header uses a fixed frame name from
+  `--planning-scene-frame-id` (default `world`) — **not** a tf2 lookup. Set
+  this to whatever frame your robot/world is actually spawned under if it
+  isn't `world`.
+- **Non-blocking, fail-soft**: publishing is a plain topic publish (never a
+  blocking service call), and `_publish_planning_scene_object`/
+  `_remove_planning_scene_objects` swallow all failures internally (missing
+  mesh, bad pose, publish error) after logging once — a problem here never
+  slows or crashes the detection/tracking loop.
+- **Removal**: when a track's `pose_status` transitions to `lost` (see
+  `_tick()`'s `_force_reinit_tracks` handling), its `CollisionObject` is
+  retracted from the scene with a `REMOVE` op.
 
----
+### Viewing it in RViz
 
-## 8. Compliant control (Cartesian impedance / admittance)
+RViz's `PlanningScene`/`MotionPlanning` display needs a `robot_description`
+to initialize against, and needs a `move_group` (or similar) already
+maintaining a base scene before it can apply our `is_diff:=true` updates —
+otherwise it reports "no planning scene loaded" even though the topic is
+publishing correctly. There's no need for the real robot hardware for any of
+this — a mock robot is enough.
 
-Two additive execution paths for the dual-arm rig, alongside the
-position-controlled MoveGroup pipeline above — a torque-mode Cartesian
-impedance controller with runtime-adjustable gains, and a software
-admittance loop on the position interface. See
-**[docs/compliant_control.md](docs/compliant_control.md)** for bring-up
-commands, the client APIs
-(`src/calibration/cartesian_impedance_dual_arm.py`,
-`src/calibration/admittance_dual_arm.py`), named gain profiles, and known
-caveats.
+[scripts/launch_moveit_scene_viewer.launch.py](scripts/launch_moveit_scene_viewer.launch.py)
+bundles a mock `iiwa7`, `move_group`, and RViz together for exactly this:
 
-**New to these modes, or picking one for a calibration session?** Start
-with **[docs/calibration_control_modes.md](docs/calibration_control_modes.md)**
-instead — a walkthrough of all three dual-arm control modes (gravity
-compensation, Cartesian impedance, admittance) side by side: what each
-does, when to reach for it, and how each fits (or doesn't yet) into the
-existing calibration routine.
+```bash
+source /opt/ros/humble/setup.bash
+source ~/franka_ros2_ws/install/setup.bash   # wherever the lbr_fri_ros2_stack workspace lives
+ros2 launch /path/to/Masterthesis-vision/scripts/launch_moveit_scene_viewer.launch.py
+```
+
+Then in RViz: **Add → By display type → moveit_ros_visualization →
+PlanningScene**, and set its **Planning Scene Topic** to `/planning_scene`.
+Fixed Frame is already `world` in the bundled RViz config, matching
+`--planning-scene-frame-id`'s default.
+
+Notes/quirks (already hit and fixed once, so no need to rediscover them):
+- `lbr_bringup`'s own `move_group.launch.py`/`rviz.launch.py` don't expose a
+  namespace argument, but the mock robot (`lbr_bringup mock.launch.py`) runs
+  everything under `/lbr` — the bundled launch file builds `move_group`/RViz
+  as raw `Node` actions with `namespace="lbr"` instead of including those
+  launch files directly.
+- Namespacing `move_group` under `/lbr` also remaps its `/planning_scene`
+  subscription to `/lbr/planning_scene` by default, disconnecting it from the
+  bare `/planning_scene` topic the pipeline publishes on — the bundled launch
+  file remaps it back explicitly (`("/lbr/planning_scene", "/planning_scene")`,
+  same for `monitored_planning_scene`/`planning_scene_world`/
+  `collision_object`/`attached_collision_object`).
+- Collision meshes render with flat per-triangle shading that shifts as you
+  orbit the camera (`shape_msgs/Mesh` carries no vertex normals) — this is a
+  cosmetic limitation of RViz's collision-object rendering, not a sign of bad
+  geometry or a wrong pose; it doesn't affect MoveIt's actual collision
+  checking, which uses the raw triangle mesh directly.
