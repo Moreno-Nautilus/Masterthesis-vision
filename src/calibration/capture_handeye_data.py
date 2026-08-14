@@ -38,7 +38,7 @@ for the full walkthrough; this docstring covers the flag semantics.
     Ignored (with a note printed) when --mode replay -- replay always drives
     via MoveIt joint-space goals regardless.
 
---mode {interactive,replay} (default: interactive)
+--mode {interactive,replay,augment} (default: interactive)
     interactive -- operator positions the arm (per --controller above),
         presses Enter, script captures. This is how you build up the
         initial pose set.
@@ -57,6 +57,46 @@ for the full walkthrough; this docstring covers the flag semantics.
         interactive-mode session's joint_positions to replay from. Needs
         `ros2 launch lbr_dual_arm_bringup hardware.launch.py` +
         `move_group.launch.py` up (same as --controller moveit).
+    augment -- STANDARD way to grow a small interactive-mode pose set into a
+        well-conditioned one, no manual positioning. APPEND-ONLY: every
+        already-saved pose for the arm is kept in config/flange_poses/<arm>.json
+        no matter what happens this run -- nothing is ever removed,
+        renumbered, or randomly downsampled, even if --target-samples is
+        below the known count or a known pose stops detecting the
+        checkerboard. Per arm: (1) replay every already-saved pose exactly
+        like --mode replay and re-detect the checkerboard at each; a hit
+        refreshes that pose's debug hand-eye sample in place (same idx --
+        the checkerboard may have moved since first capture) and becomes an
+        anchor for step 2, a miss just leaves that pose/sample untouched;
+        (2) if the known count is still below --target-samples, repeatedly
+        perturb the MOST RECENTLY accepted anchor pose (the last known-good
+        one first, then whichever perturbation was just accepted -- NOT a
+        random pick across the whole anchor pool, so consecutive IK targets
+        stay close together and don't force large joint-space swings /
+        near-limit detours on this redundant 7-DOF arm) by a small random
+        Cartesian offset (+/-3cm per translation axis, +/-7deg per
+        rotation axis -- see pose_augmentation.py), drive there via IK
+        seeded from the arm's current joint state
+        (DualArmMoveitClient.move_to_seeded -- see that method's docstring
+        for why: MoveGroup's own Cartesian-goal IK sampler seeds each
+        attempt from a RANDOM state, which can pick a completely different
+        elbow/null-space solution for this redundant 7-DOF arm even for a
+        tiny Cartesian offset, producing a large, visually pointless
+        joint-space move; seeding from the current state instead keeps the
+        IK solution -- and therefore the executed motion -- close to where
+        the arm already is), and attempt a detection; a hit is appended
+        with a fresh idx (added to the anchor pool too), a miss is
+        discarded and a new perturbation is drawn, until --target-samples
+        total is reached (or the attempt budget runs out) -- if the known
+        count already meets or exceeds --target-samples, this step is
+        skipped entirely. Both config/flange_poses/<arm>.json and
+        outputs/calibration_debug/handeye/<cam_id>/ are saved after every
+        appended sample (never lose a sample to a crash); the pre-run
+        content is snapshotted (copied, not moved) up front purely as an
+        extra backup, since the live files are never at risk of going
+        missing. Same prerequisites as replay. Works with however many arms
+        are actually connected -- pass --arm left/right/both as
+        appropriate; each arm's augmentation is independent.
 
 What gets saved, every accepted sample, both modes:
   1. config/flange_poses/<arm>.json (flange_pose_store.FlangePoseCapture --
@@ -101,6 +141,10 @@ Run (inside the 'vision' container):
 
     # Checkerboard moved slightly -- recapture at the previously saved poses:
     python3 -m src.calibration.capture_handeye_data --mode replay
+
+    # Standard: grow an existing pose set to 10 well-conditioned samples/arm:
+    python3 -m src.calibration.capture_handeye_data --mode augment
+    python3 -m src.calibration.capture_handeye_data --arm left --mode augment --target-samples 10
 """
 
 from __future__ import annotations
@@ -148,17 +192,19 @@ from src.calibration.handeye_flange_cam_realsense import (
     _solve_board_pose,
     _stamp_to_sec,
 )
-from src.calibration.moveit_dual_arm import DEFAULT_MOVE_GROUP_NAMESPACE, DualArmMoveitClient, JointTarget
+from src.calibration.moveit_dual_arm import ArmTarget, DEFAULT_MOVE_GROUP_NAMESPACE, DualArmMoveitClient, JointTarget
+from src.calibration.pose_augmentation import PoseAugmentationConfig, sample_augmented_pose
 from src.perception.ros.multicam_grabber_realsense import _pose_msg_to_se3
 from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 from src.utils.se3 import SE3
 
 CONTROLLERS = ("moveit", "admittance", "handguided")
-MODES = ("interactive", "replay")
+MODES = ("interactive", "replay", "augment")
 
 FLANGE_POSE_MAX_AGE_S = 0.25
 JOINT_STATE_MAX_AGE_S = 0.25
 RECOMMENDED_SAMPLES = 7
+DEFAULT_TARGET_SAMPLES = 10   # --mode augment default (see docstring)
 HANDEYE_DEBUG_DIR = Path("outputs/calibration_debug/handeye")
 
 # joint_state_broadcaster's namespace -- matches lbr_dual_arm_bringup's
@@ -183,7 +229,14 @@ def _arm_joint_prefix(arm_key: str) -> str:
 
 def _archive_if_exists(path: Path) -> Optional[Path]:
     """Moves an existing file/dir aside to a timestamped backup path and
-    returns the backup path, or returns None if nothing existed to move."""
+    returns the backup path, or returns None if nothing existed to move.
+
+    Only for call sites where discarding the live data is the explicit,
+    immediate intent (--mode interactive without --append: the user is
+    deliberately starting that arm's captures over). Everywhere else, prefer
+    _snapshot_if_exists (copy, not move) so the live file is never at risk
+    of being left missing -- see _restore_untouched_backups for the
+    generic safety net around uses of this function specifically."""
     if not path.exists():
         return None
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -191,6 +244,46 @@ def _archive_if_exists(path: Path) -> Optional[Path]:
     backup = path.with_name(path.name + suffix) if path.is_dir() else path.with_name(path.stem + f"_bak_{ts}" + path.suffix)
     shutil.move(str(path), str(backup))
     return backup
+
+
+def _snapshot_if_exists(path: Path) -> Optional[Path]:
+    """Copies (never moves) an existing file/dir aside to a timestamped
+    backup path, leaving the original in place, and returns the backup path
+    (or None if nothing existed to copy). Used where the live data must
+    never go missing mid-run, e.g. --mode augment's append-only rewrite."""
+    if not path.exists():
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if path.is_dir():
+        backup = path.with_name(path.name + f"_bak_{ts}")
+        shutil.copytree(path, backup)
+    else:
+        backup = path.with_name(path.stem + f"_bak_{ts}" + path.suffix)
+        shutil.copy2(path, backup)
+    return backup
+
+
+def _restore_untouched_backups(archived: list[tuple[Path, Path]]) -> None:
+    """Moves each _archive_if_exists backup back to its canonical path if
+    that path ended up missing or empty -- i.e. this run was interrupted
+    before the arm/cam it belongs to was ever reached, so archiving it
+    turned out to be premature and must be undone rather than leaving a
+    silently-missing config/flange_poses/*.json or an empty debug dir.
+
+    Added after a run aborted (Ctrl-C) while still processing the left arm
+    left config/flange_poses/right.json archived-and-never-recreated, even
+    though right hadn't been touched yet -- both arms get archived up front
+    in main() before either is actually processed."""
+    for canonical, backup in archived:
+        if not backup.exists():
+            continue
+        empty_dir = canonical.is_dir() and not any(canonical.iterdir())
+        if canonical.exists() and not empty_dir:
+            continue  # this run actually wrote something here -- leave it
+        if canonical.exists():
+            shutil.rmtree(canonical) if canonical.is_dir() else canonical.unlink()
+        shutil.move(str(backup), str(canonical))
+        print(f"Restored {canonical} <- {backup} (never reached this run)")
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +763,221 @@ def _run_replay(arms: list[str], args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Augment mode
+# ---------------------------------------------------------------------------
+
+
+def _detect_at_live_pose(
+    node: "_ReplayNode", arm_key: str, idx: int, note_prefix: str,
+) -> Optional[tuple[FlangePoseCapture, HandEyeSample, np.ndarray]]:
+    """Attempts one checkerboard detection at the arm's CURRENT live pose
+    (already moved there by the caller) -- shared by both halves of --mode
+    augment (replaying known poses, and the newly-perturbed ones), unlike
+    _try_capture (interactive mode, needs joint_state freshness too) or
+    _recapture_at (replay mode, doesn't return anything to the caller)."""
+    st = node.arms[arm_key]
+    if not st.has_fresh_rgb_info():
+        print("  [skip] no fresh RGB/CameraInfo")
+        return None
+    if not st.has_fresh_flange_pose():
+        print(f"  [skip] no fresh flange pose on {st.flange_pose_topic}")
+        return None
+
+    img = _img_to_numpy_bgr(st.img_msg)
+    K = st.K.copy()
+    try:
+        T_cam_board, corners, reproj_err = _solve_board_pose(img, K)
+    except RuntimeError as e:
+        print(f"  [skip] checkerboard not visible to {st.cam_id}: {e}")
+        node.publish_debug(arm_key, img)
+        return None
+    if reproj_err > MAX_REPROJ_ERR_PX:
+        print(f"  [skip] reprojection error too high: {reproj_err:.3f}px > {MAX_REPROJ_ERR_PX}px")
+        return None
+
+    vis = _draw_chessboard(img, corners, f"{arm_key} {note_prefix} idx={idx} reproj={reproj_err:.3f}px")
+    node.publish_debug(arm_key, vis)
+
+    joint_prefix = _arm_joint_prefix(arm_key)
+    joint_positions = {
+        name: pos for name, pos in node.moveit.current_joint_positions().items()
+        if name.startswith(joint_prefix)
+    }
+
+    flange_capture = FlangePoseCapture(
+        idx=idx, T_armBase_flange=st.flange_pose, captured_at_unix_s=time.time(),
+        note=f"{note_prefix} board_reproj_px={reproj_err:.3f}", joint_positions=joint_positions,
+    )
+    handeye_sample = HandEyeSample(
+        idx=idx, T_base_flange=st.flange_pose, T_cam_board=T_cam_board, reproj_px=reproj_err,
+        corners_px=corners, K=K,
+    )
+    return flange_capture, handeye_sample, vis
+
+
+def _run_augment(arms: list[str], args: argparse.Namespace) -> None:
+    """Append-only: existing captures (config/flange_poses/<arm>.json) and
+    their debug hand-eye samples (outputs/calibration_debug/handeye/<cam>/)
+    are NEVER removed, renumbered, or randomly downsampled here, regardless
+    of whether a known pose still detects the checkerboard this run or
+    whether the known count already exceeds --target-samples. A known pose
+    that still detects the board gets its debug sample refreshed in place
+    (same idx -- the checkerboard may have moved since it was first
+    captured); one that doesn't is left exactly as it was. New poses are
+    appended with fresh idx values on top. This is why the archiving below
+    is a copy (_snapshot_if_exists), not a move: the live files are never at
+    risk of going missing, so there's nothing to restore on a crash/Ctrl-C
+    (see the right-arm postmortem 2026-08-14 this replaced -- the old
+    archive-then-rebuild design left config/flange_poses/right.json
+    deleted-and-never-recreated when the run was interrupted while still on
+    the left arm)."""
+    per_arm_existing: dict[str, list[FlangePoseCapture]] = {}
+    for arm_key in arms:
+        pose_set = load_pose_set(arm_key)
+        if not pose_set.captures:
+            raise RuntimeError(
+                f"{arm_key}: no saved poses to augment from -- run --mode interactive first "
+                f"(need at least 1 known-good pose to perturb around)."
+            )
+        missing = [c.idx for c in pose_set.captures if not c.joint_positions]
+        if missing:
+            raise RuntimeError(
+                f"{arm_key}: capture idx={missing} have no saved joint_positions -- --mode augment "
+                f"replays known poses via joint-space MoveGroup goals first, so every saved capture "
+                f"needs joint_positions."
+            )
+        per_arm_existing[arm_key] = pose_set.captures
+
+    for arm_key in arms:
+        flange_path = FLANGE_POSES_DIR / f"{arm_key}.json"
+        backup = _snapshot_if_exists(flange_path)
+        if backup:
+            print(f"Snapshotted existing {flange_path} -> {backup} (original left in place)")
+        cam_dir = HANDEYE_DEBUG_DIR / ARM_KEYS[arm_key]["cam_id"]
+        backup = _snapshot_if_exists(cam_dir)
+        if backup:
+            print(f"Snapshotted existing {cam_dir} -> {backup} (original left in place)")
+        cam_dir.mkdir(parents=True, exist_ok=True)
+
+    node = _ReplayNode(arms, publish_debug=not args.no_debug_topic, robot_namespace=args.robot_namespace)
+    print("Waiting for /move_action (MoveGroup) action server...")
+    if not node.moveit.wait_for_server(timeout_s=30.0):
+        raise RuntimeError(
+            "MoveGroup action server not available -- is lbr_dual_arm_bringup's "
+            "move_group.launch.py running?"
+        )
+
+    cfg = PoseAugmentationConfig()
+    rng = np.random.default_rng()
+
+    try:
+        for arm_key in arms:
+            arm = ARM_KEYS[arm_key]
+            cam_dir = HANDEYE_DEBUG_DIR / arm["cam_id"]
+            known_captures = list(per_arm_existing[arm_key])
+            next_idx = max((c.idx for c in known_captures), default=-1) + 1
+
+            print(f"\n=== augment: arm={arm_key} (cam={arm['cam_id']}) -- target {args.target_samples} total samples ===")
+            print(
+                f"Step 1/2: verifying {len(known_captures)} known pose(s) still see the checkerboard "
+                f"(append-only -- none are removed from the saved set regardless of outcome)..."
+            )
+            verified_bases: list[SE3] = []
+            for cap in known_captures:
+                target = JointTarget(
+                    group_name=arm["group_name"], joint_positions=cap.joint_positions,
+                    label=f"{arm_key} known idx={cap.idx}",
+                )
+                ok, _record = node.moveit.move_to_joint([target])
+                if not ok:
+                    print(f"  [warn] MoveGroup failed to reach known idx={cap.idx} -- kept as-is")
+                    continue
+                node.spin_briefly(REPLAY_SETTLE_S)
+                result = _detect_at_live_pose(node, arm_key, idx=cap.idx, note_prefix="known-verify")
+                if result is None:
+                    print(f"  [warn] known idx={cap.idx} no longer detects the checkerboard -- kept as-is")
+                    continue
+                # Still visible -- refresh this idx's debug sample in place
+                # (same idx, so it overwrites only itself) in case the
+                # checkerboard moved since it was first captured. The saved
+                # flange pose/joint_positions are untouched either way.
+                _flange_cap, handeye_sample, vis = result
+                handeye_sample.idx = cap.idx
+                cv2.imwrite(str(cam_dir / f"sample_{cap.idx:02d}.png"), vis)
+                _save_sample_json(cam_dir, handeye_sample)
+                verified_bases.append(cap.T_armBase_flange)
+
+            print(f"  {len(verified_bases)}/{len(known_captures)} known pose(s) still detect the checkerboard.")
+            if not verified_bases:
+                raise RuntimeError(
+                    f"{arm_key}: none of the known poses still see the checkerboard -- can't perturb "
+                    f"around zero successful poses. Re-run --mode interactive for this arm."
+                )
+
+            all_captures = list(known_captures)
+            n_needed = max(0, args.target_samples - len(known_captures))
+            if n_needed == 0:
+                print(
+                    f"Step 2/2: already have {len(known_captures)} known pose(s) >= target "
+                    f"{args.target_samples} -- append-only mode never discards existing poses, "
+                    f"so no perturbation needed."
+                )
+            else:
+                print(f"Step 2/2: perturbing to append up to {n_needed} new sample(s)...")
+                attempts = 0
+                n_added = 0
+                max_attempts = 20 * max(1, n_needed)
+                while n_added < n_needed and attempts < max_attempts:
+                    attempts += 1
+                    candidate = sample_augmented_pose(verified_bases, rng, cfg)
+                    arm_target = ArmTarget(
+                        group_name=arm["group_name"], base_frame=arm["base_frame"],
+                        tip_link=arm["flange_frame"], T_armBase_flange=candidate,
+                    )
+                    if not node.moveit.move_to_seeded(arm_target, label=f"{arm_key} augmented"):
+                        continue
+                    node.spin_briefly(REPLAY_SETTLE_S)
+                    result = _detect_at_live_pose(node, arm_key, idx=next_idx, note_prefix="augmented")
+                    if result is None:
+                        continue
+                    flange_capture, handeye_sample, vis = result
+                    cv2.imwrite(str(cam_dir / f"sample_{next_idx:02d}.png"), vis)
+                    _save_sample_json(cam_dir, handeye_sample)
+                    all_captures.append(flange_capture)
+                    verified_bases.append(flange_capture.T_armBase_flange)
+                    # Save as soon as a new sample is appended -- crash-safe,
+                    # and always a strict superset of what was on disk before.
+                    save_pose_set(FlangePoseSet(
+                        arm_key=arm_key, cam_id=arm["cam_id"], base_frame=arm["base_frame"],
+                        flange_frame=arm["flange_frame"], captures=all_captures,
+                    ))
+                    n_added += 1
+                    print(
+                        f"  [ok] appended sample idx={next_idx} ({len(all_captures)}/{args.target_samples} "
+                        f"total, reproj={handeye_sample.reproj_px:.3f}px, {attempts} attempt(s) so far) -- saved"
+                    )
+                    next_idx += 1
+
+                if n_added < n_needed:
+                    print(
+                        f"WARNING: only appended {n_added}/{n_needed} new samples for arm={arm_key} "
+                        f"after {attempts} perturbation attempts -- proceeding with {len(all_captures)} total."
+                    )
+
+            # Persist even when nothing new was appended, so any Step 1
+            # in-place refreshes are reflected in the canonical file too.
+            save_pose_set(FlangePoseSet(
+                arm_key=arm_key, cam_id=arm["cam_id"], base_frame=arm["base_frame"],
+                flange_frame=arm["flange_frame"], captures=all_captures,
+            ))
+            print(f"Done: {len(all_captures)} sample(s) saved -> {FLANGE_POSES_DIR / f'{arm_key}.json'}, {cam_dir}")
+
+        print("\nDone augmenting.")
+    finally:
+        node.destroy_node()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -681,23 +989,40 @@ def main() -> None:
     parser.add_argument("--mode", choices=MODES, default="interactive")
     parser.add_argument("--num-samples", type=int, default=RECOMMENDED_SAMPLES, help="per arm, --mode interactive only")
     parser.add_argument(
+        "--target-samples", type=int, default=DEFAULT_TARGET_SAMPLES,
+        help="per arm, --mode augment only -- minimum total samples to reach by appending perturbed "
+             "ones (known + newly appended). Never removes samples if the known count already meets "
+             "or exceeds this.",
+    )
+    parser.add_argument(
         "--append", action="store_true",
         help="--mode interactive: extend existing data instead of archiving it first (only valid if "
              "the checkerboard has NOT moved since the archived data was captured). No effect in "
-             "--mode replay.",
+             "--mode replay/augment.",
     )
     parser.add_argument(
         "--gain-profile", default=None, choices=("holding", "insertion"),
         help="--controller admittance only -- see config/admittance_gain_profiles.yaml.",
     )
-    parser.add_argument("--robot-namespace", default=DEFAULT_MOVE_GROUP_NAMESPACE, help="--mode replay only")
+    parser.add_argument("--robot-namespace", default=DEFAULT_MOVE_GROUP_NAMESPACE, help="--mode replay/augment only")
     parser.add_argument("--no-debug-topic", action="store_true")
     args = parser.parse_args()
 
     arms = ["left", "right"] if args.arm == "both" else [args.arm]
 
-    if args.mode == "replay" and args.controller != "moveit":
-        print(f"NOTE: --mode replay always drives via MoveIt joint-space replay -- ignoring --controller {args.controller}.")
+    if args.mode in ("replay", "augment") and args.controller != "moveit":
+        print(
+            f"NOTE: --mode {args.mode} always drives via MoveIt (joint-space and/or Cartesian IK) "
+            f"-- ignoring --controller {args.controller}."
+        )
+
+    # (canonical_path, backup_path) pairs from _archive_if_exists (move
+    # semantics) below -- restored automatically if the run is aborted
+    # before the canonical path is touched again (see
+    # _restore_untouched_backups). --mode augment archives internally via
+    # _snapshot_if_exists (copy, not move) instead, so it has nothing to
+    # register here -- its live files are never at risk.
+    archived: list[tuple[Path, Path]] = []
 
     if args.mode == "interactive":
         if not args.append:
@@ -706,11 +1031,13 @@ def main() -> None:
                 backup = _archive_if_exists(flange_path)
                 if backup:
                     print(f"Archived existing {flange_path} -> {backup}")
+                    archived.append((flange_path, backup))
                 cam_dir = HANDEYE_DEBUG_DIR / ARM_KEYS[arm_key]["cam_id"]
                 backup = _archive_if_exists(cam_dir)
                 if backup:
                     print(f"Archived existing {cam_dir} -> {backup}")
-    else:
+                    archived.append((cam_dir, backup))
+    elif args.mode == "replay":
         if args.append:
             print(
                 "NOTE: --append has no effect in --mode replay -- the previous hand-eye samples for "
@@ -721,15 +1048,28 @@ def main() -> None:
             backup = _archive_if_exists(cam_dir)
             if backup:
                 print(f"Archived existing {cam_dir} -> {backup}")
+                archived.append((cam_dir, backup))
+    else:  # augment
+        if args.append:
+            print("NOTE: --append has no effect in --mode augment -- it always rewrites the full resulting set.")
+        # _run_augment does its own (non-destructive) archiving of
+        # flange_poses AND the debug dir, since it needs to read the
+        # existing content before snapshotting it.
 
     rclpy.init()
     try:
         if args.mode == "interactive":
             _run_interactive(arms, args)
-        else:
+        elif args.mode == "replay":
             _run_replay(arms, args)
+        else:
+            _run_augment(arms, args)
+    except BaseException:
+        _restore_untouched_backups(archived)
+        raise
     finally:
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
