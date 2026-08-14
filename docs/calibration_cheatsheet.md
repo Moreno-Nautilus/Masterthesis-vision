@@ -207,6 +207,19 @@ samples instead.
 
 ## 3. Board pose + ZED calibration (hands-off, one command)
 
+**Just want to redo the 5-sample board-pose average by hand — checkerboard
+moved, hand-eye is still fine, don't want to touch the ZED stage?** Use
+[`capture_board_pose_data.py`](#capture_board_pose_datapy-board-pose-only-manual)
+instead of the auto command below — same interactive jog-and-press-Enter
+loop as Stage A, scoped to only `config/base_board_pose.yaml`:
+
+```bash
+python3 -m src.calibration.capture_board_pose_data
+```
+
+Otherwise, the fully automatic hands-off path (drives to saved flange poses,
+augments, and runs ZED too):
+
 ```bash
 python3 -m src.calibration.autocalibrate_dual_realsense
 ```
@@ -242,16 +255,6 @@ If you stopped before the ZED stage, run it separately whenever ready:
 
 ```bash
 scripts/calibrate_zed_from_board_pose.sh
-```
-
-**Want to redo just the 5-sample board-pose average by hand, without
-re-driving through saved flange poses or touching the ZED stage?** Use
-[`capture_board_pose_data.py`](#capture_board_pose_datapy-board-pose-only-manual)
-instead — same interactive jog-and-press-Enter loop as Stage A, scoped to
-only `config/base_board_pose.yaml`:
-
-```bash
-python3 -m src.calibration.capture_board_pose_data
 ```
 
 ✅ Checkpoint: script exits with `=== All stages complete ===` and no
