@@ -244,6 +244,16 @@ If you stopped before the ZED stage, run it separately whenever ready:
 scripts/calibrate_zed_from_board_pose.sh
 ```
 
+**Want to redo just the 5-sample board-pose average by hand, without
+re-driving through saved flange poses or touching the ZED stage?** Use
+[`capture_board_pose_data.py`](#capture_board_pose_datapy-board-pose-only-manual)
+instead — same interactive jog-and-press-Enter loop as Stage A, scoped to
+only `config/base_board_pose.yaml`:
+
+```bash
+python3 -m src.calibration.capture_board_pose_data
+```
+
 ✅ Checkpoint: script exits with `=== All stages complete ===` and no
 `RuntimeError`. Each stage refuses to write bad results (translation/rotation
 spread or reprojection error too high) rather than silently writing a wrong
@@ -308,6 +318,25 @@ timestamped backup automatically before capturing:
 python3 -m src.calibration.capture_handeye_data
 ```
 
+**Checkerboard moved and hand-eye is still fine — just want to replace the
+5 pooled board-pose samples that feed `config/base_board_pose.yaml`:**
+`capture_board_pose_data.py` is the manual counterpart to
+`autocalibrate_dual_realsense.py`'s board-pose stage — same interactive
+jog-and-press-Enter capture loop as `capture_handeye_data.py`'s
+`--mode interactive`, but it captures directly against the live board pose
+(no saved-flange-pose replay, no augmentation/perturbation) and writes only
+`config/base_board_pose.yaml`. It archives the previous
+`outputs/calibration_debug/board_pose/dual/` samples and
+`config/base_board_pose.yaml` to a timestamped backup first (same
+backup/auto-restore policy as Stage A) and never touches
+`config/flange_poses/*.json` or runs ZED calibration:
+
+```bash
+python3 -m src.calibration.capture_board_pose_data                       # pool 5 samples, left then right
+python3 -m src.calibration.capture_board_pose_data --arm left            # left arm's camera only
+python3 -m src.calibration.capture_board_pose_data --append --num-samples 8  # grow instead of replace
+```
+
 ---
 
 ## Flags reference
@@ -351,3 +380,14 @@ Defaults below are what you get by passing no flag at all — see
 | `--zed-only` | off | Skip the board-pose stage entirely and just re-run ZED calibration against the existing `config/base_board_pose.yaml` — for when the checkerboard hasn't moved and only the ZED needs recalibrating. No arm motion. Mutually exclusive with `--skip-zed`. |
 | `--robot-namespace NAME` | `lbr_dual_arm` | Must match `move_group.launch.py`'s `robot_name`. |
 | `--no-debug-topic` | off | Skip publishing the `/calibration/autocalibrate/<arm>/debug_image` topic. |
+
+### `capture_board_pose_data.py` (board pose only, manual)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--arm {left,right,both}` | `both` | Which arm(s)' wrist camera may capture a sample. With `both`, samples are pooled: left captures first, right only tops up if left didn't reach `--num-samples`. |
+| `--controller {moveit,admittance,handguided}` | `moveit` | How the arm gets positioned — same semantics as `capture_handeye_data.py --mode interactive`. |
+| `--num-samples N` | `5` | Pooled total across whichever arm(s) are used (matches `autocalibrate_dual_realsense.py`'s `--target-board-samples`). |
+| `--append` | off | Extend the existing pooled sample set under `outputs/calibration_debug/board_pose/dual/` instead of archiving it first (only valid if the checkerboard hasn't moved). |
+| `--gain-profile {holding,insertion}` | none | `--controller admittance` only. |
+| `--no-debug-topic` | off | Skip publishing the `/calibration/capture_board_pose_data/<arm>/debug_image` topic. |
