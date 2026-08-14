@@ -1,6 +1,6 @@
 """Checkerboard pose in the robot base frame (Stage 2 of 2), using a
-wrist-mounted RealSense camera that already has a T_flange_cam from
-src/calibration/handeye_flange_cam_realsense.py (Stage 1).
+wrist-mounted RealSense camera that already has a T_flange_cam solved by
+src/calibration/capture_handeye_data.py + calibrate_handeye.py (Stage 1).
 
 With the flange->camera offset known, one synced (camera image, flange
 pose) pair is enough to place the checkerboard in the robot base frame:
@@ -35,7 +35,7 @@ import rclpy
 import yaml
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 from sensor_msgs.msg import CameraInfo, Image
 
 from src.calibration.handeye_flange_cam_realsense import (
@@ -174,9 +174,9 @@ class BoardPoseNode(Node):
         self.flange_pose: Optional[SE3] = None
         self.flange_pose_wall_t: float = 0.0
 
-        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data)
-        self.create_subscription(PoseStamped, flange_pose_topic, self._on_flange, qos_profile_sensor_data)
+        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data_low_latency)
+        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data_low_latency)
+        self.create_subscription(PoseStamped, flange_pose_topic, self._on_flange, qos_profile_sensor_data_low_latency)
 
         self._debug_pub = None
         if publish_debug:
@@ -311,8 +311,8 @@ def main() -> None:
     if np.allclose(T_flange_cam.R, np.eye(3)) and np.allclose(T_flange_cam.t, 0.0):
         raise RuntimeError(
             f"{args.cam_id}'s entry in {EXTRINSICS_YAML} is still the identity placeholder. "
-            "Run src.calibration.handeye_flange_cam_realsense for this camera first "
-            "(Stage 1) before computing the board pose (Stage 2)."
+            "Run capture_handeye_data.py then calibrate_handeye.py --write for this camera "
+            "first (Stage 1) before computing the board pose (Stage 2)."
         )
 
     rclpy.init()

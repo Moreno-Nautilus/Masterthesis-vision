@@ -1,0 +1,50 @@
+# RealSense camera parameters for bandwidth optimization.
+# Resolution set to 640x480 (QVGA) as requested.
+# Frame rate: 30 FPS for real-time performance (matches ZED neural depth).
+# Use with: ros2 launch realsense2_camera rs_launch.py param_file:=$(pwd)/config/realsense_camera_bandwidth.yaml
+
+/**:
+  ros__parameters:
+    camera_name: realsense
+
+    # RGB stream parameters
+    rgb_camera:
+      profile: 640x480x30  # 640x480 resolution at 30 FPS
+      format: RGB8
+      # Hardware encoding: none=raw (higher bandwidth), mjpeg/h264=compressed (lower bandwidth)
+      # Use hardware_format for H.264 if the camera model supports it
+      # For D405: only mjpeg is available in hardware
+      info_update_base_url: ""
+      trigger_camera: false
+
+    # Depth stream parameters
+    depth_camera:
+      profile: 640x480x30  # Match RGB resolution/FPS for sync
+      format: Z16
+
+    # Stereo depth module (depth processing)
+    stereo_depth:
+      # Depth preset: 0=Default, 1=Hand, 2=High Density, 3=Medium Density, 4=Medium Density (Prefer Min Weight)
+      # Use 0 (Default) for most balanced performance
+      preset: 0
+
+    # Accelerometer/Gyroscope (if present)
+    enable_accel: false
+    enable_gyro: false
+    enable_pose: false
+
+    # Depth filtering (reduce data before transmission)
+    enable_decimation_filter: false  # Disabled to maintain quality at 640x480
+    enable_spatial_filter: false  # Smooth depth, can slow down processing
+    enable_temporal_filter: false  # Time-based filtering, adds latency
+
+    # Auto-exposure settings (stable image)
+    auto_exposure_mode: 0
+    auto_white_balance_mode: 0
+
+# Notes:
+# - Resolution: 640x480 (QVGA) vs 1280x720 = ~75% pixel reduction
+# - Frame rate: 30 FPS (matches ZED neural depth for synchronized capture)
+# - Decimation filter disabled to preserve depth quality at lower resolution
+# - IMU streams disabled if not needed
+# - Compression: image_transport package can add JPEG compression at ROS level for further savings

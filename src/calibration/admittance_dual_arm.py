@@ -6,11 +6,11 @@ cartesian_impedance_dual_arm.py, not a replacement.
 
 Two ways to run this: standalone, via this module's own main()
 (`python3 -m src.calibration.admittance_dual_arm`) for general hand-guiding;
-or embedded, as the default Step 1 calibration-image-gathering control
-mode -- capture_flange_poses_dual_admittance.py constructs
-AdmittanceDualArmNode itself and spins it in a background thread alongside
-its own interactive capture loop, rather than importing this main(). Both
-paths share apply_gain_profile()/log_active_gains() below.
+or embedded, as the `--controller admittance` calibration-image-gathering
+control mode -- capture_handeye_data.py constructs AdmittanceDualArmNode
+itself and spins it in a background thread alongside its own interactive
+capture loop, rather than importing this main(). Both paths share
+apply_gain_profile()/log_active_gains() below.
 
 Reuses lbr_fri_ros2_stack's existing, working control law --
 lbr_demos_advanced_py.admittance_controller.AdmittanceController -- rather
@@ -161,7 +161,7 @@ class AdmittanceDualArmNode(Node):
         # the other arm's command right behind it in the queue. Only
         # actually buys concurrency when spun via a MultiThreadedExecutor
         # (this module's own main() below, and
-        # capture_flange_poses_dual_admittance.py, both do) -- a plain
+        # capture_handeye_data.py's --controller admittance path, both do) -- a plain
         # rclpy.spin() uses a single-threaded executor internally and would
         # still process one callback at a time regardless of grouping.
         self._callback_groups: dict[str, MutuallyExclusiveCallbackGroup] = {
@@ -294,9 +294,9 @@ def apply_gain_profile(
     invokes add_on_set_parameters_callback callbacks directly, no service
     round-trip needed for an in-process caller). Safe to call right after
     construction: nothing has moved yet, so every arm reads as stationary.
-    Shared by this module's own main() and
-    capture_flange_poses_dual_admittance.py so both pick up retuned
-    profiles without duplicating this logic.
+    Shared by this module's own main() and capture_handeye_data.py's
+    --controller admittance path so both pick up retuned profiles without
+    duplicating this logic.
     """
     profile = gain_profiles.load_admittance_profile(profile_name)
     params = [
@@ -326,20 +326,20 @@ def log_active_gains(node: AdmittanceDualArmNode, arm_keys: tuple[str, ...]) -> 
 def main(args: list[str] | None = None) -> None:
     """Standalone entry point -- general-purpose admittance hand-guiding for
     the dual-arm rig, independent of any calibration capture script (for
-    that, see capture_flange_poses_dual_admittance.py, which runs this same
-    node internally alongside its own capture loop instead of calling this
-    main()). Requires `ros2 launch lbr_dual_arm_bringup admittance.launch.py`
-    already running.
+    that, see capture_handeye_data.py --controller admittance, which runs
+    this same node internally alongside its own capture loop instead of
+    calling this main()). Requires
+    `ros2 launch lbr_dual_arm_bringup admittance.launch.py` already running.
 
         python3 -m src.calibration.admittance_dual_arm
         python3 -m src.calibration.admittance_dual_arm --arm left
         python3 -m src.calibration.admittance_dual_arm --gain-profile insertion
 
     --arm restricts the admittance loop to a single arm (see
-    capture_flange_poses_dual_admittance.py, which always does this --
-    running both arms' Jacobian solves concurrently roughly halves the
-    achievable control-loop rate for the arm actually being hand-guided).
-    Omit it to hand-guide both arms at once, same as before.
+    capture_handeye_data.py, which always does this for --controller
+    admittance -- running both arms' Jacobian solves concurrently roughly
+    halves the achievable control-loop rate for the arm actually being
+    hand-guided). Omit it to hand-guide both arms at once, same as before.
     """
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument(

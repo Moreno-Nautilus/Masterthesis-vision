@@ -1568,22 +1568,41 @@ class FoundationPoseTrackerNode(Node):
         return self.pub_pose_base[key]
 
     def _resolve_T_base_cam(self, cam_id: str) -> np.ndarray:
-        """Get T_base_cam as a plain float64 4x4 array, cached."""
+        """Get T_base_cam as a plain float64 4x4 array.
+
+        Cached for static cameras (e.g. zed2i_1). Dynamic (arm-mounted)
+        cameras -- realsense_1/realsense_2 -- are recomposed on every call:
+        T_base_cam(t) = T_base_flange(t) @ T_flange_cam, and T_base_flange(t)
+        changes as the arm moves, so caching it would freeze the camera at
+        whatever arm pose was current on the first lookup.
+        """
+        T = self.T_base_cam_map[cam_id]
+        if hasattr(T, "as_matrix"):
+            T = T.as_matrix()
+        elif hasattr(T, "matrix"):
+            T = T.matrix
+        T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+
+        is_dynamic = getattr(self.T_base_cam_map, "is_dynamic", None)
+        if is_dynamic is not None and is_dynamic(cam_id):
+            return T
+
         if not hasattr(self, '_T_base_cam_cache'):
             self._T_base_cam_cache: dict[str, np.ndarray] = {}
         if cam_id not in self._T_base_cam_cache:
-            T = self.T_base_cam_map[cam_id]
-            if hasattr(T, "as_matrix"):
-                T = T.as_matrix()
-            elif hasattr(T, "matrix"):
-                T = T.matrix
-            self._T_base_cam_cache[cam_id] = np.asarray(T, dtype=np.float64).reshape(4, 4)
+            self._T_base_cam_cache[cam_id] = T
         return self._T_base_cam_cache[cam_id]
 
     def _resolve_T_cam_base(self, cam_id: str) -> np.ndarray:
-        """Get T_cam_base (inverse of extrinsic), cached."""
+        """Get T_cam_base (inverse of extrinsic). Cached for static cameras
+        only -- see _resolve_T_base_cam for why dynamic cameras are not."""
+        T_bc = self._resolve_T_base_cam(cam_id)
+
+        is_dynamic = getattr(self.T_base_cam_map, "is_dynamic", None)
+        if is_dynamic is not None and is_dynamic(cam_id):
+            return np.linalg.inv(T_bc).astype(np.float32)
+
         if cam_id not in self._T_cam_base_cache:
-            T_bc = self._resolve_T_base_cam(cam_id)
             self._T_cam_base_cache[cam_id] = np.linalg.inv(T_bc).astype(np.float32)
         return self._T_cam_base_cache[cam_id]
 
@@ -2223,11 +2242,20 @@ class FoundationPoseTrackerNode(Node):
 
         try:
             T_base = self._to_base_pose(cam_id, T_camera)
+            x_base = float(T_base[0, 3])
+            y_base = float(T_base[1, 3])
             z_base = float(T_base[2, 3])
             z_lo = float(getattr(self.args, "table_plane_z_min", 0.0))
             z_hi = float(getattr(self.args, "table_plane_z_max", 0.9))
             if z_base < z_lo or z_base > z_hi:
                 return False, f"bad_z_base z={z_base:.3f} (table window [{z_lo:.3f}, {z_hi:.3f}])"
+            x_lo = float(getattr(self.args, "workspace_x_min", 0.10))
+            if x_base < x_lo:
+                return False, f"bad_x_base x={x_base:.3f} (min {x_lo:.3f})"
+            y_lo = float(getattr(self.args, "workspace_y_min", -0.4))
+            y_hi = float(getattr(self.args, "workspace_y_max", 0.4))
+            if y_base < y_lo or y_base > y_hi:
+                return False, f"bad_y_base y={y_base:.3f} (window [{y_lo:.3f}, {y_hi:.3f}])"
         except Exception:
             pass
 
@@ -4721,7 +4749,17 @@ class FoundationPoseTrackerNode(Node):
 
             if any_tracking and not no_states and not force_init_this_tick:
                 # Fused tracking is the hot loop: Cutie masks + fused ICP.
-                self._track_multicam_fused(views, stamp)
+                try:
+                    self._track_multicam_fused(views, stamp)
+                except KeyError as e:
+                    # A dynamic camera's extrinsic (T_base_flange from its
+                    # flange-pose topic) went stale/missing mid-tick -- e.g. a
+                    # brief gap in the flange pose stream while the arm is
+                    # moving. Skip publishing this tick rather than crashing
+                    # the whole tracking node; track_states are left
+                    # untouched so tracking resumes on its own next tick once
+                    # the flange pose is fresh again.
+                    self.get_logger().warn(f"Skipping fused-tracking tick: {e}")
             else:
                 # Multicam init is expensive but gives fresh identities and poses.
                 torch.cuda.empty_cache()
@@ -5106,6 +5144,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--table-plane-z-min", type=float, default=-0.03)
     p.add_argument("--table-plane-z-max", type=float, default=0.9)
+    p.add_argument("--workspace-x-min", type=float, default=0.10)
+    p.add_argument("--workspace-y-min", type=float, default=-0.4)
+    p.add_argument("--workspace-y-max", type=float, default=0.4)
 
 
     p.add_argument("--icp-mask-close-kernel", type=int, default=0)

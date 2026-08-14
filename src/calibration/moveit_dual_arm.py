@@ -3,10 +3,10 @@
 Nothing in this repo sends motion commands to the robot today (see
 docs/moveit_robot_control.md: "none of Masterthesis-vision's own scripts send
 motion commands to the robot" -- everything only reads /iiwa/ee_pose-style
-topics). src/calibration/autocalibrate_dual_realsense.py is the first thing
-that needs to actually drive the arms (to the poses saved by
-capture_flange_poses_dual.py / capture_flange_poses_dual_handguided.py), so
-this module exists to do that through the moveit_msgs/action/MoveGroup action
+topics). capture_handeye_data.py's --mode replay and
+autocalibrate_dual_realsense.py are what actually drive the arms (to the
+poses saved by capture_handeye_data.py's --mode interactive), so this
+module exists to do that through the moveit_msgs/action/MoveGroup action
 directly -- no moveit_commander/moveit_py Python bindings are installed in
 this environment (checked: both raise ModuleNotFoundError), but moveit_msgs
 itself is, and MoveGroup is the same action move_group's own C++
@@ -24,7 +24,7 @@ Planning groups (lbr_dual_arm_moveit_config/config/lbr_dual_arm.srdf.xacro):
 
   arm_one_flange / arm_two_flange / both_arms_flange -- same joint chains,
   but ALWAYS tipped at lbr_{one,two}_link_ee regardless of use_gripper.
-  Hand-eye calibration (capture_flange_poses_dual*.py,
+  Hand-eye calibration (capture_handeye_data.py, calibrate_handeye.py,
   autocalibrate_dual_realsense.py, mock_reachability_check.py) uses these
   exclusively -- flange_pose_store.ARM_KEYS["group_name"] points here --
   since the calibration math and the already-captured
@@ -42,7 +42,8 @@ Two independent goal styles are supported:
   JointTarget / move_to_joint() / plan_only_joint() -- joint-space: a
     JointConstraint per joint, no IK at all. Used to replay a captured
     configuration exactly (see JointTarget docstring) -- this is what
-    autocalibrate_dual_realsense.py's Stage A/B replay actually uses.
+    capture_handeye_data.py's --mode replay and
+    autocalibrate_dual_realsense.py's board-pose stage both use.
 """
 
 from __future__ import annotations
@@ -112,7 +113,7 @@ STARTUP_READY_RETRY_INTERVAL_S = 1.0
 
 # joint_state_broadcaster's namespace -- must match calibration.launch.py's
 # default robot_name ("lbr_dual_arm") and
-# capture_flange_poses_dual_handguided.py's JOINT_STATES_TOPIC.
+# capture_handeye_data.py's JOINT_STATES_TOPIC.
 JOINT_STATES_TOPIC = "/lbr_dual_arm/joint_states"
 
 # JointConstraint tolerance for move_to_joint()/plan_only_joint() -- how
@@ -133,7 +134,7 @@ MOVE_LOG_DIR = Path("outputs/calibration_debug/moveit_joint_targets")
 # One arm's motion target: which planning group/tip link, and the desired
 # T_armBase_flange pose (already in that arm's OWN lbr_{one,two}_link_0
 # frame -- i.e. exactly what /left/ee_pose or /right/ee_pose publishes, and
-# exactly the T_base_flange stored by capture_flange_poses_dual.py).
+# exactly the T_base_flange stored by capture_handeye_data.py).
 @dataclass
 class ArmTarget:
     group_name: str      # "arm_one"/"arm_two" (gripper-toggle tip) or "arm_one_flange"/"arm_two_flange" (always bare flange)
@@ -143,7 +144,7 @@ class ArmTarget:
 
 
 # One arm's motion target as a literal joint configuration -- e.g. the
-# joint_positions saved by capture_flange_poses_dual_handguided.py
+# joint_positions saved by capture_handeye_data.py
 # (FlangePoseCapture.joint_positions). Unlike ArmTarget (a Cartesian pose,
 # which move_to() has MoveGroup's IK sampler solve, landing on *some*
 # configuration among this redundant 7-DOF arm's whole family of solutions
@@ -340,6 +341,57 @@ class DualArmMoveitClient:
             attempt += 1
             goal = self._build_goal(targets, group_name, plan_only=True)
             ok, error_code = self._send_goal_and_wait(goal)
+            if ok:
+                if attempt > 1:
+                    self._node.get_logger().info(
+                        f"move_group ready for group={group} after {attempt} attempts."
+                    )
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._node.get_logger().error(
+                    f"move_group still not ready for group={group} after "
+                    f"{timeout_s:.0f}s (last error_code={error_code}). Giving up -- "
+                    f"if this is running in a Docker container, check that move_group's "
+                    f"own log doesn't show DDS discovery still in progress."
+                )
+                return False
+
+            self._node.get_logger().warn(
+                f"[attempt {attempt}] group={group} not plannable yet "
+                f"(error_code={error_code}) -- retrying in {retry_interval_s:.1f}s "
+                f"({remaining:.0f}s left)..."
+            )
+            deadline_sleep = min(retry_interval_s, max(remaining, 0.0))
+            self._spin_sleep(deadline_sleep)
+
+    def wait_for_valid_state_joint(
+        self,
+        targets: list[JointTarget],
+        group_name: Optional[str] = None,
+        timeout_s: float = STARTUP_READY_TIMEOUT_S,
+        retry_interval_s: float = STARTUP_READY_RETRY_INTERVAL_S,
+    ) -> bool:
+        """wait_for_valid_state()'s joint-space twin -- see that docstring.
+        Use this instead of wait_for_valid_state() when the probe target's
+        own group is a multi-chain composite (e.g. both_arms_flange): a
+        Cartesian probe on such a group hits a structural MoveIt limitation
+        (IKConstraintSampler received dirty robot state, deterministically,
+        regardless of move_group's actual readiness -- see
+        docs/calibration_cheatsheet.md / mock_reachability_check.py), which
+        looks identical to the transient startup condition this method
+        exists to wait out. Joint-space goals through the same composite
+        group don't hit that limitation."""
+        if not targets:
+            raise ValueError("targets must be non-empty")
+
+        group = group_name or targets[0].group_name
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+        while True:
+            attempt += 1
+            ok, error_code = self.plan_only_joint(targets, group_name=group_name)
             if ok:
                 if attempt > 1:
                     self._node.get_logger().info(

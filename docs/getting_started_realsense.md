@@ -289,231 +289,60 @@ geometrically wrong** until replaced.
 
 What you need per RealSense camera: the rigid transform from the **flange frame**
 (`lbr_link_ee`) to the **camera's optical frame** (`T_flange_cam`), i.e. where
-the camera sits and points relative to the robot's flange. This repo has two
-scripts under `src/calibration/` for a two-stage routine that gets you this
-*and* a computed (not hand-measured) checkerboard pose in the robot base frame,
-using the same checkerboard as the ZED calibration
+the camera sits and points relative to the robot's flange, plus a computed
+(not hand-measured) checkerboard pose in the robot base frame and the static
+ZED's extrinsic, all using the same checkerboard as the ZED calibration
 ([getting_started.md §2](getting_started.md#2-calibrate-the-cameras): 8×11 inner
 corners, 30 mm squares).
 
-If instead the camera mount is a known, rigid, machined part, you can skip both
-scripts and pull `T_flange_cam` directly from the mount's CAD model — edit the
-`realsense_1`/`realsense_2` blocks in
+If instead the camera mount is a known, rigid, machined part, you can skip
+the routine below entirely and pull `T_flange_cam` directly from the mount's
+CAD model — edit the `realsense_1`/`realsense_2` blocks in
 [config/camera_extrinsics_realsense.yaml](../config/camera_extrinsics_realsense.yaml)
 directly (same row-major 3×3 `R` + 3-vector `t` convention as the rest of the
-repo). The rest of this section covers the checkerboard-based routine.
+repo).
 
-### 4.0 Two-script dual-arm routine (current workflow)
+**Full command-by-command walkthrough:
+[calibration_cheatsheet.md](calibration_cheatsheet.md).** Summary of the
+pieces, for orientation:
 
-The routine below drives **both** LBR arms of the dual-arm rig
-(`lbr_dual_arm_bringup`, arms `lbr_one`/left and `lbr_two`/right — see
-`~/Desktop/KUKA_dual_arm_bringup_README.md`), each carrying its own wrist
-RealSense (`realsense_1` on `lbr_one`, `realsense_2` on `lbr_two`), plus the
-one static ZED (`zed2i_1`). It's split into two scripts so the
-slow/manual/human-judgment part (deciding where to jog the arms) is done
-once and its raw result kept forever, while the actual calibration solve is
-scripted, repeatable, and doesn't need an operator standing at the robot:
+1. **Stage A — capture** (`src/calibration/capture_handeye_data.py`, manual,
+   once per arm): position each arm (RViz-jogged / admittance-guided /
+   gravity-compensation hand-guided — pick with `--controller`, see
+   [calibration_control_modes.md](calibration_control_modes.md)) to poses
+   where its wrist camera sees the fixed checkerboard, press Enter to save
+   both the flange pose/joint config AND the checkerboard image/detection.
+   `--mode replay` re-drives to previously-saved poses and recaptures fresh
+   images instead (for "the checkerboard moved a little" recalibration).
+2. **Stage B — solve hand-eye** (`src/calibration/calibrate_handeye.py`,
+   offline, no hardware): solves `T_flange_cam` for both cameras from Stage
+   A's saved data, either via the original closed-form `cv2.calibrateHandEye`
+   (`--method direct`) or a joint bundle-adjustment refinement with CAD +
+   cross-arm priors (`--method joint`, default — see
+   [joint_handeye_calibration.md](joint_handeye_calibration.md)). Writes
+   `config/camera_extrinsics_realsense.yaml`.
+3. **Board pose + ZED** (`src/calibration/autocalibrate_dual_realsense.py`,
+   automatic replay): drives both arms to their last few saved poses to
+   solve the checkerboard's pose in the robot base frame
+   (`config/base_board_pose.yaml`), then calibrates the static ZED against
+   that board pose (`scripts/calibrate_zed_from_board_pose.sh`, which reuses
+   [src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py)'s
+   existing PnP + averaging + QA-gate logic, writing
+   `config/camera_extrinsics_base.yaml`).
 
-1. **`capture_flange_poses_dual.py`** (manual, once per arm) — jog each arm
-   with MoveIt RViz to 7 poses where its own wrist camera sees the fixed
-   checkerboard, press Enter to save that arm's flange pose. Nothing is
-   calibrated yet; only the poses themselves are recorded, permanently, to
-   `config/flange_poses/left.json` / `right.json` (saved after **every**
-   single capture, not just at the end — a crash mid-session loses nothing
-   already accepted).
-2. **`autocalibrate_dual_realsense.py`** (automatic, replay) — reads those
-   saved poses back and, assuming the checkerboard hasn't moved since step 1,
-   drives both arms there via MoveIt automatically (no jogging), solving:
-   - **Stage A**: both arms' `T_flange_cam` (hand-eye), moving both arms
-     *simultaneously* per pose-pair using the first 5 poses/arm.
-   - **Stage B**: the checkerboard's pose in the robot base frame, using the
-     remaining 2 poses/arm (4 samples total), now that both hand-eye
-     transforms are known.
-   - **Stage C**: the static ZED's extrinsic, from that now-known board pose
-     (`scripts/calibrate_zed_from_board_pose.sh`).
-
-   Every stage's result + quality metrics is appended (never overwritten) to
-   `outputs/calibration_logs/{camera,checkerboard,flange}_transforms.json`
-   (see §4.6) in addition to updating the live YAML configs.
+Every stage's result + quality metrics is appended (never overwritten) to
+`outputs/calibration_logs/{camera,checkerboard,flange}_transforms.json` — see
+[src/calibration/calibration_log.py](../src/calibration/calibration_log.py)
+for the exact schema — in addition to updating the live YAML configs above.
 
 The original single-arm, single-camera manual scripts
-(`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`,
-§4.7 below) still work standalone if you ever need to recalibrate just one
-camera by hand — the dual-arm routine reuses their PnP/AX=XB solving code
-directly, it doesn't replace or remove them.
-
-**Hand-guided alternative to step 1**: `capture_flange_poses_dual_handguided.py`
-does the same job as `capture_flange_poses_dual.py` but expects the arm to
-be physically hand-guided (gravity-compensation mode,
-`ros2 launch lbr_dual_arm_bringup calibration.launch.py`) instead of jogged
-in RViz, and additionally saves the joint configuration so step 2's replay
-reproduces the exact captured posture (not just an equivalent Cartesian
-pose) via joint-space MoveGroup goals. See
-[hand_guided_calibration.md](hand_guided_calibration.md) for the full
-writeup. The two capture scripts' outputs are not interchangeable for
-`autocalibrate_dual_realsense.py` — pick one and use it for both arms.
-
-### 4.1 Bring everything up
-
-Real dual-arm hardware bringup (**not** `mock.launch.py` — Stage A/B need
-real, varied flange motion) plus MoveIt, in two terminals:
-
-```bash
-# Terminal 1 — use_gripper defaults to true (Y-gripper attached); pass
-# use_gripper:=false for the bare flange instead.
-ros2 launch lbr_dual_arm_bringup hardware.launch.py use_gripper:=true
-
-# Terminal 2 — use_gripper must match Terminal 1's value.
-ros2 launch lbr_dual_arm_bringup move_group.launch.py mode:=hardware rviz:=true use_gripper:=true
-```
-
-Then start the `LBRServer` app on **both** pendants (left, then right) to
-open the FRI UDP connections `hardware.launch.py` is waiting on — see
-`~/Desktop/KUKA_dual_arm_CHEATSHEET.md` for the full pre-flight checklist
-(T1 mode, port 30200/30201, etc.).
-
-Also bring up the host camera stack and verify both RealSense RGB topics and
-both flange-pose topics are live:
-
-```bash
-scripts/launch_host_realsense.sh
-ros2 topic echo /left/ee_pose --once
-ros2 topic echo /right/ee_pose --once
-```
-
-For **Step 1** (`capture_flange_poses_dual.py`), jog each arm in RViz's
-**MotionPlanning** panel exactly as in
-[moveit_robot_control.md](moveit_robot_control.md) — drag the interactive
-marker on that arm's flange, **Plan & Execute**. **Step 2**
-(`autocalibrate_dual_realsense.py`) needs no jogging at all; it drives the
-arms itself through the same `move_group` this terminal started, via the
-`moveit_msgs/action/MoveGroup` action directly (see
-[src/calibration/moveit_dual_arm.py](../src/calibration/moveit_dual_arm.py) —
-there is no `moveit_commander`/`moveit_py` Python package installed in this
-environment, so this talks to the same action `move_group`'s own RViz plugin
-uses under the hood).
-
-### 4.2 Recommended Foxglove layout
-
-`capture_flange_poses_dual.py` publishes
-`/calibration/capture_flange_poses/<left|right>/debug_image`;
-`autocalibrate_dual_realsense.py` publishes
-`/calibration/autocalibrate/<left|right>/debug_image` — add an **Image**
-panel on whichever is running so you can confirm the checkerboard is
-visible. Also useful: a **3D** panel with the robot model, and **Raw
-Messages** panels on `/left/ee_pose` and `/right/ee_pose`. Same
-`foxglove_bridge` as `launch_host_realsense.sh` already starts.
-
-### 4.3 Step 1 — capture flange poses (manual, per arm)
-
-Inside the `vision` container:
-
-```bash
-python3 -m src.calibration.capture_flange_poses_dual --arm left
-python3 -m src.calibration.capture_flange_poses_dual --arm right
-```
-
-For each of the recommended **7 samples per arm**: jog that arm with MoveIt
-to a pose where the checkerboard is fully visible to its own wrist
-RealSense, let it settle, press Enter. A live checkerboard detection on that
-arm's camera gates the capture (reject if the board isn't actually
-in view or the reprojection error is too high) — but only the **flange
-pose** is saved, not the checkerboard's own pose. **Vary orientation, not
-just position** across at least the first 5 of the 7 — those are the ones
-`autocalibrate_dual_realsense.py` uses for the `AX=XB` hand-eye solve by
-default (`--num-handeye-poses`, default 5), which is only well-conditioned
-with real rotational diversity; the last 2 (`--num-board-poses`, default 2)
-are used for the checkerboard-pose solve, where the pose itself matters less
-since `T_flange_cam` is already known by that point.
-
-Every capture is written immediately to
-`config/flange_poses/<left|right>.json` — safe to stop with `q` early (if
-you already have >= 1 sample) or Ctrl-C between captures; nothing already
-accepted is lost. Pass `--append` to add to a previous session's captures
-instead of starting over.
-
-Keep the checkerboard **fixed** for the rest of this whole section — Step 2
-replays these exact poses assuming the board hasn't moved.
-
-### 4.4 Step 2 — automatic calibration (replay + solve)
-
-```bash
-python3 -m src.calibration.autocalibrate_dual_realsense
-```
-
-Runs Stage A → B → C in order (see §4.0), aborting before any later stage if
-an earlier one doesn't have enough accepted samples — nothing partial is
-ever written to the YAML configs. Pass `--skip-zed` to stop after Stage B
-(e.g. if you want to inspect the checkerboard pose before trusting the ZED
-solve to it), then run `scripts/calibrate_zed_from_board_pose.sh` separately
-once satisfied. `--min-handeye-samples` (default 5) can loosen the Stage A
-gate if you deliberately captured fewer poses.
-
-Stage A drives both arms **simultaneously** per pose-pair (a single
-`both_arms` MoveGroup goal covering both tip links at once, see
-`moveit_dual_arm.ArmTarget`/`DualArmMoveitClient.move_to`) — MoveIt supports
-this directly since `lbr_dual_arm_moveit_config`'s SRDF already defines a
-`both_arms` planning group. Stage B moves one arm at a time (each board-pose
-sample only needs one camera).
-
-Stage A writes `T_flange_cam` for **both** `realsense_1` and `realsense_2`
-into `config/camera_extrinsics_realsense.yaml` together (backing up to
-`.yaml.bak` first). Stage B overwrites `config/base_board_pose.yaml`. Stage C
-(via `scripts/calibrate_zed_from_board_pose.sh`) overwrites
-`config/camera_extrinsics_base.yaml`'s `zed2i_1` entry, reusing
-[src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py)'s
-existing PnP + averaging + QA-gate logic (that script now takes a
-`--cam-ids` list — still defaults to the original 3-ZED trio with no args —
-scoped here to the single ZED this rig has).
-
-### 4.5 Sanity-checking the result
-
-Compare each `T_flange_cam` translation magnitude against a rough physical
-estimate (camera is bolted a few cm from the flange, not tens of
-centimeters) — a wildly large translation usually means too few/too
-correlated samples rather than a real mechanical offset. Also see the
-`lbr_link_0 == base` assumption flagged in
-[§5.2](#52-whats-implemented-flange_pose_publisher) below: Stage B's
-computed board pose is a good way to *verify* that assumption, since it's
-now derived from real tf data instead of a hand-typed guess.
-
-### 4.6 Where the calibration history + quality metrics live
-
-Every run of `autocalibrate_dual_realsense.py` (and any standalone run of
-`base_to_cams_calib_3.py`) **appends** an entry — never overwrites — to:
-
-| File | What's logged |
-|---|---|
-| `outputs/calibration_logs/camera_transforms.json` | One entry per camera per run: `T_flange_cam` (RealSense, Stage A) or `T_base_cam` (ZED, Stage C) plus its QA metrics (`AX=XB` rotation/translation residuals for hand-eye; reprojection error + translation/rotation std for the static ZED solve). |
-| `outputs/calibration_logs/checkerboard_transforms.json` | One entry per Stage B run: the solved `T_base_board`, sample count, translation/rotation std, mean reprojection error. |
-| `outputs/calibration_logs/flange_transforms.json` | One entry per arm per Stage A+B run: exactly which saved `config/flange_poses/<arm>.json` capture indices were used for hand-eye vs. board-pose, with each capture's own pose inlined (self-contained even if the flange-pose file is later overwritten by a fresh capture session). |
-
-See [src/calibration/calibration_log.py](../src/calibration/calibration_log.py)
-for the exact schema. The live YAML configs
-(`config/camera_extrinsics_realsense.yaml`, `config/camera_extrinsics_base.yaml`,
-`config/base_board_pose.yaml`) still only ever hold the *latest* calibration —
-these JSON logs are the append-only history + QA trail alongside them.
-
-### 4.7 Manual single-camera fallback (original scripts, still available)
-
-If you need to recalibrate just one RealSense by hand instead of running the
-full dual-arm routine (e.g. only one camera physically moved), the original
-manual, single-arm/single-camera scripts are unchanged and still work:
-
-```bash
-python3 -m src.calibration.handeye_flange_cam_realsense --cam-id realsense_1
-python3 -m src.calibration.board_pose_from_flange_realsense --cam-id realsense_1
-```
-
+(`handeye_flange_cam_realsense.py`'s helpers, `board_pose_from_flange_realsense.py`)
+still work standalone if you ever need to recalibrate just one camera by
+hand — see calibration_cheatsheet.md's "Recalibrating later" section.
 [config/robot_bases.yaml](../config/robot_bases.yaml) records the two
-robots' base-frame offsets and an `active_robot` selector these two scripts
-read purely for logging/output-header purposes (they always compute poses
-directly in whatever robot's `lbr_link_0`/`lbr_{one,two}_link_0` is actually
-streaming tf on the machine you run them on). **Set `active_robot` to match
-the arm you're actually calibrating before running either script.** See each
-script's own docstring for the full per-sample walkthrough (jog with
-MoveIt → press Enter → repeat >= 10-15 times for hand-eye, >= 5 for
-board-pose).
+robots' base-frame offsets and an `active_robot` selector; set it to match
+whichever arm you're calibrating before running `board_pose_from_flange_realsense.py`
+standalone.
 
 ---
 
@@ -790,8 +619,8 @@ table above).
   copy-pasteable command sequence for the whole dual-arm calibration routine
   (§4 below), print-and-tape-to-the-rig style.
 - **[moveit_robot_control.md](moveit_robot_control.md)** — how to jog the KUKA
-  LBR via MoveIt's RViz plugin, used to position the arm during §4.3 (Step 1)
-  captures.
+  LBR via MoveIt's RViz plugin, used to position the arm during Stage A
+  captures with `--controller moveit`.
 - **[README §6](../README.md#6-realsense-trio-variant)**
   — condensed version of §1 above, for quick reference.
 - **[config/camera_extrinsics_realsense.yaml](../config/camera_extrinsics_realsense.yaml)**
@@ -800,38 +629,41 @@ table above).
   offsets (Robot A / Robot B) and the `active_robot` selector used by §4's
   calibration scripts.
 - **[config/flange_poses/](../config/flange_poses/)** — permanent per-arm
-  flange pose captures written by `capture_flange_poses_dual.py` (§4.3) and
-  read back by `autocalibrate_dual_realsense.py` (§4.4). See
+  flange pose captures written by `capture_handeye_data.py` and read back by
+  its own `--mode replay` and by `autocalibrate_dual_realsense.py`. See
   `src/calibration/flange_pose_store.py` for the JSON schema.
 - **[outputs/calibration_logs/](../outputs/calibration_logs/)** — append-only
-  JSON history of every calibration run's transforms + quality metrics (§4.6),
+  JSON history of every calibration run's transforms + quality metrics,
   written by `calibration_log.py`.
-- **[src/calibration/capture_flange_poses_dual.py](../src/calibration/capture_flange_poses_dual.py)**
-  — dual-arm routine Step 1 (manual): jog each arm, save its flange poses
-  permanently. See §4.3.
+- **[src/calibration/capture_handeye_data.py](../src/calibration/capture_handeye_data.py)**
+  — Stage A (manual or replay): position each arm (any controller), save its
+  flange pose/joint config AND checkerboard image/detection. See
+  [calibration_cheatsheet.md](calibration_cheatsheet.md).
+- **[src/calibration/calibrate_handeye.py](../src/calibration/calibrate_handeye.py)**
+  — Stage B (offline): solves `T_flange_cam` from Stage A's saved data,
+  `--method direct` (closed-form) or `--method joint` (bundle adjustment,
+  see [joint_handeye_calibration.md](joint_handeye_calibration.md)).
 - **[src/calibration/autocalibrate_dual_realsense.py](../src/calibration/autocalibrate_dual_realsense.py)**
-  — dual-arm routine Step 2 (automatic): replays the saved poses to solve
-  hand-eye (Stage A), checkerboard pose (Stage B), and the ZED extrinsic
-  (Stage C). See §4.4.
+  — board-pose + ZED calibration (automatic replay), run after Stage A/B.
 - **[src/calibration/moveit_dual_arm.py](../src/calibration/moveit_dual_arm.py)**
-  — `MoveGroup` action-client helper used by Step 2 above; the only code in
-  this repo that sends motion commands to the robot (`ArmTarget`,
-  `DualArmMoveitClient.move_to`, incl. the simultaneous `both_arms` goal).
+  — `MoveGroup` action-client helper used by Stage A's replay mode and the
+  script above; the only code in this repo that sends motion commands to the
+  robot (`ArmTarget`/`JointTarget`, incl. the simultaneous `both_arms_flange`
+  goal).
 - **[src/calibration/flange_pose_store.py](../src/calibration/flange_pose_store.py)**
   — JSON schema + save/load for `config/flange_poses/<left,right>.json`.
 - **[src/calibration/calibration_log.py](../src/calibration/calibration_log.py)**
-  — append-only JSON run logs under `outputs/calibration_logs/` (§4.6).
+  — append-only JSON run logs under `outputs/calibration_logs/`.
 - **[src/calibration/handeye_flange_cam_realsense.py](../src/calibration/handeye_flange_cam_realsense.py)**
-  — manual single-camera fallback (§4.7): solves `T_flange_cam` via
-  `cv2.calibrateHandEye`. Its PnP/reprojection/AX=XB-solving helpers are
-  reused directly by the dual-arm Step 2 script above.
+  — helpers-only module: PnP/reprojection/AX=XB-solving + the `HandEyeSample`
+  schema, shared by Stage A, Stage B, and the script below.
 - **[src/calibration/board_pose_from_flange_realsense.py](../src/calibration/board_pose_from_flange_realsense.py)**
-  — manual single-camera fallback (§4.7): computes the checkerboard's pose in
-  the robot base frame using Stage 1's result. Its averaging/RPY helpers are
-  reused directly by the dual-arm Step 2 script above.
+  — manual single-camera fallback: computes the checkerboard's pose in
+  the robot base frame given an already-solved `T_flange_cam`. Its
+  averaging/RPY helpers are reused directly by `autocalibrate_dual_realsense.py`.
 - **[src/calibration/base_to_cams_calib_3.py](../src/calibration/base_to_cams_calib_3.py)**
   — static camera-to-base calibration, now generalized to an arbitrary
-  `--cam-ids` list (defaults to the 3-ZED trio). §4.4 Stage C pins this to
+  `--cam-ids` list (defaults to the 3-ZED trio). The ZED stage pins this to
   the single `zed2i_1` via `scripts/calibrate_zed_from_board_pose.sh`.
 - **[src/calibration/realsense_devices.py](../src/calibration/realsense_devices.py)**
   — wraps `rs-enumerate-devices -s` to list/match connected RealSense cameras.
