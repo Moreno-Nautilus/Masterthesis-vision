@@ -217,6 +217,16 @@ loop as Stage A, scoped to only `config/base_board_pose.yaml`:
 python3 -m src.calibration.capture_board_pose_data
 ```
 
+**Checkerboard hasn't moved and you already ran Stage A?** Skip the robot
+entirely with `--source handeye` — recomputes `config/base_board_pose.yaml`
+straight from Stage A's already-saved images/detections
+(`outputs/calibration_debug/handeye/<cam_id>/`), no camera stack or
+bring-up needed, pools every saved sample for both arms:
+
+```bash
+python3 -m src.calibration.capture_board_pose_data --source handeye
+```
+
 Otherwise, the fully automatic hands-off path (drives to saved flange poses,
 augments, and runs ZED too):
 
@@ -388,9 +398,10 @@ Defaults below are what you get by passing no flag at all — see
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--arm {left,right,both}` | `both` | Which arm(s)' wrist camera may capture a sample. With `both`, samples are pooled: left captures first, right only tops up if left didn't reach `--num-samples`. |
-| `--controller {moveit,admittance,handguided}` | `moveit` | How the arm gets positioned — same semantics as `capture_handeye_data.py --mode interactive`. |
-| `--num-samples N` | `5` | Pooled total across whichever arm(s) are used (matches `autocalibrate_dual_realsense.py`'s `--target-board-samples`). |
-| `--append` | off | Extend the existing pooled sample set under `outputs/calibration_debug/board_pose/dual/` instead of archiving it first (only valid if the checkerboard hasn't moved). |
-| `--gain-profile {holding,insertion}` | none | `--controller admittance` only. |
-| `--no-debug-topic` | off | Skip publishing the `/calibration/capture_board_pose_data/<arm>/debug_image` topic. |
+| `--source {live,handeye}` | `live` | `live`: jog the real arm(s), capture fresh images (needs bring-up + camera stack). `handeye`: no robot/camera at all — recompute straight from Stage A's already-saved `outputs/calibration_debug/handeye/<cam_id>/` detections. `--controller`/`--gain-profile`/`--no-debug-topic` are ignored under `handeye`, and `--num-samples` is ignored too (pools *every* saved sample per requested arm instead). |
+| `--arm {left,right,both}` | `both` | Which arm(s)' wrist camera may contribute a sample. `--source live` + `both`: pooled, left captures first, right only tops up if left didn't reach `--num-samples`. `--source handeye`: restricts which arm's saved sample directory is read. |
+| `--controller {moveit,admittance,handguided}` | `moveit` | `--source live` only. How the arm gets positioned — same semantics as `capture_handeye_data.py --mode interactive`. |
+| `--num-samples N` | `5` | `--source live` only. Pooled total across whichever arm(s) are used (matches `autocalibrate_dual_realsense.py`'s `--target-board-samples`). |
+| `--append` | off | Extend the existing pooled sample set under `outputs/calibration_debug/board_pose/dual/` instead of archiving it first (only valid if the checkerboard hasn't moved). Works with either `--source`. |
+| `--gain-profile {holding,insertion}` | none | `--source live --controller admittance` only. |
+| `--no-debug-topic` | off | `--source live` only. Skip publishing the `/calibration/capture_board_pose_data/<arm>/debug_image` topic. |

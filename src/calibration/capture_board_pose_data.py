@@ -1,48 +1,80 @@
 """Standalone recapture of ONLY the checkerboard board-pose sample set --
 gathers exactly `--num-samples` (default 5, pooled across whichever arm(s)
-are used) fresh checkerboard detections via interactive manual positioning,
-same prompt-driven capture loop as capture_handeye_data.py (position the
-arm, press Enter, capture), then overwrites config/base_board_pose.yaml.
+are used) checkerboard detections, then overwrites config/base_board_pose.yaml.
+
+Two ways to get those detections (--source):
+  live     (default) -- interactive manual positioning, same prompt-driven
+      capture loop as capture_handeye_data.py (position the arm, press
+      Enter, capture a FRESH image live).
+  handeye  -- no robot motion, no camera needed at all: reuses the
+      images/detections ALREADY saved by capture_handeye_data.py under
+      outputs/calibration_debug/handeye/<cam_id>/sample_*.json (each one
+      already has T_base_flange + T_cam_board from Stage A) and just
+      recomputes T_base_board = T_base_flange @ T_flange_cam @ T_cam_board
+      from that existing data. Use this when you already ran Stage A and
+      the checkerboard hasn't moved since -- see that flag's own section
+      below.
 
 This is the manual/interactive alternative to
 autocalibrate_dual_realsense.py's board-pose stage, which instead
 auto-replays previously-saved flange poses and perturbs via Cartesian IK to
 fill the gap. Use this script when you just want to redo the 5-sample
-board-pose average by hand -- e.g. the checkerboard moved and you don't want
-to re-run the full autocalibrate pipeline (which also drives via saved
-flange poses and runs the ZED stage). Scope is deliberately narrow: this
-script NEVER touches config/flange_poses/<arm>.json (Stage A's hand-eye
-flange-pose captures) and NEVER runs ZED calibration -- for that, use
+board-pose average -- e.g. the checkerboard moved and you don't want to
+re-run the full autocalibrate pipeline (which also drives via saved flange
+poses and runs the ZED stage). Scope is deliberately narrow: this script
+NEVER touches config/flange_poses/<arm>.json (Stage A's hand-eye flange-pose
+captures) and NEVER runs ZED calibration -- for that, use
 autocalibrate_dual_realsense.py (optionally --zed-only) or
 scripts/calibrate_zed_from_board_pose.sh directly, once this script has
 written a fresh config/base_board_pose.yaml.
 
 Requires hand-eye already solved (config/camera_extrinsics_realsense.yaml
 has a real, non-identity T_flange_cam) for whichever camera(s) --arm
-selects -- same prerequisite autocalibrate_dual_realsense.py checks.
+selects -- same prerequisite autocalibrate_dual_realsense.py checks. Neither
+--source trusts or re-derives T_flange_cam itself; both just read it.
+
+--source {live,handeye} (default: live)
+    live -- as described above: drives/jogs the real arm(s), captures fresh
+        images. Needs the robot bring-up + camera stack running (see the
+        "Run" section below).
+    handeye -- purely offline recompute from Stage A's already-saved
+        detections. --controller/--gain-profile/--no-debug-topic are
+        ignored (no robot motion, nothing to jog, no debug topic to
+        publish). Ignores --num-samples too: pools ALL of the requested
+        arm(s)' saved hand-eye samples (not just the last N) since more,
+        already-accepted samples only make the average more robust --
+        pass --arm to restrict which arm's samples are used if you only
+        trust one camera's set. No ROS node, no rclpy.init() even -- this
+        is plain file I/O + linear algebra, runs anywhere with the repo
+        checked out. Copies each source sample's debug PNG over (for
+        traceability back to which Stage A capture it came from) if that
+        PNG is still on disk.
 
 --arm {left,right,both} (default: both)
-    Which arm(s)' wrist RealSense may be used to capture a sample this run.
-    Unlike capture_handeye_data.py (which runs each requested arm's capture
-    loop to completion, one after another), a board-pose sample only needs
+    Which arm(s)' wrist RealSense may contribute a sample this run. Applies
+    to both --source values. --source live: a board-pose sample only needs
     ONE camera and the checkerboard is a single shared fixed object, so
     samples from both arms are pooled into one running total toward
     --num-samples: with --arm both, this script captures with left first,
     then tops up with right only if left didn't reach the target (type
-    'q' + Enter to move on from an arm early).
+    'q' + Enter to move on from an arm early). --source handeye: restricts
+    which arm's saved hand-eye sample directory gets read.
 
 --controller {moveit,admittance,handguided} (default: moveit)
-    How the arm gets positioned before each capture -- identical semantics
-    to capture_handeye_data.py's --mode interactive. moveit/handguided need
-    no active control loop from this script (jog via RViz or physically
+    --source live only -- ignored (with a note) for --source handeye. How
+    the arm gets positioned before each capture -- identical semantics to
+    capture_handeye_data.py's --mode interactive. moveit/handguided need no
+    active control loop from this script (jog via RViz or physically
     hand-guide, respectively); admittance runs AdmittanceDualArmNode scoped
     to whichever arm is currently being captured, in a background thread
     alongside the prompt.
 
 --num-samples N (default: 5)
-    Total POOLED sample target -- matches
-    autocalibrate_dual_realsense.py's --target-board-samples default.
-    Existing on-disk samples count toward this when --append is given.
+    --source live only -- ignored (with a note) for --source handeye, which
+    always pools every saved sample instead (see --source above). Total
+    POOLED sample target -- matches autocalibrate_dual_realsense.py's
+    --target-board-samples default. Existing on-disk samples count toward
+    this when --append is given.
 
 Backup-before-overwrite: unless --append, archives (moves) any existing
 outputs/calibration_debug/board_pose/dual/ and config/base_board_pose.yaml
@@ -65,11 +97,18 @@ host camera stack (scripts/launch_host_realsense.sh) up:
 
     # Extend the existing pooled set instead of starting over (checkerboard hasn't moved):
     python3 -m src.calibration.capture_board_pose_data --append --num-samples 8
+
+Or, with --source handeye, no robot/camera stack needed at all -- reuses
+whatever Stage A already captured (run from anywhere the repo is checked out):
+
+    python3 -m src.calibration.capture_board_pose_data --source handeye
+    python3 -m src.calibration.capture_board_pose_data --source handeye --arm right
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -97,15 +136,21 @@ from src.calibration.board_pose_from_flange_realsense import (
     _save_sample_json as _save_board_sample_json,
 )
 from src.calibration.calibration_log import log_checkerboard_transform
-from src.calibration.capture_handeye_data import _archive_if_exists, _restore_untouched_backups
+from src.calibration.capture_handeye_data import (
+    HANDEYE_DEBUG_DIR,
+    _archive_if_exists,
+    _restore_untouched_backups,
+)
 from src.calibration.flange_pose_store import ARM_KEYS
 from src.calibration.handeye_flange_cam_realsense import (
     MAX_REPROJ_ERR_PX,
     RGB_INFO_MAX_DT_S,
+    HandEyeSample,
     _camera_topics,
     _draw_chessboard,
     _img_to_numpy_bgr,
     _K_from_camerainfo,
+    _load_samples_from_dir as _load_handeye_samples_from_dir,
     _rgb_numpy_to_imgmsg,
     _solve_board_pose,
     _stamp_to_sec,
@@ -117,6 +162,7 @@ from src.utils.robot_bases import get_active_robot_base, load_robot_bases
 from src.utils.se3 import SE3
 
 CONTROLLERS = ("moveit", "admittance", "handguided")
+SOURCES = ("live", "handeye")
 
 FLANGE_POSE_MAX_AGE_S = 0.25
 DEFAULT_NUM_SAMPLES = 5   # matches autocalibrate_dual_realsense.py's DEFAULT_TARGET_BOARD_SAMPLES
@@ -445,8 +491,73 @@ def _run_interactive(arms: list[str], args: argparse.Namespace) -> None:
     _average_and_write(samples)
 
 
+def _run_from_handeye(arms: list[str], args: argparse.Namespace) -> None:
+    """No robot motion, no camera: recomputes T_base_board directly from
+    Stage A's already-saved outputs/calibration_debug/handeye/<cam_id>/
+    sample_*.json (each already has T_base_flange + T_cam_board -- see
+    module docstring's --source handeye section)."""
+    if args.controller != "moveit" or args.gain_profile is not None:
+        print("NOTE: --controller/--gain-profile are ignored with --source handeye (no robot motion).")
+    if args.no_debug_topic:
+        print("NOTE: --no-debug-topic has no effect with --source handeye (no debug topic published).")
+
+    debug_dir = BOARD_POSE_DEBUG_DIR
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    samples: list[BoardPoseSample] = []
+    if args.append:
+        samples = _load_board_samples_from_dir(debug_dir)
+        if samples:
+            print(f"Appending to {len(samples)} existing pooled board-pose sample(s) under {debug_dir}")
+
+    T_flange_cam_by_cam = _require_handeye_done(arms)
+    robot_bases_map = load_robot_bases(ROBOT_BASES_YAML)
+    next_idx = max((s.idx for s in samples), default=-1) + 1
+
+    for arm_key in arms:
+        arm = ARM_KEYS[arm_key]
+        handeye_dir = HANDEYE_DEBUG_DIR / arm["cam_id"]
+        handeye_samples = _load_handeye_samples_from_dir(handeye_dir)
+        if not handeye_samples:
+            print(f"  [skip] no saved hand-eye samples under {handeye_dir} for arm={arm_key}.")
+            continue
+
+        T_flange_cam = T_flange_cam_by_cam[arm["cam_id"]]
+        T_robotA_armBase = robot_bases_map[arm["robot_base_key"]]
+        print(
+            f"\narm={arm_key}: pooling all {len(handeye_samples)} saved hand-eye sample(s) "
+            f"under {handeye_dir} (idx={[hs.idx for hs in handeye_samples]})"
+        )
+
+        for hs in handeye_samples:
+            T_armBase_board = hs.T_base_flange @ T_flange_cam @ hs.T_cam_board
+            T_robotA_board = T_robotA_armBase @ T_armBase_board
+            sample = BoardPoseSample(idx=next_idx, T_base_board=T_robotA_board, reproj_px=hs.reproj_px)
+            _save_board_sample_json(debug_dir, sample)
+            src_png = handeye_dir / f"sample_{hs.idx:02d}.png"
+            if src_png.exists():
+                shutil.copy2(src_png, debug_dir / f"sample_{next_idx:02d}_{arm_key}.png")
+            samples.append(sample)
+            next_idx += 1
+
+    print(f"\nDone. {len(samples)} pooled board-pose sample(s) sourced from existing hand-eye captures.")
+    if len(samples) < 2:
+        raise RuntimeError(
+            f"Only {len(samples)} pooled sample(s) across {arms} -- need >= 2 to average a board "
+            f"pose. Run capture_handeye_data.py for more arm(s)/samples first."
+        )
+
+    _average_and_write(samples)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--source", choices=SOURCES, default="live",
+        help="'live': jog the real arm(s) and capture fresh images (needs the robot/camera stack "
+             "running). 'handeye': no robot motion -- recompute from Stage A's already-saved "
+             "outputs/calibration_debug/handeye/<cam_id>/ detections instead (see module docstring).",
+    )
     parser.add_argument("--arm", choices=("left", "right", "both"), default="both")
     parser.add_argument("--controller", choices=CONTROLLERS, default="moveit")
     parser.add_argument(
@@ -482,6 +593,16 @@ def main() -> None:
         if backup:
             print(f"Archived existing {BASE_BOARD_YAML} -> {backup}")
             archived.append((BASE_BOARD_YAML, backup))
+
+    if args.source == "handeye":
+        # No robot/camera involved -- plain file I/O + linear algebra, no
+        # rclpy node needed at all.
+        try:
+            _run_from_handeye(arms, args)
+        except BaseException:
+            _restore_untouched_backups(archived)
+            raise
+        return
 
     rclpy.init()
     try:
