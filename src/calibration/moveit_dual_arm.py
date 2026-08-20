@@ -57,6 +57,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
+from builtin_interfaces.msg import Duration as DurationMsg
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
@@ -65,7 +66,9 @@ from moveit_msgs.msg import (
     MoveItErrorCodes,
     OrientationConstraint,
     PositionConstraint,
+    RobotState,
 )
+from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -91,6 +94,25 @@ PLANNING_TIME_S = 10.0
 NUM_PLANNING_ATTEMPTS = 5
 VELOCITY_SCALING = 0.15
 ACCELERATION_SCALING = 0.15
+
+# move_to()/plan_only() hand goal IK off to MoveGroup's own
+# IKConstraintSampler, which seeds each attempt from a RANDOM state within
+# joint limits -- not the robot's current configuration. For calibration's
+# small-Cartesian-perturbation augmentation (pose_augmentation.py), that
+# means a tiny Cartesian offset can still land on a completely different
+# elbow/null-space solution for this redundant 7-DOF arm, which OMPL then
+# happily plans a large, visually pointless joint-space path to reach --
+# even though the requested Cartesian motion was small.
+#
+# move_to_seeded() avoids this: it solves IK itself via MoveIt's
+# /compute_ik service, seeded from current_joint_positions() (so KDL's
+# numerical solver converges to the NEAREST solution, not a random one),
+# then drives there via move_to_joint() -- exact joint-space goal, no
+# further IK involved. Timeout below is the /compute_ik service call's own
+# budget, independent of kinematics.yaml's per-solver
+# kinematics_solver_timeout (0.005s -- that's KDL's internal Newton
+# iteration budget for one solve attempt).
+IK_SEED_SERVICE_TIMEOUT_S = 1.0
 
 # move_group's own current-state monitor can still be "dirty" (no valid link
 # transforms yet) for a short window right after move_group.launch.py comes
@@ -259,6 +281,9 @@ class DualArmMoveitClient:
         move_action = f"/{namespace}/move_action" if namespace else "/move_action"
         self._client = ActionClient(node, MoveGroup, move_action)
 
+        compute_ik = f"/{namespace}/compute_ik" if namespace else "/compute_ik"
+        self._ik_client = node.create_client(GetPositionIK, compute_ik)
+
         # Tracks the latest /lbr_dual_arm/joint_states, so move_to_joint()
         # can read back what was actually achieved after a goal completes.
         # Updated by rclpy spin -- _send_goal_and_wait() already spins the
@@ -271,6 +296,13 @@ class DualArmMoveitClient:
 
     def _on_joint_state(self, msg: JointState) -> None:
         self._joint_state_positions = dict(zip(msg.name, msg.position))
+
+    def current_joint_positions(self) -> dict[str, float]:
+        """Latest /lbr_dual_arm/joint_states snapshot (all joints, both
+        arms) -- for callers that need to read back an achieved joint
+        configuration after a Cartesian (move_to) goal, which -- unlike
+        move_to_joint() -- has no requested joint values of its own to log."""
+        return dict(self._joint_state_positions)
 
     def wait_for_server(self, timeout_s: float = 10.0) -> bool:
         return self._client.wait_for_server(timeout_sec=timeout_s)
@@ -452,6 +484,99 @@ class DualArmMoveitClient:
             )
         return ok
 
+    def _solve_ik_seeded(self, target: ArmTarget) -> Optional[dict[str, float]]:
+        """Solve IK for `target` via MoveIt's /compute_ik service, seeded
+        from the CURRENT joint state -- unlike move_to()/plan_only(), which
+        hand the pose goal to MoveGroup's IKConstraintSampler and get back
+        whichever solution its random seed happened to converge to (see
+        IK_SEED_SERVICE_TIMEOUT_S above).
+
+        Returns the SOLVED GROUP's own joint values only (name -> radians;
+        e.g. just the "lbr_one_*" joints for target.group_name="arm_one_flange"),
+        filtered out of the full-robot solution /compute_ik returns, so the
+        result can be handed straight to a JointTarget without also forcing
+        the other arm to hold its current position via that same goal. None
+        if the service is unavailable, times out, or finds no solution.
+        """
+        seed = self.current_joint_positions()
+        if not seed:
+            self._node.get_logger().error(
+                "_solve_ik_seeded: no /lbr_dual_arm/joint_states received yet -- can't seed IK."
+            )
+            return None
+
+        if not self._ik_client.service_is_ready():
+            if not self._ik_client.wait_for_service(timeout_sec=IK_SEED_SERVICE_TIMEOUT_S):
+                self._node.get_logger().error(
+                    "_solve_ik_seeded: /compute_ik service not available."
+                )
+                return None
+
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = target.group_name
+        req.ik_request.ik_link_name = target.tip_link
+        req.ik_request.robot_state = RobotState()
+        req.ik_request.robot_state.joint_state.name = list(seed.keys())
+        req.ik_request.robot_state.joint_state.position = list(seed.values())
+        req.ik_request.avoid_collisions = True
+        req.ik_request.pose_stamped = _se3_to_pose_stamped(target.T_armBase_flange, target.base_frame)
+        timeout_s = IK_SEED_SERVICE_TIMEOUT_S
+        req.ik_request.timeout = DurationMsg(
+            sec=int(timeout_s), nanosec=int((timeout_s % 1.0) * 1e9)
+        )
+
+        future = self._ik_client.call_async(req)
+        rclpy.spin_until_future_complete(self._node, future, timeout_sec=IK_SEED_SERVICE_TIMEOUT_S + 1.0)
+        resp = future.result()
+        if resp is None:
+            self._node.get_logger().error("_solve_ik_seeded: /compute_ik call timed out.")
+            return None
+        if resp.error_code.val != MoveItErrorCodes.SUCCESS:
+            self._node.get_logger().warn(
+                f"_solve_ik_seeded: no IK solution for group={target.group_name} "
+                f"(error_code={resp.error_code.val})."
+            )
+            return None
+
+        # base_frame is e.g. "lbr_one_link_0" -- strip the "_link_0" suffix
+        # to get this arm's own joint-name prefix ("lbr_one_"), so only
+        # this arm's joints are pulled out of the full-robot solution.
+        prefix = target.base_frame.removesuffix("_link_0") + "_"
+        solved = dict(zip(resp.solution.joint_state.name, resp.solution.joint_state.position))
+        group_solution = {name: pos for name, pos in solved.items() if name.startswith(prefix)}
+        if not group_solution:
+            self._node.get_logger().error(
+                f"_solve_ik_seeded: IK solution had no joints matching prefix '{prefix}' -- "
+                f"check target.base_frame/group_name."
+            )
+            return None
+        return group_solution
+
+    def move_to_seeded(self, target: ArmTarget, label: str = "") -> bool:
+        """Cartesian move_to()'s current-state-seeded twin -- drop-in
+        replacement for `move_to([target])` on a single-arm _flange group.
+
+        Solves IK itself via _solve_ik_seeded() (seeded from the arm's
+        current joints, so it converges to the nearest solution rather than
+        a random elbow/null-space configuration), then reproduces that exact
+        configuration via move_to_joint() -- no further IK involved, so the
+        resulting plan's start and goal are already close in joint space for
+        a small Cartesian perturbation, instead of OMPL being asked to
+        connect two arbitrarily-far-apart configurations.
+
+        Only valid for single-arm groups (arm_one_flange/arm_two_flange,
+        or their gripper-tipped equivalents) -- not composite groups like
+        both_arms_flange, since /compute_ik's single pose_stamped can't
+        express a simultaneous two-tip goal.
+        """
+        joint_positions = self._solve_ik_seeded(target)
+        if joint_positions is None:
+            return False
+        ok, _record = self.move_to_joint(
+            [JointTarget(group_name=target.group_name, joint_positions=joint_positions, label=label)]
+        )
+        return ok
+
     def _build_joint_goal(
         self, targets: list[JointTarget], group_name: Optional[str], plan_only: bool
     ) -> MoveGroup.Goal:
@@ -463,8 +588,22 @@ class DualArmMoveitClient:
         req.max_velocity_scaling_factor = VELOCITY_SCALING
         req.max_acceleration_scaling_factor = ACCELERATION_SCALING
 
+        # moveit_msgs/MotionPlanRequest.msg: "Each element of the [goal_constraints]
+        # array defines a goal region. The goal is achieved if the constraints for
+        # A particular region are satisfied" -- i.e. the elements of this list are
+        # OR'd, not AND'd. One target per arm each appended as its own element
+        # (the previous behavior here) therefore lets MoveGroup satisfy just ONE
+        # arm's JointConstraints and leave the other arm's joints completely
+        # unconstrained within the composite group -- observed as one arm landing
+        # exactly on its saved configuration and the other landing on an
+        # essentially arbitrary one. Merging every target's JointConstraints into
+        # a SINGLE Constraints (one goal_constraints element) requires all of
+        # them simultaneously, which is what a genuinely joint "both_arms_flange"
+        # goal needs.
+        merged = Constraints()
         for target in targets:
-            req.goal_constraints.append(_joint_goal_constraints(target))
+            merged.joint_constraints.extend(_joint_goal_constraints(target).joint_constraints)
+        req.goal_constraints.append(merged)
 
         goal.planning_options.plan_only = plan_only
         goal.planning_options.replan = False

@@ -130,6 +130,7 @@ from src.calibration.admittance_dual_arm import (
 )
 from src.calibration.board_pose_from_flange_realsense import (
     BoardPoseSample,
+    _apply_board_z_override,
     _average_se3,
     _load_samples_from_dir as _load_board_samples_from_dir,
     _rotation_matrix_to_rpy_deg,
@@ -363,6 +364,11 @@ def _average_and_write(samples: list[BoardPoseSample]) -> None:
     print(f"\nT_board averaged over {len(samples)} pooled sample(s) (robot_a frame):")
     print(T_robotA_board_avg)
     print(f"translation std: {t_std:.6f}m  rotation std: {rot_std_deg:.6f}deg  mean reproj: {reproj_mean:.3f}px")
+
+    # Solved z has been unreliable across recalibrations -- pin it to the
+    # known physical value instead of trusting the solve. See
+    # board_pose_from_flange_realsense.BOARD_Z_OVERRIDE_M.
+    T_robotA_board_avg = _apply_board_z_override(T_robotA_board_avg)
 
     # active_robot's own frame -- matches board_pose_from_flange_realsense.py /
     # autocalibrate_dual_realsense.py's convention: base_board_pose.yaml's

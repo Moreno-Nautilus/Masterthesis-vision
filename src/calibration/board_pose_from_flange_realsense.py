@@ -69,7 +69,21 @@ EXTRINSICS_YAML = "config/camera_extrinsics_realsense.yaml"
 OUT_YAML = "config/base_board_pose.yaml"
 DEBUG_DIR = "outputs/calibration_debug/board_pose"
 ROBOT_BASES_YAML = "config/robot_bases.yaml"
+
+# The vision-solved z has been unreliable across recalibrations (e.g. solved
+# -8mm on 2026-08-16 vs. the board's actual measured height) -- pin it to the
+# known physical value instead of trusting the solve. x/y/rotation are still
+# solved normally. z is frame-invariant here (robot_a/robot_b differ only by
+# a y-translation, see config/robot_bases.yaml), so overriding it once before
+# the robot_a<->active_robot frame conversion keeps both YAML entries consistent.
+BOARD_Z_OVERRIDE_M = -0.020
 # ------------------------------------------------
+
+
+def _apply_board_z_override(T: SE3) -> SE3:
+    t = T.t.copy()
+    t[2] = BOARD_Z_OVERRIDE_M
+    return SE3(T.R, t)
 
 
 def _rotation_matrix_to_rotvec(R: np.ndarray) -> np.ndarray:
@@ -240,6 +254,11 @@ def _average_and_write(
         raise RuntimeError(f"Calibration rejected: translation spread too high ({t_std:.6f}m)")
     if rot_std_deg > MAX_FINAL_ROTATION_STD_DEG:
         raise RuntimeError(f"Calibration rejected: rotation spread too high ({rot_std_deg:.6f}deg)")
+
+    # QA above used the true solved z (catches a bad capture); the written
+    # pose always gets the pinned z -- see BOARD_Z_OVERRIDE_M.
+    T_base_board_avg = _apply_board_z_override(T_base_board_avg)
+    T_robotA_board_avg = _apply_board_z_override(T_robotA_board_avg)
 
     roll, pitch, yaw = _rotation_matrix_to_rpy_deg(T_base_board_avg.R)
     roll_a, pitch_a, yaw_a = _rotation_matrix_to_rpy_deg(T_robotA_board_avg.R)
