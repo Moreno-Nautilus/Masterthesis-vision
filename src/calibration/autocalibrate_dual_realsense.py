@@ -27,6 +27,40 @@ Two stages, run in order, each gated on the previous succeeding:
     same fixed board in the same base frame (robot_b's captures are
     converted into robot_a's / the active robot's frame first via
     config/robot_bases.yaml, matching that script's convention).
+
+    Standard augmentation (always on, same procedure capture_handeye_data.py's
+    --mode augment uses): every known-pose detection is written to
+    outputs/calibration_debug/board_pose/dual/ (sample_NN.json/.png) the
+    moment it succeeds -- this never touches config/flange_poses/<arm>.json
+    (read-only input here) or discards anything already on disk. If those
+    known-pose detections yield MORE than `--target-board-samples` (default
+    5) total, a random subset of that many is used for the averaged
+    T_base_board (and as the perturbation-anchor pool below) rather than an
+    arbitrary first-N truncation -- but this only trims the in-memory
+    working set for THIS computation; the dropped samples' files stay on
+    disk. If fewer, picks one arm at random from whichever arm(s) actually
+    produced a successful sample and perturbs the MOST RECENT pose in that
+    arm's own pool (last known-good one first, then whichever perturbation
+    for that arm was just accepted -- NOT a random pick within the pool, so
+    consecutive targets for a given arm stay close together in Cartesian
+    AND joint space instead of forcing large swings on this redundant
+    7-DOF arm; perturbation math in pose_augmentation.py -- +/-3cm per
+    translation axis, +/-7deg per rotation axis), drives there via IK
+    seeded from the arm's current joint state (unlike the known-pose pass
+    above, a perturbed pose has no saved joint solution to replay -- see
+    DualArmMoveitClient.move_to_seeded's docstring for why this is seeded
+    rather than a plain Cartesian move_to()), and
+    attempts a detection -- accepting it and growing that arm's pool for
+    future perturbations, or discarding it and drawing a new one, until the
+    target is hit or the attempt budget runs out. Sample idx (and therefore
+    filenames) are a monotonic counter seeded from whatever's already in
+    debug_dir, so downsampling can never free up an idx that gets reused
+    (and silently overwritten) by a later augmented sample within the same
+    run, and re-running this stage never overwrites a previous run's
+    samples either. Works with however many arms are connected: an arm that
+    never produces a successful sample (no camera, board out of view, ...)
+    contributes nothing to the pool and is simply never drawn from.
+
     Overwrites config/base_board_pose.yaml and appends to
     outputs/calibration_logs/checkerboard_transforms.json.
 
@@ -48,11 +82,19 @@ exactly where it was during the capture_handeye_data.py session that
 produced config/flange_poses/*.json:
 
     python3 -m src.calibration.autocalibrate_dual_realsense
+
+If the checkerboard hasn't moved since the last full run and only the ZED
+needs recalibrating (e.g. after nudging its mount), skip the board-pose
+stage entirely and just redo the ZED stage against the existing
+config/base_board_pose.yaml with --zed-only:
+
+    python3 -m src.calibration.autocalibrate_dual_realsense --zed-only
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -91,12 +133,14 @@ from src.calibration.board_pose_from_flange_realsense import (
     _rotation_matrix_to_rpy_deg,
     _save_sample_json as _save_board_sample_json,
 )
-from src.calibration.moveit_dual_arm import DualArmMoveitClient, JointTarget
+from src.calibration.moveit_dual_arm import ArmTarget, DualArmMoveitClient, JointTarget
+from src.calibration.pose_augmentation import PoseAugmentationConfig, sample_augmented_pose
 from src.perception.ros.multicam_grabber_realsense import _pose_msg_to_se3
 from src.utils.robot_bases import get_active_robot_base, load_robot_bases
 from src.utils.se3 import SE3
 
 DEFAULT_NUM_BOARD_POSES = 2
+DEFAULT_TARGET_BOARD_SAMPLES = 5   # standard augmentation target (see module docstring)
 
 FLANGE_POSE_MAX_AGE_S = 0.25
 SETTLE_S = 1.5
@@ -222,6 +266,20 @@ def _require_joint_positions(captures: list[FlangePoseCapture], arm_key: str) ->
         )
 
 
+def _require_board_pose_done() -> None:
+    """Confirms config/base_board_pose.yaml already exists -- used by
+    --zed-only, which skips the board-pose stage entirely and expects a
+    prior run (or board_pose_from_flange_realsense.py) to have already
+    written a real T_base_board there."""
+    path = Path(BASE_BOARD_YAML)
+    if not path.exists():
+        raise RuntimeError(
+            f"{path} doesn't exist yet -- --zed-only skips the board-pose stage and "
+            f"reuses whatever's already there, so run this script once WITHOUT "
+            f"--zed-only first (or board_pose_from_flange_realsense.py) to compute it."
+        )
+
+
 def _require_handeye_done() -> dict[str, SE3]:
     """Loads config/camera_extrinsics_realsense.yaml and confirms both
     RealSense cameras already have a real (non-identity) T_flange_cam --
@@ -286,6 +344,7 @@ def _run_board_pose_stage(
     left_poses: list[FlangePoseCapture],
     right_poses: list[FlangePoseCapture],
     T_flange_cam_by_cam: dict[str, SE3],
+    target_board_samples: int = DEFAULT_TARGET_BOARD_SAMPLES,
 ) -> SE3:
     print("\n=== Board-pose stage: checkerboard pose in robot base frame (T_base_board) ===")
     active_robot, T_robotA_activeRobot = get_active_robot_base(ROBOT_BASES_YAML)
@@ -294,7 +353,24 @@ def _run_board_pose_stage(
     debug_dir = Path(BOARD_POSE_DEBUG_DIR) / "dual"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    all_samples_robotA: list[BoardPoseSample] = []
+    # Monotonic, never reused -- NOT len(known_records)/len(all_samples_robotA).
+    # Those shrink when the known set is downsampled below, so reusing a
+    # freed-up length as the next idx would silently overwrite the
+    # already-on-disk sample_NN.json/.png of a just-downsampled-away known
+    # record; seeding from whatever's already in debug_dir also means
+    # re-running this stage never overwrites a previous run's samples either.
+    existing_idxs = [
+        int(m.group(1)) for p in debug_dir.glob("sample_*.json")
+        if (m := re.match(r"sample_(\d+)\.json$", p.name))
+    ]
+    next_idx = max(existing_idxs, default=-1) + 1
+
+    rng = np.random.default_rng()
+    # (arm_key, sample, achieved T_armBase_flange) per successful known-pose
+    # replay -- kept as one list (rather than the two separate structures
+    # used further down) so a random subset can be dropped in one place if
+    # there turn out to be more successes than target_board_samples.
+    known_records: list[tuple[str, BoardPoseSample, SE3]] = []
 
     for arm_key, poses in (("left", left_poses), ("right", right_poses)):
         arm = ARM_KEYS[arm_key]
@@ -323,12 +399,95 @@ def _run_board_pose_stage(
             T_armBase_board = st.flange_pose @ T_flange_cam @ T_cam_board
             T_robotA_board = T_robotA_armBase @ T_armBase_board
 
-            idx = len(all_samples_robotA)
+            idx = next_idx
+            next_idx += 1
             cv2.imwrite(str(debug_dir / f"sample_{idx:02d}_{arm_key}.png"), vis)
             sample = BoardPoseSample(idx=idx, T_base_board=T_robotA_board, reproj_px=reproj_err)
             _save_board_sample_json(debug_dir, sample)
-            all_samples_robotA.append(sample)
+            known_records.append((arm_key, sample, st.flange_pose))
             print(f"  [ok:{arm_key}] reproj={reproj_err:.3f}px  T_robotA_board.t={T_robotA_board.t}")
+
+    # More known-good samples than the target -- randomly keep only
+    # target_board_samples of them (same "randomly sample ... until you have
+    # N" procedure the augmentation loop below uses to ADD samples, applied
+    # in reverse to trim an oversized known set) rather than an arbitrary
+    # first-N truncation.
+    n_known = len(known_records)
+    if n_known > target_board_samples:
+        keep = sorted(rng.choice(n_known, size=target_board_samples, replace=False))
+        known_records = [known_records[i] for i in keep]
+        print(f"\n{n_known} known-pose samples exceed target {target_board_samples} -- randomly kept {len(known_records)}.")
+
+    all_samples_robotA: list[BoardPoseSample] = [r[1] for r in known_records]
+    # Per-arm pool of ACHIEVED T_armBase_flange poses that produced a
+    # successful detection -- the augmentation pass below draws from these
+    # (whichever arm(s) actually have entries) rather than from the fixed
+    # `left_poses`/`right_poses` known set.
+    arm_pools: dict[str, list[SE3]] = {"left": [], "right": []}
+    for arm_key, _sample, flange_pose in known_records:
+        arm_pools[arm_key].append(flange_pose)
+
+    # Standard augmentation: fill the gap to target_board_samples by
+    # perturbing poses drawn from whichever arm(s) actually produced a
+    # successful sample above -- see module docstring / pose_augmentation.py.
+    n_needed = max(0, target_board_samples - len(all_samples_robotA))
+    if n_needed > 0:
+        print(
+            f"\n=== Board-pose augmentation: {len(all_samples_robotA)}/{target_board_samples} so far, "
+            f"perturbing to add up to {n_needed} more ==="
+        )
+        cfg = PoseAugmentationConfig()
+        attempts = 0
+        max_attempts = 20 * n_needed
+        while len(all_samples_robotA) < target_board_samples and attempts < max_attempts:
+            attempts += 1
+            eligible_arms = [k for k, pool in arm_pools.items() if pool]
+            if not eligible_arms:
+                print("  no arm has any successful sample to perturb from -- stopping augmentation.")
+                break
+            arm_key = eligible_arms[rng.integers(len(eligible_arms))]
+            arm = ARM_KEYS[arm_key]
+            cam_id = arm["cam_id"]
+            T_flange_cam = T_flange_cam_by_cam[cam_id]
+            T_robotA_armBase = robot_bases[arm["robot_base_key"]]
+
+            candidate = sample_augmented_pose(arm_pools[arm_key], rng, cfg)
+            arm_target = ArmTarget(
+                group_name=arm["group_name"], base_frame=arm["base_frame"],
+                tip_link=arm["flange_frame"], T_armBase_flange=candidate,
+            )
+            if not node.moveit.move_to_seeded(arm_target, label=f"{arm_key} board-pose augmented"):
+                continue
+            node.spin_briefly(SETTLE_S)
+
+            st = node.arms[arm_key]
+            if not st.has_fresh_flange_pose():
+                continue
+            result = _try_capture_board_from_cam(node, arm_key)
+            if result is None:
+                continue
+            T_cam_board, vis, reproj_err = result
+
+            T_armBase_board = st.flange_pose @ T_flange_cam @ T_cam_board
+            T_robotA_board = T_robotA_armBase @ T_armBase_board
+
+            idx = next_idx
+            next_idx += 1
+            cv2.imwrite(str(debug_dir / f"sample_{idx:02d}_{arm_key}_aug.png"), vis)
+            sample = BoardPoseSample(idx=idx, T_base_board=T_robotA_board, reproj_px=reproj_err)
+            _save_board_sample_json(debug_dir, sample)
+            all_samples_robotA.append(sample)
+            arm_pools[arm_key].append(st.flange_pose)
+            print(
+                f"  [ok:aug:{arm_key}] {len(all_samples_robotA)}/{target_board_samples}  "
+                f"reproj={reproj_err:.3f}px  T_robotA_board.t={T_robotA_board.t}"
+            )
+
+        if len(all_samples_robotA) < target_board_samples:
+            print(
+                f"WARNING: only reached {len(all_samples_robotA)}/{target_board_samples} board-pose "
+                f"samples after {attempts} augmentation attempts -- proceeding with what was collected."
+            )
 
     if len(all_samples_robotA) < 2:
         raise RuntimeError(
@@ -420,7 +579,23 @@ def _log_flange_usage(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--num-board-poses", type=int, default=DEFAULT_NUM_BOARD_POSES)
+    parser.add_argument(
+        "--target-board-samples", type=int, default=DEFAULT_TARGET_BOARD_SAMPLES,
+        help="Total board-pose samples to reach (known + perturbed) -- see module docstring's "
+             "'Standard augmentation' section.",
+    )
     parser.add_argument("--skip-zed", action="store_true", help="Stop after the board-pose stage; run ZED calibration manually later.")
+    parser.add_argument(
+        "--zed-only", action="store_true",
+        help=(
+            "Skip the board-pose stage entirely and just (re)run ZED calibration against "
+            "the T_base_board already sitting in config/base_board_pose.yaml -- for when "
+            "the checkerboard hasn't moved since the last full run and only the ZED needs "
+            "recalibrating (e.g. after nudging/repositioning the ZED mount). No arm motion "
+            "happens, so hand-eye/MoveGroup/saved flange poses are never touched. Mutually "
+            "exclusive with --skip-zed."
+        ),
+    )
     parser.add_argument("--no-debug-topic", action="store_true")
     parser.add_argument(
         "--robot-namespace",
@@ -432,6 +607,19 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if args.zed_only and args.skip_zed:
+        raise SystemExit("--zed-only and --skip-zed are mutually exclusive.")
+
+    if args.zed_only:
+        _require_board_pose_done()
+        print(
+            "--zed-only passed: reusing the existing config/base_board_pose.yaml "
+            "and skipping the board-pose stage (no arm motion)."
+        )
+        _run_zed_calib_stage()
+        print("\n=== All stages complete ===")
+        return
 
     T_flange_cam_by_cam = _require_handeye_done()
 
@@ -498,7 +686,10 @@ def main() -> None:
         )
 
     try:
-        _run_board_pose_stage(node, left_board, right_board, T_flange_cam_by_cam)
+        _run_board_pose_stage(
+            node, left_board, right_board, T_flange_cam_by_cam,
+            target_board_samples=args.target_board_samples,
+        )
 
         _log_flange_usage(left_board, right_board)
 
