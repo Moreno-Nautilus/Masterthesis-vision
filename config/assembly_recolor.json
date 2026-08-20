@@ -1,0 +1,25 @@
+{
+  "plumbers_block": {
+    "threshold": {
+      "hsv_lower": [0, 0, 0],
+      "hsv_upper": [179, 255, 75]
+    },
+    "parts": {
+      "pb_base": {"recolor_rgb": [0, 100, 0]},
+      "pb_top": {"recolor_rgb": [255, 215, 0]},
+      "pb_screw": {"recolor_rgb": [220, 20, 60]},
+      "pb_pipe": {"recolor_rgb": null}
+    }
+  },
+  "cooling_manifold": {
+    "threshold": {
+      "hsv_lower": [0, 0, 0],
+      "hsv_upper": [179, 255, 75]
+    },
+    "parts": {
+      "cooling_base": {"recolor_rgb": [0, 100, 0]},
+      "cooling_f": {"recolor_rgb": [255, 215, 0]},
+      "cooling_screw": {"recolor_rgb": [220, 20, 60]}
+    }
+  }
+}
