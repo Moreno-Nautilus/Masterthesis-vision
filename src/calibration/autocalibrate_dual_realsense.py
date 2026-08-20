@@ -129,6 +129,7 @@ from src.calibration.handeye_flange_cam_realsense import (
 from src.calibration.io_extrinsics import load_extrinsics_yaml
 from src.calibration.board_pose_from_flange_realsense import (
     BoardPoseSample,
+    _apply_board_z_override,
     _average_se3,
     _rotation_matrix_to_rpy_deg,
     _save_sample_json as _save_board_sample_json,
@@ -501,6 +502,11 @@ def _run_board_pose_stage(
     print(f"\nT_board averaged over {len(all_samples_robotA)} samples (robot_a frame):")
     print(T_robotA_board_avg)
     print(f"translation std: {t_std:.6f}m  rotation std: {rot_std_deg:.6f}deg  mean reproj: {reproj_mean:.3f}px")
+
+    # Solved z has been unreliable across recalibrations -- pin it to the
+    # known physical value instead of trusting the solve. See
+    # board_pose_from_flange_realsense.BOARD_Z_OVERRIDE_M.
+    T_robotA_board_avg = _apply_board_z_override(T_robotA_board_avg)
 
     # active_robot's own frame (matching board_pose_from_flange_realsense.py's
     # convention: base_board_pose.yaml's primary entry is in active_robot's frame).
