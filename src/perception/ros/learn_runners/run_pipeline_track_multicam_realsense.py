@@ -277,9 +277,7 @@ ALL_CAMERAS: list[DynamicCameraTopics] = [
     ),
     # realsense_1 is bolted to the LEFT arm (port_id 30200 -- see
     # lbr_dual_arm_description/ros2_control/lbr_one_system_config.yaml --
-    # and robot_base_key="robot_a" in config/robot_bases.yaml). Its
-    # hand-eye offset in camera_extrinsics_realsense.yaml is still the
-    # identity placeholder (not yet calibrated).
+    # and robot_base_key="robot_a" in config/robot_bases.yaml). 
     DynamicCameraTopics(
         cam_id="realsense_1",
         # /image_rect (not /image_raw): rectified by the per-camera
