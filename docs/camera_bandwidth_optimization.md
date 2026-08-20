@@ -9,6 +9,13 @@ This document explains the bandwidth-saving optimizations implemented in the cod
 - **Frame Rate:** 30 FPS
 - **Resolution:** 1080p (HD1080)
 - **Status:** Automatically launched with RealSense cameras via `zed_realsense_trio.launch.py`
+- **2026-08-14: briefly swapped to serial 39725782** to rule out a bad
+  physical unit as the cause of a bad ZED-to-base calibration — swapping
+  cameras did **not** fix it, so reverted back to 33137761 the same day.
+  Root cause is therefore something other than the physical camera unit.
+  Override without editing code:
+  `CAM1_SERIAL=<serial> scripts/launch_host_realsense.sh`, or
+  `cam1_serial:=<serial>` directly on the `ros2 launch` command.
 
 ### RealSense Cameras
 - **Models:** D405 (wrist-mounted on both arms)

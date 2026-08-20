@@ -27,6 +27,11 @@ that publishes a canonical pose per object in the **robot base frame**.
 > (Foxglove) are covered in
 > [docs/getting_started.md §1](docs/getting_started.md#watch-the-result-in-foxglove)
 > instead.
+>
+> **Have a rosbag and want to sanity-check the pipeline offline** (depth maps,
+> DINO/SAM overlays, raw + segmented point clouds, detected object coordinate
+> frames)? See **[docs/bagviz_quickstart.md](docs/bagviz_quickstart.md)** —
+> no docker, no live pipeline, just `scripts/visualize_bag_pipeline.sh <bag>`.
 
 ---
 
@@ -58,6 +63,8 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/calibration/calibration_log.py](src/calibration/calibration_log.py) | Append-only JSON run logs (camera/checkerboard/flange transforms + quality metrics) under `outputs/calibration_logs/`. |
 | [src/utils/se3.py](src/utils/se3.py) | Minimal immutable `SE3` rigid-transform type. |
 | [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py) | Renders synthetic reference views from the CAD meshes (optional DINO reference source). |
+| [tools/refbank_crop_screenshots.py](tools/refbank_crop_screenshots.py) | Interactively crop raw screenshots into `Data/ZED_screens/` (manual bbox, one `cv2.selectROI` window per image) — see [docs/annotate_refbank.md](docs/annotate_refbank.md). |
+| [tools/refbank_autocrop_masks.py](tools/refbank_autocrop_masks.py) | Auto-crop imgpy render sessions (image + segmentation mask) into `Data/ZED_screens/`, no GUI — see [docs/annotate_refbank.md](docs/annotate_refbank.md). |
 | [debug_pose_axes.py](debug_pose_axes.py) | Publishes RViz/Foxglove axis markers for the poses on `/perception/fp/pose_base/...`. |
 | [config/](config/) | Calibration inputs/outputs (board pose, camera extrinsics). |
 | [external/](external/) | Third-party deps as submodules + the FoundationPose patch — see §2. |
@@ -133,7 +140,12 @@ Data/
 - **`ZED_screens/<assembly_name>/<object_id>/`** — the **DINO reference bank**:
   a handful of cropped photos of each object. DINOv2 embeds these once at
   startup and every candidate crop is classified against them. This is the
-  default reference source (`--reference-source real`).
+  default reference source (`--reference-source real`). Populate it with
+  [tools/refbank_crop_screenshots.py](tools/refbank_crop_screenshots.py)
+  (manual bbox from raw screenshots) and/or
+  [tools/refbank_autocrop_masks.py](tools/refbank_autocrop_masks.py)
+  (auto bbox from imgpy render + mask pairs) — see
+  [docs/annotate_refbank.md](docs/annotate_refbank.md) for the full guide.
 - **`reference_renders/<assembly_name>/<object_id>/`** — optional CAD-rendered
   alternative/extra reference views, produced by
   [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py).
@@ -380,3 +392,8 @@ instead — a walkthrough of all three dual-arm control modes (gravity
 compensation, Cartesian impedance, admittance) side by side: what each
 does, when to reach for it, and how each fits (or doesn't yet) into the
 existing calibration routine.
+
+**Just want to park both arms at a known pose** (start/end of a session)?
+See **[docs/robot_init_pose_quickstart.md](docs/robot_init_pose_quickstart.md)**
+— `scripts/launch_robots_to_init_pose.sh`, position-controlled by default,
+`CONTROL_MODE=cartesian_impedance` for a compliant approach instead.

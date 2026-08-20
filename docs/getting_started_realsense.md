@@ -249,7 +249,7 @@ same `cam_id`, regardless of USB enumeration order:
 
 | cam_id | Serial | Where it's set |
 |---|---|---|
-| `zed2i_1` | `38580376` | `cam1_serial` launch arg in `zed_realsense_trio.launch.py`, default |
+| `zed2i_1` | `33137761` | `CAM1_SERIAL` env var / `cam1_serial` launch arg, default (briefly swapped to `39725782` on 2026-08-14 to rule out a bad unit, didn't help, reverted same day — see `docs/camera_bandwidth_optimization.md`) |
 | `realsense_1` | `260322275185` | `RS1_SERIAL` env var / `rs1_serial` launch arg, default |
 | `realsense_2` | `260522275434` | `RS2_SERIAL` env var / `rs2_serial` launch arg, default |
 
@@ -272,6 +272,8 @@ RS1_SERIAL=<new_serial> RS2_SERIAL=<existing_serial> scripts/launch_host_realsen
 or for the ZED:
 
 ```bash
+CAM1_SERIAL=<new_serial> scripts/launch_host_realsense.sh
+# or directly:
 ros2 launch mv_launch zed_realsense_trio.launch.py cam1_serial:=<serial> ...
 ```
 
