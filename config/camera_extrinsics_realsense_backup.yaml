@@ -1,0 +1,109 @@
+# Extrinsics for the 1-ZED + 2-RealSense trio pipeline.
+#
+# LAYOUT (every entry below, for all cam_ids):
+#   R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # 3x3 rotation, flattened ROW-MAJOR (not column-major)
+#   t: [tx,ty,tz]                                 # meters
+# Convention: p_dst = R @ p_cam + t  (R/t map points from the camera's
+# optical frame into "dst"; "dst" differs by entry, see below).
+# See src/calibration/io_extrinsics.py (load/save_extrinsics_yaml) for the
+# code that reads/writes this exact layout.
+#
+# zed2i_1 keeps the normal meaning: a STATIC camera-to-base transform,
+# copied as-is from config/camera_extrinsics_base.yaml. "base" here is the
+# active robot's lbr_link_0 frame (see config/robot_bases.yaml:
+# active_robot -- currently robot_b), i.e. dst = lbr_link_0.
+#
+# realsense_1 / realsense_2 mean something different: they are mounted on
+# the robot end-effector, so they move with the arm. For these two entries,
+# R/t describe the STATIC camera-to-flange offset (the fixed mechanical
+# mount transform), NOT a camera-to-base transform -- dst = lbr_link_ee of
+# that same active robot. At runtime the pipeline composes this offset with
+# the live flange pose (subscribed from a PoseStamped topic, see
+# --flange-pose-topic) to get the current camera-to-base extrinsic every
+# frame:
+#
+#   T_base_cam(t) = T_base_flange(t) @ T_flange_cam
+#
+#
+# RealSense USB serial numbers (for zed_realsense_trio.launch.py
+# rs1_serial:=/rs2_serial:=), recorded here for convenience:
+#   realsense_1: 260322275185
+#   realsense_2: 260522275434
+#
+
+
+realsense_1:
+  R:
+  - 0.002321764157194206
+  - -0.8654223294953782
+  - 0.5010377241505786
+  - 0.9994952228900846
+  - -0.013866922434525808
+  - -0.028583349735374547
+  - 0.03168452037033634
+  - 0.5008511755731314
+  - 0.8649532883895603
+  t:
+  - -0.04916893307530425
+  - 0.00020776010925683107
+  - 0.06150947952501556
+realsense_2: 
+  R:
+  - 0.015362270991549076
+  - -0.8545823624328567
+  - 0.5190886113648223
+  - 0.9998541397249218
+  - 0.009254513719493263
+  - -0.01435455505238925
+  - 0.007463236892834901
+  - 0.5192334155218566
+  - 0.8545998831620493
+  t:
+  - -0.05433435401022999
+  - -0.007676712228315602
+  - 0.06635979815116708
+realsense_2_initial_guess_cad:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+realsense_nominal:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+zed2i_1:
+  R:
+  - 0.004403812204537894
+  - -0.5179704072767931
+  - 0.8553872009935499
+  - -0.9990571041368691
+  - -0.03922514467933169
+  - -0.01860888762226881
+  - 0.043191539816495095
+  - -0.8544987098939343
+  - -0.5176547552934114
+  t:
+  - 0.0645038744163499
+  - -0.3624129187844245
+  - 0.24622335804524623
