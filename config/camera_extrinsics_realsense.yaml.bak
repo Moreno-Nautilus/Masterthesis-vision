@@ -24,106 +24,86 @@
 #
 #   T_base_cam(t) = T_base_flange(t) @ T_flange_cam
 #
-# PLACEHOLDER VALUE: realsense_1 below is still pure identity (camera optical
-# frame == flange frame, no offset at all) -- not yet hand-eye calibrated.
-# realsense_2 has a real online hand-eye calibration. Replace realsense_1's
-# R/t with its real hand-eye calibration (camera optical frame relative to
-# the flange frame, lbr_link_ee) before trusting any fused pose from it --
-# identity is almost certainly wrong, it's a placeholder so the pipeline can
-# run end-to-end before calibration exists.
 #
 # RealSense USB serial numbers (for zed_realsense_trio.launch.py
 # rs1_serial:=/rs2_serial:=), recorded here for convenience:
 #   realsense_1: 260322275185
 #   realsense_2: 260522275434
 #
-# realsense_nominal and realsense_2_initial_guess_cad both hold the SAME
-# CAD-derived (not hand-eye calibrated) camera-to-flange offset for the
-# RealSense mount, just consumed by different code under different names:
-#   - realsense_nominal: read by calibrate_handeye.py / the joint_handeye_calib
-#     bundle-adjustment package as the CAD prior for its solver.
-#   - realsense_2_initial_guess_cad: NOT a cam_id read by any loader -- it's
-#     swapped in for "realsense_2" by publish_extrinsics_tf.py's default
-#     --realsense2-source cad_initial_guess, so the CAD guess can be
-#     sanity-checked against the gripper/robot in RViz, or diffed by eye
-#     against the actual calibrated realsense_2 entry below (they currently
-#     differ by ~141 deg of rotation and ~39mm of translation -- see git
-#     history for the full derivation).
-# Neither is consumed by the tracking pipeline (run_pipeline_track_multicam_
-# realsense.py only looks up "realsense_1"/"realsense_2" by name).
 
+
+realsense_1:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+realsense_2:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+realsense_2_initial_guess_cad:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
 realsense_nominal:
   R:
   - 0.0
   - -0.866
-  - -0.5
+  - 0.5
   - 1.0
   - 0.0
   - 0.0
   - 0.0
-  - -0.5
+  - 0.5
   - 0.866
   t:
   - 0.055667
-  - 0.009000
+  - 0.009
   - 0.070776
-realsense_1:
-  R:
-  - 1.0
-  - 0.0
-  - 0.0
-  - 0.0
-  - 1.0
-  - 0.0
-  - 0.0
-  - 0.0
-  - 1.0
-  t:
-  - 0.0
-  - 0.0
-  - 0.0
-realsense_2:
-  R:
-  - -0.7035180330728221
-  - 0.6064101522519233
-  - -0.3705794171121041
-  - -0.7104195013650753
-  - -0.6141301607254079
-  - 0.34372703962240503
-  - -0.019144430562059
-  - 0.5050850155500396
-  - 0.8628572407097659
-  t:
-  - 0.04822088853440753
-  - -0.029119031966159226
-  - 0.07017758691589546
-realsense_2_initial_guess_cad:
-  R:
-  - 6.123233995736766e-17
-  - -0.8660254037844386
-  - -0.5000000000000001
-  - 1.0
-  - 8.364493191492918e-17
-  - -2.2412591957561503e-17
-  - 6.123233995736766e-17
-  - -0.5000000000000001
-  - 0.8660254037844386
-  t:
-  - 0.0556666756801677
-  - 0.008999999999999992
-  - 0.07077648943349073
 zed2i_1:
   R:
-  - -0.98305904327408
-  - -0.15541365087829384
-  - 0.09716745626870306
-  - -0.1790583561869697
-  - 0.7010643749690525
-  - -0.6902512928121703
-  - 0.03915383144305058
-  - -0.6959564205249723
-  - -0.7170157865859002
+  - 0.0044065342467657365
+  - -0.517977006169593
+  - 0.8553831910527103
+  - -0.9990573145894173
+  - -0.03922200880420279
+  - -0.018604198202156974
+  - 0.04318639393737539
+  - -0.8544948537615358
+  - -0.5176615499278823
   t:
-  - -0.17743503724584297
-  - 0.7057189434412777
-  - 0.4862059721899694
+  - 0.06449983363523973
+  - -0.3624150386109466
+  - 0.2578665416628918
