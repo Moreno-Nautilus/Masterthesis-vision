@@ -1,0 +1,31 @@
+# Python packages for the HOST's plain system Python (no venv, no docker) --
+# used by the nodes the launch_host*.sh scripts start directly via
+# `python3 -m ...` (not `docker exec`): debug_pose_axes.py,
+# src/perception/ros/learn_runners/visualize_pipeline.py, and (per
+# README §4/§6.2) the src/calibration/*.py and tools/*.py scripts, which are
+# explicitly allowed to run either on the host or inside the container.
+#
+# rclpy, cv_bridge, tf2_ros, geometry_msgs, sensor_msgs, moveit_msgs, and the
+# rest of the ROS 2 message/action packages come from
+# /opt/ros/humble/setup.bash + ~/franka_ros2_ws/install/setup.bash (see
+# docs/setup_and_docker.md §2) -- NOT from pip, so they're not listed here.
+# fp_debug_msgs likewise comes from the host workspace build, not pip.
+#
+# opencv: install via apt (`sudo apt install python3-opencv`), NOT pip.
+# Mixing pip's opencv-python with apt's system numpy (or vice versa) is
+# exactly the ABI-shadowing failure mode documented in
+# external/README.md#the-venv-why---system-site-packages for the container's
+# venv -- avoid it here too by keeping opencv apt-managed like the rest of
+# the ROS install.
+#
+# Install (numpy/scipy/trimesh/PyYAML/matplotlib/open3d only --
+# python3-opencv via apt separately):
+#   sudo apt install python3-opencv
+#   pip3 install -r requirements-host.txt
+
+numpy==1.26.4
+scipy==1.15.3
+trimesh==4.4.9
+PyYAML==5.4.1
+matplotlib==3.5.1
+open3d==0.19.0

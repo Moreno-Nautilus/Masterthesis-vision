@@ -1,0 +1,25 @@
+# Python packages for the dedicated `bagviz` conda env -- a THIRD, separate
+# Python environment from both the host system Python (requirements-host.txt)
+# and the container's /opt/thesis-venv (requirements-docker.txt). Used only
+# by scripts/visualize_bag_pipeline.sh and tools/bagviz/{capture_pipeline_snapshots,
+# view_pointclouds,view_object_inference_debug}.py -- offline rosbag
+# sanity-checking, no docker, no GPU. See docs/bagviz_quickstart.md for the
+# full guide (tools/bagviz/run_object_inference_debug.py is the one script in
+# that folder that instead needs the full container stack -- it re-runs live
+# inference, not just replays saved debug frames).
+#
+# Python 3.10 specifically -- that's what this machine's ROS 2 Humble
+# `rclpy` bindings are compiled against; the env deliberately does NOT
+# pip-install rclpy/rosbag2_py/fp_debug_msgs, which come from
+# /opt/ros/humble/setup.bash + ~/franka_ros2_ws/install/setup.bash on
+# PYTHONPATH instead (see docs/bagviz_quickstart.md).
+#
+# Install:
+#   conda create -n bagviz python=3.10
+#   conda activate bagviz
+#   pip install -r requirements-bagviz.txt
+
+opencv-python-headless==5.0.0
+numpy==1.26.4
+PyYAML==6.0.3
+open3d==0.19.0

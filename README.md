@@ -106,9 +106,10 @@ pinned commit `ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a` (see
 ### 2.2 Docker
 
 The pipeline runs inside a CUDA container built from
-[Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda). The launch scripts assume a
-container named `vision` already exists (they `docker start`/`stop` it, they do
-not build it). Override the name with the `CONTAINER` env var.
+[Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda) (Python packages pinned in
+[requirements-docker.txt](requirements-docker.txt)). The launch scripts assume
+a container named `vision` already exists (they `docker start`/`stop` it, they
+do not build it). Override the name with the `CONTAINER` env var.
 
 **Setting up a fresh machine from scratch** (Docker image + container, GPU
 passthrough, the host ROS 2 workspace that `mv_launch`/`fp_debug_msgs` live
