@@ -111,9 +111,14 @@ exist yet on this machine:
 mkdir -p ~/franka_ros2_ws/src
 cd ~/franka_ros2_ws/src
 
-# Pull in (clone or copy from another machine) at minimum:
-#   mv_launch/            — launch files + flange_pose_publisher node (this repo's camera bring-up)
-#   fp_debug_msgs/         — message defs (host-side copy)
+# mv_launch — launch files + flange_pose_publisher node (this repo's camera bring-up)
+git clone https://github.com/LucasG2001/mv_launch.git
+
+# fp_debug_msgs — message defs (host-side copy; same branch as this repo's
+# src/fp_debug_msgs submodule, so message types match across both workspaces)
+git clone --branch assembly-cell-interfaces https://github.com/Moreno-Nautilus/fp_debug_msgs.git
+
+# Also pull in (clone or copy from another machine) at minimum:
 #   zed-ros2-wrapper/ + zed-ros2-interfaces/   — ZED driver (needs ZED SDK from §1.1 first)
 #   realsense-ros/         — RealSense driver (RealSense variant only)
 #   lbr_fri_ros2_stack/ + lbr_fri_idl/ + fri/  — KUKA LBR bridge
