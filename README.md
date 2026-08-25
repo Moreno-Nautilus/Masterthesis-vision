@@ -96,6 +96,12 @@ The pipeline runs inside a CUDA container built from
 container named `vision` already exists (they `docker start`/`stop` it, they do
 not build it). Override the name with the `CONTAINER` env var.
 
+**Setting up a fresh machine from scratch** (Docker image + container, GPU
+passthrough, the host ROS 2 workspace that `mv_launch`/`fp_debug_msgs` live
+in, camera SDKs)? See **[docs/setup_and_docker.md](docs/setup_and_docker.md)**
+for the full walkthrough — this section only covers the submodules/`Data/`
+half of one-time setup.
+
 ### 2.3 The `Data/` folder (you must create this)
 
 `Data/` is **git-ignored**, so cloning this repo does **not** give you the meshes
