@@ -141,6 +141,8 @@ class MultiCamGrabberRealsense(Node):
         flange_pose_max_age_s: float = 0.25,
         T_robotA_activeRobot: Optional[SE3] = None,
         robot_bases: Optional[dict[str, SE3]] = None,
+        min_active_cameras: Optional[int] = None,
+        flange_pose_stale_ok: bool = False,
     ):
         super().__init__("multicam_grabber_realsense")
 
@@ -149,6 +151,28 @@ class MultiCamGrabberRealsense(Node):
         self.use_best_effort_if_unsynced = bool(use_best_effort_if_unsynced)
         self.rgb_depth_max_dt_s = float(rgb_depth_max_dt_s)
         self.flange_pose_max_age_s = float(flange_pose_max_age_s)
+        # None (default) preserves the original all-cameras-required behavior
+        # (every caller that doesn't pass this -- the calibration scripts --
+        # is unaffected). A finite value lets ready()/get_latest_views() start
+        # producing views once that many of `cameras` are individually ready,
+        # instead of blocking on every camera (and, for end-effector-mounted
+        # ones, every flange pose) publishing.
+        if min_active_cameras is not None and not (1 <= min_active_cameras <= len(cameras)):
+            raise ValueError(
+                f"min_active_cameras={min_active_cameras} must be between 1 and "
+                f"len(cameras)={len(cameras)}"
+            )
+        self.min_active_cameras = min_active_cameras
+        self._last_active_cam_ids: Optional[frozenset[str]] = None
+        # False (default) preserves the original hard cutoff -- a flange pose
+        # older than flange_pose_max_age_s is treated as missing, which is
+        # what calibration capture scripts want (a stale pose there means a
+        # bad/desynced sample, not "keep going"). True instead just warns and
+        # keeps serving the last received pose, so a brief gap in the flange
+        # topic degrades that camera's extrinsic accuracy for a moment rather
+        # than dropping it out of ready()/active_cameras() entirely.
+        self.flange_pose_stale_ok = bool(flange_pose_stale_ok)
+        self._last_warn_stale_flange_t: dict[str, float] = {}
         # None = leave everything in whichever robot is physically connected's
         # frame (old behavior). If given, static (non-dynamic) entries -- true
         # base-frame poses -- are shifted into the caller's chosen global
@@ -274,7 +298,17 @@ class MultiCamGrabberRealsense(Node):
             return None
         age = time.time() - self._latest_flange_pose_wall_t[cam_id]
         if age > self.flange_pose_max_age_s:
-            return None
+            if not self.flange_pose_stale_ok:
+                return None
+            now = time.time()
+            last_warn = self._last_warn_stale_flange_t.get(cam_id, 0.0)
+            if (now - last_warn) > 5.0:
+                self._last_warn_stale_flange_t[cam_id] = now
+                self.get_logger().warn(
+                    f"{cam_id} flange pose is stale (age={age:.2f}s > "
+                    f"{self.flange_pose_max_age_s:.2f}s) -- continuing with the "
+                    f"last known pose instead of dropping the camera"
+                )
         return self._latest_flange_pose[cam_id]
 
     # Subscription callbacks: stash each latest message (and its stamp / intrinsics) per camera.
@@ -292,31 +326,58 @@ class MultiCamGrabberRealsense(Node):
     def _on_rgb_info(self, cam_id: str, msg: CameraInfo) -> None:
         self._K_rgb[cam_id] = _K_from_camerainfo(msg)
 
-    def ready(self) -> bool:
-        # True only once every camera has both images, both intrinsics buffered,
-        # and (for dynamic cameras) a fresh flange pose.
-        for c in self.cameras:
-            if c.cam_id not in self._depth_msg:
-                return False
-            if c.cam_id not in self._K_depth:
-                return False
-            if c.cam_id not in self._rgb_msg:
-                return False
-            if c.cam_id not in self._K_rgb:
-                return False
-            if c.is_dynamic and self._get_flange_pose(c.cam_id) is None:
-                return False
+    def _camera_individually_ready(self, c: DynamicCameraTopics) -> bool:
+        # True once this one camera has both images, both intrinsics buffered,
+        # and (if dynamic) a fresh flange pose.
+        if c.cam_id not in self._depth_msg:
+            return False
+        if c.cam_id not in self._K_depth:
+            return False
+        if c.cam_id not in self._rgb_msg:
+            return False
+        if c.cam_id not in self._K_rgb:
+            return False
+        if c.is_dynamic and self._get_flange_pose(c.cam_id) is None:
+            return False
         return True
+
+    def active_cameras(self) -> list[DynamicCameraTopics]:
+        """Cameras currently individually ready, in `self.cameras` order."""
+        return [c for c in self.cameras if self._camera_individually_ready(c)]
+
+    def ready(self) -> bool:
+        # min_active_cameras=None (default) requires every camera in
+        # self.cameras -- unchanged from the original behavior. A finite
+        # value only requires that many to be individually ready, so the
+        # caller can start with whatever subset of cameras (and flange poses)
+        # is currently publishing.
+        min_required = (
+            len(self.cameras) if self.min_active_cameras is None else self.min_active_cameras
+        )
+        n_ready = sum(1 for c in self.cameras if self._camera_individually_ready(c))
+        return n_ready >= min_required
 
     def get_latest_views(self) -> Optional[list[View]]:
         """
-        Returns a synced list[View] in base frame if possible.
+        Returns a synced list[View] in base frame if possible. Only includes
+        cameras that are currently individually ready -- with the default
+        min_active_cameras=None this is always all of self.cameras (matching
+        the original behavior); otherwise it's whichever subset has come up.
         """
         if not self.ready():
             return None
 
+        active = self.active_cameras()
+        active_ids = frozenset(c.cam_id for c in active)
+        if active_ids != self._last_active_cam_ids:
+            self.get_logger().info(
+                f"active camera set changed: {sorted(active_ids)} "
+                f"(of configured {[c.cam_id for c in self.cameras]})"
+            )
+            self._last_active_cam_ids = active_ids
+
         # Reject the set if the cameras' depth stamps span more than the sync slop.
-        stamps_d = [self._depth_stamp_s[c.cam_id] for c in self.cameras]
+        stamps_d = [self._depth_stamp_s[c.cam_id] for c in active]
         t_ref = max(stamps_d)
         max_dt = max(abs(t - t_ref) for t in stamps_d)
 
@@ -343,7 +404,7 @@ class MultiCamGrabberRealsense(Node):
 
         now_wall = time.time()
 
-        for c in self.cameras:
+        for c in active:
             cam_id = c.cam_id
 
             depth_msg = self._depth_msg[cam_id]

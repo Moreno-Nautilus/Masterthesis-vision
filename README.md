@@ -395,5 +395,6 @@ existing calibration routine.
 
 **Just want to park both arms at a known pose** (start/end of a session)?
 See **[docs/robot_init_pose_quickstart.md](docs/robot_init_pose_quickstart.md)**
-— `scripts/launch_robots_to_init_pose.sh`, position-controlled by default,
-`CONTROL_MODE=cartesian_impedance` for a compliant approach instead.
+— `scripts/launch_robots_to_init_pose.sh`, Cartesian-impedance (compliant)
+by default, `CONTROL_MODE=position` for a stiff MoveGroup-executed move
+instead.

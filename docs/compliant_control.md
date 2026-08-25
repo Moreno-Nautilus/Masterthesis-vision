@@ -207,8 +207,8 @@ Rebuild the `vision` image before running `admittance_dual_arm.py`.
 ## 3. The `cartesian_impedance_controller` patch
 
 `~/franka_ros2_ws/src/kuka_lbr_control/controllers/cartesian_impedance_controller`
-(a third-party `idra-lab/ros2_effort_controller` git submodule) needed two
-changes the upstream code didn't have, both required for the design above:
+(a third-party `idra-lab/ros2_effort_controller` git submodule) needed
+changes the upstream code didn't have, required for the design above:
 
 1. **Live nullspace target** — `nullspace_desired_configuration` (a
    `double[]` parameter that previously was only read once, at
@@ -228,6 +228,22 @@ changes the upstream code didn't have, both required for the design above:
    filtering — a value takes effect on the very next control cycle.
    `nullspace_desired_configuration` shares this same re-read path but has
    no stationary requirement of its own (see `set_nullspace_target()`).
+3. **Capped reference jumps** — `target_frame` commands (`targetFrameCallback()`)
+   are clamped through `limitTargetStep()` so the resulting spring
+   force/torque (`stiffness.* * error`) never exceeds `max_impedance_force`
+   (N) / `max_impedance_torque` (Nm), both new tunable parameters
+   (defaults 70 N / 20 Nm, set explicitly in
+   `dual_arm_cartesian_impedance_controllers.yaml`). Without this, a
+   target far from the currently-applied one — e.g. a MoveIt waypoint
+   streamed by `execute_planned_trajectory()` — turned straight into a
+   large instantaneous force, i.e. fast/violent motion, and the higher
+   `stiffness.*` was set the worse it got. The allowed step now scales
+   DOWN as stiffness goes up so the resulting force/torque stays bounded
+   regardless of gain; the clamp is direction-preserving (shrinks the
+   step, doesn't clip per-axis) and only applies to this manual/streamed
+   path — the `FollowJointTrajectory` action path in
+   `updateTrajectoryExecution()` already interpolates smoothly via
+   `hermiteSample()`.
 
 This patch is **local and uncommitted** in that submodule's own repo
 (`https://github.com/idra-lab/ros2_effort_controller.git`, branch `main`) —

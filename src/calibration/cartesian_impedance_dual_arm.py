@@ -58,6 +58,7 @@ updateGainsFromParameters()), so neither needs a controller restart.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -116,8 +117,8 @@ DEFAULT_NAMESPACE = DEFAULT_MOVE_GROUP_NAMESPACE  # "lbr_dual_arm"
 # Convergence gates for move_to_cartesian()/move_to_joint_compliant() --
 # looser than moveit_dual_arm.py's MoveGroup goal tolerances since this is a
 # spring-damper settling to a pose, not a planner's terminal-state check.
-POSITION_TOLERANCE_M = 0.01
-ORIENTATION_TOLERANCE_RAD = 0.03
+POSITION_TOLERANCE_M = 0.02
+ORIENTATION_TOLERANCE_RAD = math.radians(3)  # ~0.0524 rad
 SETTLE_VELOCITY_RAD_S = 0.01  # joint speed below this counts as "not moving"
 SETTLE_CONSECUTIVE_CHECKS = 5
 POLL_INTERVAL_S = 0.05

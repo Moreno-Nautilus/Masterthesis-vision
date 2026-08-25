@@ -4876,6 +4876,33 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated camera ids to exclude from FoundationPose init calls.",
     )
+    p.add_argument(
+        "--strict-flange-freshness",
+        action="store_true",
+        default=False,
+        help=(
+            "Restore the strict behavior: a flange pose older than "
+            "--flange-pose-max-age-s makes that camera (and, with too few "
+            "cameras left, the whole tick) not-ready. Default off: a stale "
+            "flange pose is logged and the last known pose is used instead, "
+            "so a brief gap in the flange-pose topic never stalls the "
+            "pipeline or drops the camera."
+        ),
+    )
+    p.add_argument(
+        "--min-active-cameras",
+        type=int,
+        default=1,
+        help=(
+            "Minimum number of the 3 configured cameras (zed2i_1, realsense_1, "
+            "realsense_2) that must be individually ready (image+intrinsics, "
+            "plus a fresh flange pose if end-effector-mounted) before the "
+            "pipeline starts ticking. Default 1: start with whichever camera "
+            "comes up first (no camera or flange pose is required to publish "
+            "up front) and pick up the rest automatically once they publish. "
+            "Set to 3 to restore the old all-cameras-required behavior."
+        ),
+    )
 
     # Per-camera SAM/ROI filtering thresholds.
     # cam1 = zed2i_1 (static). cam2/cam3 = realsense_1/realsense_2
@@ -5153,6 +5180,8 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.run_mode == "track" and args.tracking_profile is None:
         p.error("--tracking-profile fast_cutie is required for --run-mode track")
+    if not (1 <= args.min_active_cameras <= 3):
+        p.error(f"--min-active-cameras must be between 1 and 3, got {args.min_active_cameras}")
     return args
 
 
@@ -5185,7 +5214,12 @@ def main() -> None:
         f"fused poses are output in the dual-arm base_link frame (global reference)"
     )
     cameras = select_cameras(args.num_cameras)
-    print(f"[PIPELINE] Using {len(cameras)} cameras: {[c.cam_id for c in cameras]}")
+    print(
+        f"[PIPELINE] Configured cameras: {[c.cam_id for c in cameras]} -- "
+        f"starting once {args.min_active_cameras}/{len(cameras)} are individually "
+        f"ready (image+intrinsics, plus flange pose if end-effector-mounted); "
+        f"the rest are picked up automatically as they come online"
+    )
     grabber = MultiCamGrabberRealsense(
         cameras=cameras,
         sync_slop_s=0.10,
@@ -5195,6 +5229,8 @@ def main() -> None:
         flange_pose_max_age_s=args.flange_pose_max_age_s,
         T_robotA_activeRobot=T_robotA_activeRobot,
         robot_bases=robot_bases,
+        min_active_cameras=args.min_active_cameras,
+        flange_pose_stale_ok=not args.strict_flange_freshness,
     )
 
     # grabber.T_base_cam_map is the dynamic-composing wrapper (static
