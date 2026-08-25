@@ -623,7 +623,7 @@ table above).
 - **[moveit_robot_control.md](moveit_robot_control.md)** — how to jog the KUKA
   LBR via MoveIt's RViz plugin, used to position the arm during Stage A
   captures with `--controller moveit`.
-- **[README §6](../README.md#6-realsense-trio-variant)**
+- **[README §3](../README.md#3-running-the-pipeline)**
   — condensed version of §1 above, for quick reference.
 - **[config/camera_extrinsics_realsense.yaml](../config/camera_extrinsics_realsense.yaml)**
   — extrinsics file, with inline comments on the camera-to-flange convention.
