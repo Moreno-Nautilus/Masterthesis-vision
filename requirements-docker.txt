@@ -1,0 +1,69 @@
+# Python packages for /opt/thesis-venv, inside the `vision` docker container
+# (Dockerfile.thesisnewcuda). This is a --system-site-packages venv layered
+# on top of ROS 2 Humble's apt/system Python -- see
+# external/README.md#the-venv-why---system-site-packages for why, and
+# docs/setup_and_docker.md §4-5 for the full build sequence.
+#
+# Versions below are pinned to what's actually installed and confirmed
+# working in the current `vision` container (checked via `pip freeze`,
+# 2026-08-25) -- not just what Dockerfile.thesisnewcuda happens to list.
+# Several of these (numpy, Pillow, PyYAML, tqdm, requests) were previously
+# only ever pulled in *transitively* by other packages below and were never
+# pinned anywhere -- they're pinned explicitly here so a future rebuild
+# doesn't silently lose one if an upstream dependency changes.
+#
+# Install order (this file alone is NOT `pip install -r`-able end to end --
+# torch needs a CUDA-specific index, nvdiffrast/pytorch3d need
+# --no-build-isolation and come from source, and sam2 is a local editable
+# install that only works once the repo is bind-mounted in):
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu126 \
+#       torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0
+#   pip install -r requirements-docker.txt
+#   pip install --no-cache-dir --no-build-isolation \
+#       git+https://github.com/NVlabs/nvdiffrast.git
+#   pip install --no-cache-dir --no-build-isolation \
+#       "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+#   # after colcon build, with the repo bind-mounted at /workspace/MasterThesis:
+#   pip install --no-deps -e external/sam2
+#
+# Also used as a quick repair/top-up inside an already-running container:
+#   docker exec -it vision bash -lc \
+#       "source /opt/thesis-venv/bin/activate && pip install -r requirements-docker.txt"
+
+# --- explicitly listed in Dockerfile.thesisnewcuda ---
+ninja==1.13.0
+scipy==1.15.3
+scikit-image==0.25.2
+matplotlib==3.10.9
+omegaconf==2.3.1
+trimesh==4.12.2
+kornia==0.8.2
+open3d==0.19.0
+warp-lang==1.15.0
+ruamel.yaml==0.19.1
+transformations==2025.1.1
+hydra-core==1.3.4
+iopath==0.1.10
+opencv-python==4.13.0.92
+h5py==3.16.0
+transformers==5.14.1
+
+# --- confirmed required by this repo's own code (numpy/PIL/yaml: used
+#     throughout src/perception/; tqdm/requests: external/Cutie's
+#     cutie/utils/download_models.py, pulled in by cutie_tracker.py via
+#     get_default_model() -- but only ever present transitively (numpy/
+#     Pillow/PyYAML via opencv-python & co., tqdm/requests via transformers)
+#     until now ---
+numpy==2.2.6
+Pillow==12.3.0
+PyYAML==5.4.1
+tqdm==4.68.4
+requests==2.34.2
+
+# --- declared in Dockerfile.thesisnewcuda but NOT actually present in the
+#     currently-built `vision` image (ModuleNotFoundError) and not imported
+#     anywhere in this repo's own code either -- kept for parity with the
+#     Dockerfile; if you rely on it, verify it installs and is importable
+#     before trusting it. ---
+optas

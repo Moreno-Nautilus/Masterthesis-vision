@@ -31,6 +31,11 @@ submodule at `src/fp_debug_msgs` — that copy gets built a second time, inside
 the container, so the pipeline process can publish/subscribe the same message
 types. You end up building `fp_debug_msgs` twice, once per side; see §3 and §5.
 
+There's a **third, narrower Python environment**, `bagviz` (a conda env, host
+side, offline rosbag debugging only — not needed to run the live pipeline):
+see [docs/bagviz_quickstart.md](bagviz_quickstart.md) and
+[requirements-bagviz.txt](../requirements-bagviz.txt).
+
 ---
 
 ## 1. Host prerequisites
@@ -98,6 +103,21 @@ types. You end up building `fp_debug_msgs` twice, once per side; see §3 and §5
   package in the workspace below wraps it). Not needed to exercise the vision
   pipeline against a fixed/identity transform (see
   [getting_started_realsense.md §1 Step 1, Option B](getting_started_realsense.md#step-1--get-a-baseflange-transform-into-tf2-terminal-1)).
+
+### 1.2 Host Python packages
+
+`debug_pose_axes.py` and `src/perception/ros/learn_runners/visualize_pipeline.py`
+(both started directly by `launch_host*.sh`, on the host's plain system
+Python — no venv, no docker) plus the `src/calibration/*.py` and `tools/*.py`
+scripts (which §4/§6.2 explicitly allow running on the host instead of inside
+the container) need a handful of pip packages the ROS 2 install doesn't
+provide. Install `opencv` via apt, not pip — see
+**[requirements-host.txt](../requirements-host.txt)** for why and the rest:
+
+```bash
+sudo apt install python3-opencv
+pip3 install -r requirements-host.txt
+```
 
 ---
 
@@ -201,22 +221,26 @@ docker build -t masterthesis-vision:latest -f Dockerfile.thesisnewcuda .
 ```
 
 This layers, in order: CUDA 12.6.1 + cuDNN devel base (Ubuntu 22.04) → ROS 2
-Humble base + cv_bridge/sensor_msgs/geometry_msgs/image_transport →
-`/opt/thesis-venv` (a `--system-site-packages` venv — deliberately *not*
-isolated from the apt/ROS Python install, see
+Humble base + cv_bridge/sensor_msgs/geometry_msgs/image_transport/moveit_msgs
+(the last one because the pipeline publishes `moveit_msgs/CollisionObject` —
+README §7) → `/opt/thesis-venv` (a `--system-site-packages` venv —
+deliberately *not* isolated from the apt/ROS Python install, see
 [external/README.md](../external/README.md#the-venv-why---system-site-packages)
-for why and its one known footgun) → the ML stack via pip (torch 2.7.0/cu126,
-open3d, kornia, transformers, …) → `nvdiffrast` and `pytorch3d` built from
-source against that torch. Expect this to take a while and produce a large
-image (the existing one on this machine is ~27 GB).
+for why and its one known footgun) → the ML stack via pip → `nvdiffrast` and
+`pytorch3d` built from source against that torch. Expect this to take a
+while and produce a large image (the existing one on this machine is ~27 GB).
+
+The exact pip package list (and why each of numpy/Pillow/PyYAML/tqdm/requests
+is pinned explicitly rather than left to transitive resolution) is in
+**[requirements-docker.txt](../requirements-docker.txt)** — keep the
+Dockerfile's `pip install` layer and that file in sync if you add/remove
+anything.
 
 The Dockerfile has **no `COPY`** — the repo only ever enters the container via
-a bind mount at container run time, not at build time. That also means the
-image has no `moveit_msgs` etc. by default beyond what's explicitly
-`apt install`ed; check `docker exec vision dpkg -l | grep moveit` if the
-pipeline's `CollisionObject`/planning-scene publishing (README §7) errors on
-missing message packages, and add whatever's missing to the Dockerfile's ROS
-apt layer.
+a bind mount at container run time, not at build time. That means any apt/ROS
+package a script ends up needing (message packages, colcon build tools, ...)
+has to be explicitly listed in the Dockerfile's `apt install` layers — it
+can't be inferred from the repo, since the repo isn't there at build time.
 
 ---
 
@@ -285,6 +309,15 @@ docker exec -it vision bash -lc '
 '
 ```
 
+If `import torch, open3d, ...` (§6 below) fails for anything the Dockerfile
+is supposed to provide, the repo's own `requirements-docker.txt` is now
+bind-mounted in too and doubles as a quick repair/top-up:
+
+```bash
+docker exec -it vision bash -lc \
+  "source /opt/thesis-venv/bin/activate && pip install -r requirements-docker.txt"
+```
+
 After this, `scripts/launch_pipeline.sh` (see
 [docs/getting_started.md](getting_started.md)) sources
 `/workspace/MasterThesis/install/setup.bash` automatically via the container's
@@ -325,5 +358,6 @@ for the calibrate → run workflow.
 | `AttributeError: module 'X' has no attribute 'Y'` for a package that exists both via apt and pip, or `cv2` import errors mentioning `_ARRAY_API` | pip/apt package shadowing inside `/opt/thesis-venv` (it's `--system-site-packages`) — see [external/README.md](../external/README.md#the-venv-why---system-site-packages). |
 | `colcon build` fails with `CMakeCache.txt ... is different than the directory ... where CMakeCache.txt was created` | `colcon build` was run on the **host** at some point instead of inside the container — `rm -rf build install log` and rebuild from inside `docker exec`. |
 | `ros2 launch mv_launch ...` can't find `zed_wrapper` / `realsense2_camera` | `zed-ros2-wrapper` / `realsense-ros` aren't built in `~/franka_ros2_ws`, or the ZED SDK / librealsense weren't installed before building them (§1.1, §2). |
-| Pipeline errors publishing `moveit_msgs/CollisionObject` | `ros-humble-moveit-msgs` (or the full `ros-humble-moveit`) isn't installed in the container image — it's not in the base `Dockerfile.thesisnewcuda` apt list; `apt install` it in the running container or add it to the Dockerfile and rebuild. |
+| Pipeline errors publishing `moveit_msgs/CollisionObject` on an older image | `ros-humble-moveit-msgs` was added to `Dockerfile.thesisnewcuda`'s apt layer after some images were built — `docker exec vision apt-get install -y ros-humble-moveit-msgs` as a one-off fix, or rebuild the image. |
+| `ModuleNotFoundError` inside the container for something `requirements-docker.txt` lists | Rebuild the image, or run the repair command in §5.1 — it was very likely only ever present transitively (see that file's header) and silently dropped when an upstream dependency changed. |
 | Camera shows `CAMERA NOT DETECTED` in the host `cams` tmux window | USB enumeration flakiness — see [README §6.2 step 1](../README.md#62-3-zed-camera-to-base-calibration) for the `--cam-ids` workaround (3-ZED variant; the default RealSense rig has no such workaround needed). |

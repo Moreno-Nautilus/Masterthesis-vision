@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y \
     ros-humble-sensor-msgs \
     ros-humble-geometry-msgs \
     ros-humble-image-transport \
+    ros-humble-moveit-msgs \
     python3-colcon-common-extensions \
     python3-rosdep \
     python3-vcstool \
@@ -56,6 +57,13 @@ ENV PATH="/opt/thesis-venv/bin:${PATH}"
 
 RUN pip install --upgrade pip setuptools wheel
 
+# Keep in sync with requirements-docker.txt (repo root) -- that file also
+# pins numpy/Pillow/PyYAML/tqdm/requests explicitly: they're real runtime
+# deps of this repo's own code (numpy/Pillow/PyYAML throughout
+# src/perception/; tqdm/requests via external/Cutie's download_models.py)
+# that were previously only ever satisfied transitively by the packages
+# below (e.g. tqdm/requests via transformers) and are pinned here for the
+# same reason -- don't rely on transitive resolution to keep providing them.
 RUN pip install \
     ninja \
     scipy \
@@ -73,7 +81,12 @@ RUN pip install \
     opencv-python \
     h5py \
     transformers \
-    optas
+    optas \
+    numpy \
+    Pillow \
+    PyYAML \
+    tqdm \
+    requests
 
 RUN pip install \
     torch==2.7.0 \

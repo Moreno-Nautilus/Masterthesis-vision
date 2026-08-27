@@ -21,8 +21,11 @@ in case this ever needs to run somewhere else.
 ```bash
 conda create -n bagviz python=3.10
 conda activate bagviz
-pip install opencv-python-headless numpy pyyaml open3d
+pip install -r requirements-bagviz.txt
 ```
+
+(exact pinned versions + rationale in
+[requirements-bagviz.txt](../requirements-bagviz.txt))
 
 Python **3.10 specifically** — that's what ROS 2 Humble's compiled `rclpy`
 bindings are built against on this machine. The env deliberately does **not**

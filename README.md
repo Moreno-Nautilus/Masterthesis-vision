@@ -8,7 +8,14 @@ that publishes a canonical pose per object in the **robot base frame**. The
 original 3-ZED-only rig is still supported as a variant — see
 [§6](#6-3-zed-trio-variant-original).
 
-> **New here / just want to calibrate and run it?** Start with
+> **Brand-new machine, nothing installed yet?** Start with
+> **[docs/setup_and_docker.md](docs/setup_and_docker.md)** — the complete
+> from-scratch walkthrough: OS/GPU/ROS 2 prerequisites, camera SDKs, the host
+> ROS 2 workspace (`mv_launch`/`fp_debug_msgs`), and Docker (image, container,
+> in-container build) — nothing to run yet after this, just a machine that's
+> ready to.
+>
+> **Rig already set up / just want to calibrate and run it?** Start with
 > **[docs/getting_started_realsense.md](docs/getting_started_realsense.md)** —
 > a linear, tested end-to-end calibrate → run → view guide for the default
 > 1-ZED + 2-RealSense rig, or its condensed
@@ -37,9 +44,8 @@ original 3-ZED-only rig is still supported as a variant — see
 > no docker, no live pipeline, just `scripts/visualize_bag_pipeline.sh <bag>`.
 >
 > **Looking for anything else** (compliant control, hand-eye calibration,
-> annotating the DINO reference bank, fresh-machine dependency install, ...)?
-> Every topic has its own guide under **[docs/](docs/)** — check there before
-> digging through the code.
+> annotating the DINO reference bank, ...)? Every topic has its own guide
+> under **[docs/](docs/)** — check there before digging through the code.
 
 ---
 
@@ -100,9 +106,10 @@ pinned commit `ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a` (see
 ### 2.2 Docker
 
 The pipeline runs inside a CUDA container built from
-[Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda). The launch scripts assume a
-container named `vision` already exists (they `docker start`/`stop` it, they do
-not build it). Override the name with the `CONTAINER` env var.
+[Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda) (Python packages pinned in
+[requirements-docker.txt](requirements-docker.txt)). The launch scripts assume
+a container named `vision` already exists (they `docker start`/`stop` it, they
+do not build it). Override the name with the `CONTAINER` env var.
 
 **Setting up a fresh machine from scratch** (Docker image + container, GPU
 passthrough, the host ROS 2 workspace that `mv_launch`/`fp_debug_msgs` live
