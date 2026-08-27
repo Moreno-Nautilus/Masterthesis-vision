@@ -40,9 +40,9 @@
 #   scripts/launch_pipeline_realsense.sh attach            # attach if already running
 #
 # fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/*
-# topics) is OFF by default -- pass --enable-debug-frames after a mode name
-# to build/publish it, e.g.
-#   scripts/launch_pipeline_realsense.sh fast-track --enable-debug-frames
+# topics) is ON by default -- pass --disable-debug-frames after a mode name
+# to skip building/publishing it, e.g.
+#   scripts/launch_pipeline_realsense.sh fast-track --disable-debug-frames
 #
 # Override the container name or tmux session name via env vars:
 #   CONTAINER=other-container scripts/launch_pipeline_realsense.sh
@@ -141,21 +141,16 @@ usage() {
     sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-ENABLE_DEBUG_FRAMES=0
+DISABLE_DEBUG_FRAMES=0
 ARGS=()
 for arg in "$@"; do
-    if [ "$arg" = "--enable-debug-frames" ]; then
-        ENABLE_DEBUG_FRAMES=1
+    if [ "$arg" = "--disable-debug-frames" ]; then
+        DISABLE_DEBUG_FRAMES=1
     else
         ARGS+=("$arg")
     fi
 done
 set -- "${ARGS[@]}"
-
-# Snapshot before the mode-preset case below rewrites $@ -- tells us whether
-# this invocation actually runs the pipeline (a mode name or raw runner
-# args) vs. the bare/interactive-shell form, which must stay untouched.
-HAD_ARGS=$#
 
 MODE_NAME=""
 MODE_LOG=""
@@ -196,7 +191,7 @@ case "${1:-}" in
         ;;
 esac
 
-if (( HAD_ARGS > 0 )) && (( ! ENABLE_DEBUG_FRAMES )); then
+if (( DISABLE_DEBUG_FRAMES )); then
     set -- "$@" --no-debug-frame-publish
 fi
 

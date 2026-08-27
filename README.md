@@ -211,14 +211,14 @@ ros2 run tf2_ros static_transform_publisher \
 
 Starts a tmux session with `zed2i_1`, both RealSense D405s, and
 `flange_pose_publisher`; the Foxglove bridge and per-camera `visualize_pipeline`
-windows are opt-in.
+windows come up by default so the mask + tracked-axes overlays show in Foxglove.
 
 ```bash
-scripts/launch_host_realsense.sh                # start (and attach) the tmux session
-scripts/launch_host_realsense.sh attach          # re-attach if already running
-scripts/launch_host_realsense.sh stop            # kill the session
-scripts/launch_host_realsense.sh --visualize     # also start the 3 visualize_pipeline windows
-scripts/launch_host_realsense.sh --foxglove      # also start the foxglove_bridge window
+scripts/launch_host_realsense.sh                  # start (and attach) the tmux session
+scripts/launch_host_realsense.sh attach           # re-attach if already running
+scripts/launch_host_realsense.sh stop             # kill the session
+scripts/launch_host_realsense.sh --no-visualize   # skip the 3 visualize_pipeline windows
+scripts/launch_host_realsense.sh --no-foxglove    # skip the foxglove_bridge window
 ```
 
 tmux: `Ctrl+b` then a number to switch windows, `Ctrl+b d` to detach.

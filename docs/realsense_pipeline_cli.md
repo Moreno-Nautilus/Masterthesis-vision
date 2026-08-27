@@ -82,8 +82,8 @@ Host-side stack (camera drivers + debug windows) in one tmux session
 | *(no args)* | Start the session (or attach if already running) |
 | `stop` | Kill the tmux session |
 | `attach` | Attach to the already-running session |
-| `--visualize` | Also start the 3 `viz1`/`viz2`/`viz3` windows (`visualize_pipeline` per camera). **Off by default** — each instance renders+publishes 5 overlay images at 5 Hz whether or not anything subscribes, so it does real work you don't want running unattended. |
-| `--foxglove` | Also start the `foxglove` window (`foxglove_bridge`). **Off by default** — its `topic_whitelist` is `.*`, so any client that connects can pull full-res images/IMU/point cloud for anything on the graph. |
+| `--no-visualize` | Skip the 3 `viz1`/`viz2`/`viz3` windows (`visualize_pipeline` per camera). **On by default** so the mask + tracked-axes overlays show in Foxglove — each instance renders+publishes 5 overlay images at 5 Hz whether or not anything subscribes, so pass this for a lean unattended run. |
+| `--no-foxglove` | Skip the `foxglove` window (`foxglove_bridge`). **On by default** — its `topic_whitelist` is `.*`, so any client that connects can pull full-res images/IMU/point cloud for anything on the graph; pass this for a lean unattended run. |
 
 Env var overrides:
 
@@ -94,8 +94,9 @@ Env var overrides:
 | `RS2_SERIAL` | `260322275185` | realsense_2 camera serial |
 | `CAM1_SERIAL` | `33137761` | zed2i_1 camera serial |
 
-Windows created: `cams` (camera drivers), `axes` (`debug_pose_axes`), then
-`viz1`/`viz2`/`viz3` if `--visualize`, then `foxglove` if `--foxglove`.
+Windows created: `cams` (camera drivers), `viz1`/`viz2`/`viz3` (unless
+`--no-visualize`), `axes` (`debug_pose_axes`), then `foxglove` (unless
+`--no-foxglove`).
 
 ---
 
@@ -113,7 +114,7 @@ shell or runs a pinned preset inside a tmux session (`$SESSION`, default
 | `accurate-track` | Settled-axis accuracy preset |
 | `stop` | Kill the tmux session |
 | `attach` | Attach to the already-running session |
-| `--enable-debug-frames` | Build/publish `fp_debug_msgs/DebugFrame` (and the `/perception/fp/*_overlay/*` topics). **Off by default** (adds `--no-debug-frame-publish` to the runner otherwise). Only applies to preset/argument invocations — the bare interactive-shell form is untouched. |
+| `--disable-debug-frames` | Skip building/publishing `fp_debug_msgs/DebugFrame` (and the `/perception/fp/*_overlay/*` topics). **On by default** (this flag adds `--no-debug-frame-publish` to the runner). |
 | anything else | Passed straight through as runner args (raw `run_pipeline_track_multicam_realsense` CLI) |
 
 Env var overrides:
@@ -144,7 +145,7 @@ scripts/launch_pipeline_realsense.sh fast-track --flange-pose-max-age-s 0.5
 Same container/tmux mechanics as §3, different module
 (`run_pipeline_track_multicam` instead of the RealSense one), same presets
 (`init-only`/`baseline`/`fast-track`/`accurate-track`), same
-`--enable-debug-frames` flag and default-off behavior. No
+`--disable-debug-frames` flag and default-on behavior. No
 `--min-active-cameras`/`--strict-flange-freshness`/`--flange-pose-max-age-s`
 readiness flags — see the note at the end of §1.
 
@@ -159,7 +160,7 @@ or in the interactive shell:
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--debug-frame-publish` / `--no-debug-frame-publish` | `--debug-frame-publish` (True) at the runner level — the launch scripts flip this to off unless `--enable-debug-frames` is passed (see §3/§4) | Publish `fp_debug_msgs/DebugFrame` messages |
+| `--debug-frame-publish` / `--no-debug-frame-publish` | `--debug-frame-publish` (True) at the runner level — the launch scripts leave this on unless `--disable-debug-frames` is passed (see §3/§4) | Publish `fp_debug_msgs/DebugFrame` messages |
 | `--debug-logging` | off | Enable all pipeline logging (prints + ROS logger info/warn) |
 | `--debug-verbose-logs` | off | Per-frame `INFO` logs and `[TIMING]` prints |
 | `--debug-per-cam-pose-publish` | off | Publish per-camera (pre-fusion) poses for debugging |
