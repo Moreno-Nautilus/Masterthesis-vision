@@ -27,8 +27,8 @@
 #
 # RealSense USB serial numbers (for zed_realsense_trio.launch.py
 # rs1_serial:=/rs2_serial:=), recorded here for convenience:
-#   realsense_1: 260322275185
-#   realsense_2: 260522275434
+#   realsense_1: 260522275434
+#   realsense_2: 260322275185
 #
 
 

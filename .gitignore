@@ -36,3 +36,11 @@ plots/
 # Third-party dep with no public upstream — clone locally, not tracked.
 # Pinned commit: ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a (see external/README.md)
 /external/Cutie/
+
+# ROS bags — large binary captures, keep local only
+rosbag2_*/
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.bag

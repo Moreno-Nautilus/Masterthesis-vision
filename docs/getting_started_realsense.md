@@ -250,8 +250,8 @@ same `cam_id`, regardless of USB enumeration order:
 | cam_id | Serial | Where it's set |
 |---|---|---|
 | `zed2i_1` | `33137761` | `CAM1_SERIAL` env var / `cam1_serial` launch arg, default (briefly swapped to `39725782` on 2026-08-14 to rule out a bad unit, didn't help, reverted same day — see `docs/camera_bandwidth_optimization.md`) |
-| `realsense_1` | `260322275185` | `RS1_SERIAL` env var / `rs1_serial` launch arg, default |
-| `realsense_2` | `260522275434` | `RS2_SERIAL` env var / `rs2_serial` launch arg, default |
+| `realsense_1` | `260522275434` | `RS1_SERIAL` env var / `rs1_serial` launch arg, default |
+| `realsense_2` | `260322275185` | `RS2_SERIAL` env var / `rs2_serial` launch arg, default |
 
 Just running `scripts/launch_host_realsense.sh` with no overrides uses all three
 — nothing to do here unless the hardware changes. **If you swap a camera**,
@@ -402,10 +402,17 @@ pass different `flange_base_frame`/`flange_frame`/`flange_pose_topic` launch arg
 
 **If the tf lookup fails** (e.g. `hardware.launch.py` isn't running, or the frame
 names don't match your actual URDF), `flange_pose_publisher` logs a throttled
-warning and simply doesn't publish — `MultiCamGrabberRealsense.ready()` then never
-returns `True` for the RealSense cameras (it waits for a fresh flange pose no older
-than `--flange-pose-max-age-s`, default 0.25 s), so the pipeline sits waiting for
-frames rather than running with a wrong/frozen extrinsic.
+warning and simply doesn't publish — that RealSense camera then never becomes
+individually ready (it needs a fresh flange pose no older than
+`--flange-pose-max-age-s`, default 0.25 s) and never joins `active_cameras()`,
+rather than running with a wrong/frozen extrinsic. This no longer blocks the
+whole pipeline, though: with the default `--min-active-cameras 1`,
+`MultiCamGrabberRealsense.ready()` returns `True` and tracking starts as soon
+as the static ZED alone is ready, picking up each RealSense camera
+automatically once its flange pose starts publishing. See
+[realsense_pipeline_cli.md §1](realsense_pipeline_cli.md#1-startup-no-longer-blocks-on-flange-pose)
+for the full startup-readiness behavior and how to restore the old
+all-cameras-required behavior (`--min-active-cameras 3`).
 
 ---
 

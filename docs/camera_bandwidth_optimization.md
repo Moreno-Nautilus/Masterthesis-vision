@@ -19,7 +19,7 @@ This document explains the bandwidth-saving optimizations implemented in the cod
 
 ### RealSense Cameras
 - **Models:** D405 (wrist-mounted on both arms)
-- **Serials:** realsense_1=260322275185, realsense_2=260522275434
+- **Serials:** realsense_1=260522275434, realsense_2=260322275185
 - **Frame Rate:** 30 FPS (matched to ZED)
 - **Resolution:** 640×480 (QVGA)
 - **Status:** Automatically launched with ZED via `zed_realsense_trio.launch.py`
