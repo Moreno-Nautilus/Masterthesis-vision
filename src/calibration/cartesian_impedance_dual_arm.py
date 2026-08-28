@@ -14,7 +14,10 @@ plan_joint_trajectory() below.
 Two ways to reach a target, matching the controller's actual inputs:
   - move_to_cartesian()      -- a Cartesian target (ArmTarget): published
                                  straight to the controller's target_frame
-                                 topic.
+                                 topic, then blocks until settled.
+                                 publish_target() is the same publish without
+                                 the settle-wait, for interactive/streaming
+                                 callers like teleop_cartesian_impedance.py.
   - move_to_joint_compliant() -- a joint-space target (JointTarget, e.g. a
                                  hand-guided capture): FK'd via MoveIt's
                                  compute_fk service to get target_frame, AND
@@ -55,6 +58,7 @@ updateGainsFromParameters()), so neither needs a controller restart.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -113,8 +117,8 @@ DEFAULT_NAMESPACE = DEFAULT_MOVE_GROUP_NAMESPACE  # "lbr_dual_arm"
 # Convergence gates for move_to_cartesian()/move_to_joint_compliant() --
 # looser than moveit_dual_arm.py's MoveGroup goal tolerances since this is a
 # spring-damper settling to a pose, not a planner's terminal-state check.
-POSITION_TOLERANCE_M = 0.01
-ORIENTATION_TOLERANCE_RAD = 0.03
+POSITION_TOLERANCE_M = 0.02
+ORIENTATION_TOLERANCE_RAD = math.radians(3)  # ~0.0524 rad
 SETTLE_VELOCITY_RAD_S = 0.01  # joint speed below this counts as "not moving"
 SETTLE_CONSECUTIVE_CHECKS = 5
 POLL_INTERVAL_S = 0.05
@@ -232,6 +236,25 @@ class CartesianImpedanceDualArmClient:
             return False  # no data yet -- can't confirm settled
         return all(abs(v) < threshold for v in velocities)
 
+    # -- Readiness ---------------------------------------------------------
+
+    def wait_for_controller(self, arm_key: str, timeout_s: float = 10.0) -> bool:
+        """Waits for arm_key's cartesian_impedance_lbr_one/_two controller's
+        set_parameters service to become available -- a concrete signal that
+        controller is actually loaded and its node is up, as opposed to
+        DualArmMoveitClient.wait_for_valid_state_joint()'s check (MoveGroup
+        can produce a plan), which is a structural/MoveIt-side check that
+        can succeed BEFORE this controller (or even the FRI hardware
+        connection) exists -- e.g. immediately after cartesian_impedance.launch.py
+        starts, using whatever placeholder joint state MoveGroup happens to
+        have. Callers driving this client (not just MoveGroup) must wait on
+        this too, or a call like execute_planned_trajectory() ->
+        set_nullspace_target() can hit an unavailable set_parameters service
+        (see cartesian_impedance_lbr_one/_two spawner logs: it blocks on
+        controller_manager's own service, which itself doesn't come up
+        until BOTH arms' FRI hardware has connected)."""
+        return self._set_params_client[arm_key].wait_for_service(timeout_sec=timeout_s)
+
     # -- Cartesian pose lookup -------------------------------------------------
 
     def current_flange_pose(self, arm_key: str, timeout_s: float = 2.0) -> Optional[SE3]:
@@ -274,6 +297,16 @@ class CartesianImpedanceDualArmClient:
 
     # -- Goal execution ---------------------------------------------------------
 
+    def publish_target(self, target: ArmTarget) -> None:
+        """Publish target.T_armBase_flange to the arm's target_frame topic
+        without waiting for it to settle -- for continuous/interactive
+        streaming (see teleop_cartesian_impedance.py), where blocking on
+        every incremental update would stall input handling. move_to_cartesian()
+        below is this plus the settle-wait, for one-shot goals."""
+        arm_key = _arm_key_from_group_name(target.group_name)
+        pose_msg = _se3_to_pose_stamped(target.T_armBase_flange, target.base_frame)
+        self._target_frame_pub[arm_key].publish(pose_msg)
+
     def move_to_cartesian(
         self,
         target: ArmTarget,
@@ -284,8 +317,7 @@ class CartesianImpedanceDualArmClient:
         """Publish target.T_armBase_flange to the arm's target_frame topic
         and block until the flange settles there (or timeout_s elapses)."""
         arm_key = _arm_key_from_group_name(target.group_name)
-        pose_msg = _se3_to_pose_stamped(target.T_armBase_flange, target.base_frame)
-        self._target_frame_pub[arm_key].publish(pose_msg)
+        self.publish_target(target)
         return self._wait_until_settled(
             arm_key, target.T_armBase_flange, position_tol, orientation_tol, timeout_s
         )

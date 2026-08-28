@@ -19,17 +19,30 @@
 #   scripts/launch_pipeline_realsense.sh --debug-logging   # runs pipeline runner with given args
 #
 # Named presets (init-only/fast-track/accurate-track/baseline) run inside a
-# tmux session with two windows so the tracker's start/stop/reset services
+# tmux session with three windows so the tracker's start/stop/reset services
 # are one keypress away without reopening a shell:
-#   window 0 "run"  — the pipeline itself (this is what you were seeing before)
-#   window 1 "keys" — tracking_keyboard_control.py (s=start, x=stop, r=reset)
-# Switch windows: Ctrl+b then 0/1 (or n/p). Detach without killing: Ctrl+b d.
+#   window 0 "run"       — the pipeline itself (this is what you were seeing before)
+#   window 1 "keys"      — tracking_keyboard_control.py (s=start, x=stop, r=reset)
+#   window 2 "cam-scene" — publish_camera_scene_objects.py --dual-arm: publishes
+#                          the ZED camera + holder meshes as CollisionObjects on
+#                          /planning_scene, in the same base_link frame as the
+#                          tracked-part CollisionObjects the pipeline itself
+#                          publishes. This is a plain topic publisher (no
+#                          robot_state_publisher, no move_group) so it never
+#                          duplicates the robot on a shared ROS network — for
+#                          that reason it's also fine to run alongside a real
+#                          MoveIt elsewhere on the network. The interactive
+#                          mock-robot RViz viewer (scripts/view_scene.sh) is a
+#                          separate, local-only visualization workflow and is
+#                          untouched by this.
+# Switch windows: Ctrl+b then 0/1/2 (or n/p). Detach without killing: Ctrl+b d.
 #   scripts/launch_pipeline_realsense.sh stop              # kill that tmux session
 #   scripts/launch_pipeline_realsense.sh attach            # attach if already running
 #
-# Pass --disable-debug-frames after a track preset to skip building/publishing
-# fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/* topics),
-# e.g. scripts/launch_pipeline_realsense.sh fast-track --disable-debug-frames
+# fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/*
+# topics) is ON by default -- pass --disable-debug-frames after a mode name
+# to skip building/publishing it, e.g.
+#   scripts/launch_pipeline_realsense.sh fast-track --disable-debug-frames
 #
 # Override the container name or tmux session name via env vars:
 #   CONTAINER=other-container scripts/launch_pipeline_realsense.sh
@@ -43,85 +56,16 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SRC='export FASTDDS_BUILTIN_TRANSPORTS=UDPv4 && source /opt/thesis-venv/bin/activate && source /workspace/MasterThesis/install/setup.bash && cd /workspace/MasterThesis'
 
-COMMON_ARGS=(
-    --num-cameras 3
-    --flange-pose-topic /iiwa/ee_pose
-    --gdino-device cpu
-    --gdino-box-threshold 0.30
-    --gdino-text-threshold 0.20
-    --gdino-max-boxes 20
-    --sam-max-image-side 1536
-    --reference-source real
-    --dino-min-crop-side 112
-    --icp-grid-n-rot 45
-    --icp-grid-prescreen
-    --icp-grid-cross-cam-chamfer
-    --fusion-match-max-centroid-dist-m 0.07
-    --depth-fill-holes-kernel 3
-)
-
-INIT_ONLY_ARGS=(
-    "${COMMON_ARGS[@]}"
-    --run-mode init_only
-    --debug-logging
-    --debug-verbose-logs
-    --log-init-poses
-)
-
-TRACK_BASE_ARGS=(
-    "${COMMON_ARGS[@]}"
-    --run-mode track
-    --tracking-profile fast_cutie
-    --sam-fp32
-    --icp-variant point_to_point
-    --track-icp-num-points 800
-    --fused-track-icp-max-iteration 8
-    --fused-track-icp-max-correspondence-dist-m 0.15
-    --chamfer-every-n-frames 1
-    --fused-track-max-translation-speed-mps 1.2
-    --fused-track-min-translation-jump-m 0.10
-    --fused-track-max-dt-s 0.80
-    --fused-gate-max-centroid-dist-m 0.25
-    --fused-track-centroid-recovery
-    --fused-track-centroid-recovery-min-cameras 1
-    --fused-track-centroid-recovery-cluster-dist-m 0.12
-    --fused-track-centroid-recovery-max-seed-jump-m 0.75
-    --fused-track-max-rotation-speed-degps 1200
-    --fused-track-min-rotation-jump-deg 90
-    --fused-track-hold-window-frames 5
-    --fused-track-max-lost-frames 20
-    --track-pose-mask-margin-px 250
-    --timer-period-s 0.05
-)
-
-FAST_TRACK_ARGS=(
-    "${TRACK_BASE_ARGS[@]}"
-    --log-track-poses
-    --track-pose-log-path outputs/logs/live_fast_track_realsense_q.csv
-)
-
-ACCURATE_TRACK_ARGS=(
-    "${TRACK_BASE_ARGS[@]}"
-    --fused-track-rot-slew-limit-deg 10.0
-    --fused-track-rot-lowpass 0.2
-    --fused-track-rot-reseed
-    --fused-track-rot-reseed-chamfer-m 0.006
-    --fused-track-rot-reseed-max-chamfer-m 0.080
-    --fused-track-rot-reseed-n-rot 45
-    --fused-track-rot-reseed-icp-iters 10
-    --fused-track-pca-axis
-    --fused-track-pca-axis-min-deg 8
-    --fused-track-pca-axis-max-deg 45
-    --fused-track-pca-axis-min-elongation 5.0
-    --fused-track-pca-axis-min-points 80
-    --fused-track-pca-axis-blend 0.5
-    --log-init-poses
-    --log-track-poses
-    --track-pose-log-path outputs/logs/live_accurate_track_realsense_q.csv
-)
+# Every pipeline knob lives in YAML now (see
+# src/perception/ros/learn_runners/config.yaml for the full list + defaults).
+# Each named mode below is a small overlay in presets/ that the runner merges
+# onto config.yaml; profiles/fast_cutie.yaml is pulled in automatically when a
+# preset sets tracking_profile. Ad-hoc `--some-key value` / `--flag` / `--no-flag`
+# args still work and override the YAML.
+PRESETS="$REPO_DIR/src/perception/ros/learn_runners/presets"
 
 usage() {
-    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 DISABLE_DEBUG_FRAMES=0
@@ -158,25 +102,33 @@ case "${1:-}" in
         MODE_NAME="init-only"
         MODE_LOG="outputs/logs/multicam_init_realsense_baseline.log"
         shift
-        set -- "${INIT_ONLY_ARGS[@]}" "$@"
+        set -- --config "$PRESETS/init_only.yaml" "$@"
         ;;
     fast-track|fast_track|fast)
         MODE_NAME="fast-track"
         MODE_LOG="outputs/logs/live_fast_track_realsense.log"
         shift
-        set -- "${FAST_TRACK_ARGS[@]}" "$@"
+        set -- --config "$PRESETS/fast_track.yaml" "$@"
         ;;
     accurate-track|accurate_track|accurate)
         MODE_NAME="accurate-track"
         MODE_LOG="outputs/logs/live_accurate_track_realsense.log"
         shift
-        set -- "${ACCURATE_TRACK_ARGS[@]}" "$@"
+        set -- --config "$PRESETS/accurate_track.yaml" "$@"
         ;;
 esac
 
 if (( DISABLE_DEBUG_FRAMES )); then
     set -- "$@" --no-debug-frame-publish
 fi
+
+# Plain CollisionObject publisher for the fixed ZED camera + holder meshes
+# (no robot_state_publisher, no move_group -- see src/calibration/
+# publish_camera_scene_objects.py) -- safe to run alongside the pipeline on a
+# shared ROS network without duplicating the robot. --dual-arm both
+# re-expresses the camera poses into base_link and defaults --frame-id to
+# base_link, matching COMMON_ARGS' --planning-scene-frame-id above.
+CAM_SCENE_CMD="$SRC && exec python3 -m src.calibration.publish_camera_scene_objects --dual-arm"
 
 echo "[*] restarting container: $CONTAINER"
 docker stop "$CONTAINER" >/dev/null
@@ -206,9 +158,17 @@ elif [ -n "$MODE_NAME" ]; then
     tmux new-window -t "$SESSION" -n keys -c "$REPO_DIR"
     tmux send-keys -t "$SESSION:keys" "docker exec -it \"$CONTAINER\" bash -lc $(printf '%q' "$KEYS_CMD")" Enter
 
+    tmux new-window -t "$SESSION" -n cam-scene -c "$REPO_DIR"
+    tmux send-keys -t "$SESSION:cam-scene" "docker exec -it \"$CONTAINER\" bash -lc $(printf '%q' "$CAM_SCENE_CMD")" Enter
+
     tmux select-window -t "$SESSION:run"
     exec tmux attach -t "$SESSION"
 else
+    # Custom args, no tmux: start the camera-scene publisher detached in the
+    # background (docker restart above already ensures no stale copy is left
+    # running from a previous invocation), then run the pipeline itself in
+    # the foreground as before.
+    docker exec -d "$CONTAINER" bash -lc "$CAM_SCENE_CMD"
     exec docker exec -it "$CONTAINER" bash -lc \
         "$SRC && exec python3 -m src.perception.ros.learn_runners.run_pipeline_track_multicam_realsense \"\$@\"" \
         -- "$@"

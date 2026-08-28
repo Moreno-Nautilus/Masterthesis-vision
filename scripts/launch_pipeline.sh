@@ -22,9 +22,10 @@
 #   scripts/launch_pipeline.sh stop              # kill that tmux session
 #   scripts/launch_pipeline.sh attach            # attach if already running
 #
-# Pass --disable-debug-frames after a track preset to skip building/publishing
-# fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/* topics),
-# e.g. scripts/launch_pipeline.sh fast-track --disable-debug-frames
+# fp_debug_msgs/DebugFrame (and therefore the /perception/fp/*_overlay/*
+# topics) is ON by default -- pass --disable-debug-frames after a mode name
+# to skip building/publishing it, e.g.
+#   scripts/launch_pipeline.sh fast-track --disable-debug-frames
 #
 # Override the container name or tmux session name via env vars:
 #   CONTAINER=other-container scripts/launch_pipeline.sh
@@ -115,7 +116,7 @@ ACCURATE_TRACK_ARGS=(
 )
 
 usage() {
-    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 DISABLE_DEBUG_FRAMES=0

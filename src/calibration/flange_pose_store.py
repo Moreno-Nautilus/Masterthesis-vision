@@ -1,9 +1,10 @@
 """Permanent on-disk storage for the flange poses captured by
-capture_flange_poses_dual.py and consumed by autocalibrate_dual_realsense.py.
+capture_handeye_data.py and consumed by capture_handeye_data.py's own
+--mode replay and by autocalibrate_dual_realsense.py's board-pose stage.
 
-Separated from either script so both can import the same schema without a
-circular dependency: capture writes, autocalibrate reads (and both scripts'
---help/docstrings point here for the file format).
+Separated from those so all of them can import the same schema without a
+circular dependency (each script's --help/docstring points here for the
+file format).
 
 One JSON file per arm (config/flange_poses/<arm_key>.json), written
 incrementally -- each captured pose is appended and the whole file rewritten
@@ -63,9 +64,10 @@ class FlangePoseCapture:
     # T_armBase_flange alone is ambiguous for MoveIt reconstruction on this
     # redundant 7-DOF arm -- re-solving IK for the same Cartesian pose can
     # land on a different elbow configuration than the one physically
-    # captured. Saved by capture_flange_poses_dual_handguided.py so a later
-    # MoveIt-based replay can target the exact recorded joint state (a
-    # JointConstraint goal) instead of re-deriving it via IK.
+    # captured. Saved by capture_handeye_data.py (every capture, regardless
+    # of --controller) so a later MoveIt-based replay can target the exact
+    # recorded joint state (a JointConstraint goal) instead of re-deriving
+    # it via IK.
     joint_positions: dict = field(default_factory=dict)
 
 
@@ -135,7 +137,7 @@ def load_pose_set(arm_key: str) -> FlangePoseSet:
     if not path.exists():
         raise FileNotFoundError(
             f"No saved flange poses for arm_key={arm_key!r} at {path} -- "
-            f"run capture_flange_poses_dual.py first."
+            f"run capture_handeye_data.py first."
         )
     data = json.loads(path.read_text())
     return FlangePoseSet(

@@ -1,6 +1,6 @@
 """Checkerboard pose in the robot base frame (Stage 2 of 2), using a
-wrist-mounted RealSense camera that already has a T_flange_cam from
-src/calibration/handeye_flange_cam_realsense.py (Stage 1).
+wrist-mounted RealSense camera that already has a T_flange_cam solved by
+src/calibration/capture_handeye_data.py + calibrate_handeye.py (Stage 1).
 
 With the flange->camera offset known, one synced (camera image, flange
 pose) pair is enough to place the checkerboard in the robot base frame:
@@ -35,7 +35,7 @@ import rclpy
 import yaml
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from src.perception.ros.qos_profiles import qos_profile_sensor_data_low_latency
 from sensor_msgs.msg import CameraInfo, Image
 
 from src.calibration.handeye_flange_cam_realsense import (
@@ -69,7 +69,21 @@ EXTRINSICS_YAML = "config/camera_extrinsics_realsense.yaml"
 OUT_YAML = "config/base_board_pose.yaml"
 DEBUG_DIR = "outputs/calibration_debug/board_pose"
 ROBOT_BASES_YAML = "config/robot_bases.yaml"
+
+# The vision-solved z has been unreliable across recalibrations (e.g. solved
+# -8mm on 2026-08-16 vs. the board's actual measured height) -- pin it to the
+# known physical value instead of trusting the solve. x/y/rotation are still
+# solved normally. z is frame-invariant here (robot_a/robot_b differ only by
+# a y-translation, see config/robot_bases.yaml), so overriding it once before
+# the robot_a<->active_robot frame conversion keeps both YAML entries consistent.
+BOARD_Z_OVERRIDE_M = -0.020
 # ------------------------------------------------
+
+
+def _apply_board_z_override(T: SE3) -> SE3:
+    t = T.t.copy()
+    t[2] = BOARD_Z_OVERRIDE_M
+    return SE3(T.R, t)
 
 
 def _rotation_matrix_to_rotvec(R: np.ndarray) -> np.ndarray:
@@ -174,9 +188,9 @@ class BoardPoseNode(Node):
         self.flange_pose: Optional[SE3] = None
         self.flange_pose_wall_t: float = 0.0
 
-        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data)
-        self.create_subscription(PoseStamped, flange_pose_topic, self._on_flange, qos_profile_sensor_data)
+        self.create_subscription(Image, rgb_topic, self._on_img, qos_profile_sensor_data_low_latency)
+        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data_low_latency)
+        self.create_subscription(PoseStamped, flange_pose_topic, self._on_flange, qos_profile_sensor_data_low_latency)
 
         self._debug_pub = None
         if publish_debug:
@@ -240,6 +254,11 @@ def _average_and_write(
         raise RuntimeError(f"Calibration rejected: translation spread too high ({t_std:.6f}m)")
     if rot_std_deg > MAX_FINAL_ROTATION_STD_DEG:
         raise RuntimeError(f"Calibration rejected: rotation spread too high ({rot_std_deg:.6f}deg)")
+
+    # QA above used the true solved z (catches a bad capture); the written
+    # pose always gets the pinned z -- see BOARD_Z_OVERRIDE_M.
+    T_base_board_avg = _apply_board_z_override(T_base_board_avg)
+    T_robotA_board_avg = _apply_board_z_override(T_robotA_board_avg)
 
     roll, pitch, yaw = _rotation_matrix_to_rpy_deg(T_base_board_avg.R)
     roll_a, pitch_a, yaw_a = _rotation_matrix_to_rpy_deg(T_robotA_board_avg.R)
@@ -311,8 +330,8 @@ def main() -> None:
     if np.allclose(T_flange_cam.R, np.eye(3)) and np.allclose(T_flange_cam.t, 0.0):
         raise RuntimeError(
             f"{args.cam_id}'s entry in {EXTRINSICS_YAML} is still the identity placeholder. "
-            "Run src.calibration.handeye_flange_cam_realsense for this camera first "
-            "(Stage 1) before computing the board pose (Stage 2)."
+            "Run capture_handeye_data.py then calibrate_handeye.py --write for this camera "
+            "first (Stage 1) before computing the board pose (Stage 2)."
         )
 
     rclpy.init()

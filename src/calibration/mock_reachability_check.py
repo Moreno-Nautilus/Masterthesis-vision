@@ -1,18 +1,22 @@
 """Simulation-only reachability check for the dual-arm RealSense
-autocalibration poses -- answers ONE question: can MoveIt actually plan (and,
-optionally, execute) motion to every pose saved by capture_flange_poses_dual.py
+calibration poses -- answers ONE question: can MoveIt actually plan (and,
+optionally, execute) motion to every pose saved by capture_handeye_data.py
 (config/flange_poses/{left,right}.json), driving lbr_dual_arm_bringup's
 `mock` (simulated, non-physical) robot state instead of the real arms?
 
-This is the "mock script" version of src/calibration/autocalibrate_dual_realsense.py:
-it reuses that script's exact pose split (Stage A's --num-handeye-poses go
-through a simultaneous both_arms goal, Stage B's --num-board-poses go through
-single-arm goals) and the same MoveIt client (moveit_dual_arm.py), but does
-NOT touch any camera topic, does NOT run the checkerboard PnP solve, and does
-NOT write any of the real calibration outputs (config/camera_extrinsics_realsense.yaml,
-config/base_board_pose.yaml). It only checks: is each pose (pair) reachable?
-There does not need to be a real checkerboard, real RealSense cameras, or a
-real robot connected at all -- everything here is virtual.
+This is the "mock script" version of capture_handeye_data.py's --mode replay
++ autocalibrate_dual_realsense.py: it splits the saved poses into a
+"--num-handeye-poses go through a simultaneous both_arms goal" chunk and a
+"--num-board-poses go through single-arm goals" chunk (mirroring how
+capture_handeye_data.py's replay mode pairs poses for --arm both, and how
+autocalibrate_dual_realsense.py's board-pose stage moves single-arm) purely
+to exercise both group-type reachability, and uses the same MoveIt client
+(moveit_dual_arm.py) -- but does NOT touch any camera topic, does NOT run
+the checkerboard PnP solve, and does NOT write any of the real calibration
+outputs (config/camera_extrinsics_realsense.yaml, config/base_board_pose.yaml).
+It only checks: is each pose (pair) reachable? There does not need to be a
+real checkerboard, real RealSense cameras, or a real robot connected at all
+-- everything here is virtual.
 
 Run (needs ONLY the mock/sim MoveIt stack -- no camera launch, no
 hardware.launch.py):
@@ -60,13 +64,13 @@ planning pipeline are otherwise fine; this is specifically the
 Cartesian-constraint IK-sampler path for composite multi-chain groups, a
 documented MoveIt2 limitation, not a property of any particular flange pose.
 
-Because of this, this script checks each Stage A pose PAIR three ways: the
-literal "both_arms_flange" simultaneous goal (expected to fail -- reported
-separately, does not affect the pass/fail verdict), plus each arm's own
-target checked alone via its single-arm group (arm_one_flange /
+Because of this, this script checks each "handeye-style" pose PAIR three
+ways: the literal "both_arms_flange" simultaneous goal (expected to fail --
+reported separately, does not affect the pass/fail verdict), plus each arm's
+own target checked alone via its single-arm group (arm_one_flange /
 arm_two_flange -- these DO answer "is this pose reachable" and DO gate the
-exit code). If autocalibrate_dual_realsense.py needs to actually run Stage
-A's simultaneous motion on real hardware, `moveit_dual_arm.py`'s
+exit code). If capture_handeye_data.py's --mode replay needs to actually run
+simultaneous motion (--arm both) on real hardware, `moveit_dual_arm.py`'s
 "both_arms_flange" single-goal design will need a workaround first (e.g. a
 dedicated combined kinematics solver for `both_arms_flange` in
 kinematics.yaml, or issuing two concurrent single-arm goals instead of one
@@ -124,13 +128,13 @@ def _check(
     return moveit.plan_only(targets, group_name=group_name)
 
 
-def _run_stage_a(
+def _run_both_arms_check(
     moveit: DualArmMoveitClient,
     left_poses: list[FlangePoseCapture],
     right_poses: list[FlangePoseCapture],
     execute: bool,
 ) -> list[_PoseCheckResult]:
-    print("\n=== Stage A poses: both_arms_flange simultaneous reachability ===")
+    print("\n=== both_arms_flange simultaneous reachability ===")
     print(
         "(also checking each arm's target individually via arm_one_flange/arm_two_flange -- "
         "see module docstring: this MoveIt config's 'both_arms_flange' composite group cannot plan Cartesian "
@@ -159,13 +163,13 @@ def _run_stage_a(
     return results
 
 
-def _run_stage_b(
+def _run_single_arm_check(
     moveit: DualArmMoveitClient,
     left_poses: list[FlangePoseCapture],
     right_poses: list[FlangePoseCapture],
     execute: bool,
 ) -> list[_PoseCheckResult]:
-    print("\n=== Stage B poses: single-arm reachability ===")
+    print("\n=== single-arm-only reachability ===")
     results = []
     for arm_key, poses in (("left", left_poses), ("right", right_poses)):
         arm = ARM_KEYS[arm_key]
@@ -198,7 +202,7 @@ def main() -> None:
     if len(left_all) < need or len(right_all) < need:
         raise RuntimeError(
             f"Need >= {need} saved poses per arm (have left={len(left_all)}, right={len(right_all)}). "
-            f"Run capture_flange_poses_dual.py first."
+            f"Run capture_handeye_data.py first."
         )
 
     left_handeye = left_all[: args.num_handeye_poses]
@@ -235,8 +239,8 @@ def main() -> None:
         )
 
     try:
-        results = _run_stage_a(moveit, left_handeye, right_handeye, args.execute)
-        results += _run_stage_b(moveit, left_board, right_board, args.execute)
+        results = _run_both_arms_check(moveit, left_handeye, right_handeye, args.execute)
+        results += _run_single_arm_check(moveit, left_board, right_board, args.execute)
     finally:
         node.destroy_node()
         rclpy.shutdown()

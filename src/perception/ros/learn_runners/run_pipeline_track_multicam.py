@@ -73,6 +73,8 @@ from src.perception.fused_multicam_helpers import (
     fill_depth_holes_in_mask,
 )
 
+from src.perception.ros.learn_runners.PoseKalmanFilter import PoseKalmanFilter
+
 
 _DEBUG_LOGGING = False
 
@@ -275,107 +277,6 @@ def select_cameras(num_cameras: int) -> list[CameraTopics]:
             f"num_cameras must be in 1..{len(ALL_CAMERAS)}, got {num_cameras}"
         )
     return ALL_CAMERAS[:num_cameras]
-
-class PoseKalmanFilter:
-    """
-    Simple Kalman filter for 6DoF pose prediction.
-    Tracks position and velocity, predicts next position.
-    """
-
-    def __init__(self, process_noise: float = 0.01, measurement_noise: float = 0.002):
-        """
-        Args:
-            process_noise: How much we expect velocity to change (m/frame)
-            measurement_noise: How noisy our pose measurements are (m)
-        """
-        # State: [x, y, z, vx, vy, vz]
-        self.state = np.zeros(6, dtype=np.float64)
-        
-        # Covariance matrix
-        self.P = np.eye(6, dtype=np.float64) * 0.1
-        
-        # Process noise 
-        self.Q = np.eye(6, dtype=np.float64)
-        self.Q[:3, :3] *= process_noise ** 2  # Position 
-        self.Q[3:, 3:] *= (process_noise * 2) ** 2  # Velocity
-        
-        # Measurement noise (position only)
-        self.R = np.eye(3, dtype=np.float64) * measurement_noise ** 2
-        
-        # State transition matrix (constant velocity model)
-        self.F = np.eye(6, dtype=np.float64)
-        self.F[0, 3] = 1.0  # x += vx
-        self.F[1, 4] = 1.0  # y += vy
-        self.F[2, 5] = 1.0  # z += vz
-        
-        # Measurement matrix (only position)
-        self.H = np.zeros((3, 6), dtype=np.float64)
-        self.H[0, 0] = 1.0
-        self.H[1, 1] = 1.0
-        self.H[2, 2] = 1.0
-        
-        self._initialized = False
-        self._frame_count = 0
-       
-    
-    def initialize(self, position: np.ndarray) -> None:
-        self.state[:3] = position
-        self.state[3:] = 0.0  # Zero initial velocity
-        self.P = np.eye(6, dtype=np.float64) * 0.1
-        self._initialized = True
-        self._frame_count = 1
-    
-    def predict(self) -> np.ndarray:
-        """
-        Advance state one step using the constant-velocity model and
-        propagate covariance.
-        """
-        if not self._initialized:
-            return np.zeros(3)
-
-        # x ← Fx, P ← FPFᵀ + Q.
-        self.state = self.F @ self.state
-        self.P = self.F @ self.P @ self.F.T + self.Q
-
-        return self.state[:3].copy()
-    
-    def update(self, position: np.ndarray) -> None:
-        """
-        Update filter with new measured position.
-        """
-        if not self._initialized:
-            self.initialize(position)
-            return
-
-        # Standard Kalman correction step (residual → gain → state/covariance update).
-        # Measurement residual
-        y = position - self.H @ self.state
-
-        # Residual covariance
-        S = self.H @ self.P @ self.H.T + self.R
-
-        # Kalman gain
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-
-        # Update state
-        self.state = self.state + K @ y
-        
-        # Update covariance
-        I = np.eye(6)
-        self.P = (I - K @ self.H) @ self.P
-        
-        self._frame_count += 1
-
-    def reset(self) -> None:
-        """Reset filter state."""
-        self.state = np.zeros(6, dtype=np.float64)
-        self.P = np.eye(6, dtype=np.float64) * 0.1
-        self._initialized = False
-        self._frame_count = 0
-    
-    @property
-    def is_initialized(self) -> bool:
-        return self._initialized
 
 # Per-camera, per-object tracking state carried between ticks (pose, masks, mode, Kalman).
 @dataclass
@@ -2168,11 +2069,20 @@ class FoundationPoseTrackerNode(Node):
 
         try:
             T_base = self._to_base_pose(cam_id, T_camera)
+            x_base = float(T_base[0, 3])
+            y_base = float(T_base[1, 3])
             z_base = float(T_base[2, 3])
             z_lo = float(getattr(self.args, "table_plane_z_min", 0.0))
             z_hi = float(getattr(self.args, "table_plane_z_max", 0.9))
             if z_base < z_lo or z_base > z_hi:
                 return False, f"bad_z_base z={z_base:.3f} (table window [{z_lo:.3f}, {z_hi:.3f}])"
+            x_lo = float(getattr(self.args, "workspace_x_min", 0.10))
+            if x_base < x_lo:
+                return False, f"bad_x_base x={x_base:.3f} (min {x_lo:.3f})"
+            y_lo = float(getattr(self.args, "workspace_y_min", -0.4))
+            y_hi = float(getattr(self.args, "workspace_y_max", 0.4))
+            if y_base < y_lo or y_base > y_hi:
+                return False, f"bad_y_base y={y_base:.3f} (window [{y_lo:.3f}, {y_hi:.3f}])"
         except Exception:
             pass
 
@@ -5041,6 +4951,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--table-plane-z-min", type=float, default=-0.03)
     p.add_argument("--table-plane-z-max", type=float, default=0.9)
+    p.add_argument("--workspace-x-min", type=float, default=0.10)
+    p.add_argument("--workspace-y-min", type=float, default=-0.4)
+    p.add_argument("--workspace-y-max", type=float, default=0.4)
 
 
     p.add_argument("--icp-mask-close-kernel", type=int, default=0)

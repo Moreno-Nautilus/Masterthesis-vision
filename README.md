@@ -1,25 +1,35 @@
 # Masterthesis — Vision
 
 Multi-camera 6-DoF object pose estimation and tracking for robotic manipulation.
-Three calibrated ZED 2i cameras feed a learned perception stack —
+The default rig — one static ZED 2i plus two end-effector-mounted Intel
+RealSense D405 cameras — feeds a learned perception stack —
 **Grounding-DINO → SAM2 → DINOv2 → cross-camera fusion → FoundationPose → ICP** —
-that publishes a canonical pose per object in the **robot base frame**.
+that publishes a canonical pose per object in the **robot base frame**. The
+original 3-ZED-only rig is still supported as a variant — see
+[§6](#6-3-zed-trio-variant-original).
 
-> **New here / just want to calibrate and run it?** Start with
-> **[docs/getting_started.md](docs/getting_started.md)** — a linear, student-facing
-> calibrate → run → view guide for the lab rig. There's also a one-page
-> **[cheat sheet](docs/cheatsheet.md)** (commands only) to print and tape to the rig.
+> **Brand-new machine, nothing installed yet?** Start with
+> **[docs/setup_and_docker.md](docs/setup_and_docker.md)** — the complete
+> from-scratch walkthrough: OS/GPU/ROS 2 prerequisites, camera SDKs, the host
+> ROS 2 workspace (`mv_launch`/`fp_debug_msgs`), and Docker (image, container,
+> in-container build) — nothing to run yet after this, just a machine that's
+> ready to.
+>
+> **Rig already set up / just want to calibrate and run it?** Start with
+> **[docs/getting_started_realsense.md](docs/getting_started_realsense.md)** —
+> a linear, tested end-to-end calibrate → run → view guide for the default
+> 1-ZED + 2-RealSense rig, or its condensed
+> **[calibration cheat sheet](docs/calibration_cheatsheet.md)**.
+>
+> **On the original 3-ZED-only rig instead?** See
+> **[docs/getting_started.md](docs/getting_started.md)** and its
+> **[cheat sheet](docs/cheatsheet.md)** — [§6 below](#6-3-zed-trio-variant-original)
+> has the condensed launch commands.
 >
 > **For a step-by-step description of how the pipeline actually runs,
 > read [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).** This README
 > covers setup, how to launch things, and what each piece of code does; the
 > walkthrough explains the algorithm itself.
->
-> **Experimenting with the 1-ZED + 2-RealSense (end-effector) variant?** See
-> **[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**
-> for the full step-by-step run sequence, or [§6 below](#6-realsense-trio-variant)
-> for a quick reference — a separate, parallel pipeline (own
-> scripts/config/launch files); nothing above is affected by it.
 >
 > **Just want to view tracked objects / camera poses in RViz?** See
 > **[docs/visualization.md](docs/visualization.md)** for the MoveIt2 planning
@@ -27,6 +37,15 @@ that publishes a canonical pose per object in the **robot base frame**.
 > (Foxglove) are covered in
 > [docs/getting_started.md §1](docs/getting_started.md#watch-the-result-in-foxglove)
 > instead.
+>
+> **Have a rosbag and want to sanity-check the pipeline offline** (depth maps,
+> DINO/SAM overlays, raw + segmented point clouds, detected object coordinate
+> frames)? See **[docs/bagviz_quickstart.md](docs/bagviz_quickstart.md)** —
+> no docker, no live pipeline, just `scripts/visualize_bag_pipeline.sh <bag>`.
+>
+> **Looking for anything else** (compliant control, hand-eye calibration,
+> annotating the DINO reference bank, ...)? Every topic has its own guide
+> under **[docs/](docs/)** — check there before digging through the code.
 
 ---
 
@@ -48,16 +67,18 @@ that publishes a canonical pose per object in the **robot base frame**.
 | [src/perception/tracking/realtime_tracker.py](src/perception/tracking/realtime_tracker.py) | Per-object tracker state (pose + ICP refinement) used in `track` mode. In the multicam loop the runner drives one shared Cutie session per camera and feeds each object's mask into its own `RealtimeTracker`; the canonical pose comes from the fused multi-camera ICP. |
 | [src/perception/tracking/cutie_tracker.py](src/perception/tracking/cutie_tracker.py) | Cutie (video object segmentation) wrapper. |
 | [src/perception/tracking/icp_refiner.py](src/perception/tracking/icp_refiner.py) | Generic ICP refiner used by `RealtimeTracker`; the fused base-frame ICP and rotation grid live in the multicam runner/helpers. |
-| [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **N-camera extrinsic calibration** (checkerboard → base frame) — see §4. Defaults to the 3-ZED trio; accepts `--cam-ids` for any subset (e.g. the RealSense-trio rig's single `zed2i_1`). |
+| [src/calibration/base_to_cams_calib_3.py](src/calibration/base_to_cams_calib_3.py) | **N-camera extrinsic calibration** (checkerboard → base frame) — see §6.2. Defaults to the 3-ZED trio; accepts `--cam-ids` for any subset (e.g. the RealSense-trio rig's single `zed2i_1`). |
 | [src/calibration/io_extrinsics.py](src/calibration/io_extrinsics.py) | Load/save extrinsics YAML (`R` row-major + `t`) ↔ `SE3`. |
-| [src/calibration/capture_flange_poses_dual.py](src/calibration/capture_flange_poses_dual.py) | Dual-arm calibration, Step 1 (manual): jog + save each arm's flange poses permanently to `config/flange_poses/` — see §6. |
-| [src/calibration/capture_flange_poses_dual_handguided.py](src/calibration/capture_flange_poses_dual_handguided.py) | Step 1's hand-guided twin: gravity-compensation bring-up instead of RViz jogging, also saves the joint configuration — see [docs/hand_guided_calibration.md](docs/hand_guided_calibration.md). |
-| [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Step 2 (automatic): replays the saved poses to solve hand-eye + checkerboard pose + ZED extrinsic — see §6. |
+| [src/calibration/capture_handeye_data.py](src/calibration/capture_handeye_data.py) | Dual-arm calibration, Stage A (manual or replay): position each arm via `--controller {moveit,admittance,handguided}`, save its flange pose/joint config and checkerboard image/detection — see §4. |
+| [src/calibration/calibrate_handeye.py](src/calibration/calibrate_handeye.py) | Stage B (offline, no hardware): solves `T_flange_cam` from Stage A's saved data, `--method direct` or `--method joint` — see §4. |
+| [src/calibration/autocalibrate_dual_realsense.py](src/calibration/autocalibrate_dual_realsense.py) | Dual-arm calibration, Stage C (automatic replay): solves checkerboard pose + ZED extrinsic, run after Stage A/B — see §4. |
 | [src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py) | `MoveGroup` action-client helper — the only code in this repo that sends motion commands to the robot (used by the Step 2 script above); Cartesian (`ArmTarget`/`move_to()`) and joint-space (`JointTarget`/`move_to_joint()`) goal types. |
 | [src/calibration/flange_pose_store.py](src/calibration/flange_pose_store.py) | JSON schema + save/load for the permanently-stored flange pose captures. |
 | [src/calibration/calibration_log.py](src/calibration/calibration_log.py) | Append-only JSON run logs (camera/checkerboard/flange transforms + quality metrics) under `outputs/calibration_logs/`. |
 | [src/utils/se3.py](src/utils/se3.py) | Minimal immutable `SE3` rigid-transform type. |
 | [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py) | Renders synthetic reference views from the CAD meshes (optional DINO reference source). |
+| [tools/refbank_crop_screenshots.py](tools/refbank_crop_screenshots.py) | Interactively crop raw screenshots into `Data/ZED_screens/` (manual bbox, one `cv2.selectROI` window per image) — see [docs/annotate_refbank.md](docs/annotate_refbank.md). |
+| [tools/refbank_autocrop_masks.py](tools/refbank_autocrop_masks.py) | Auto-crop imgpy render sessions (image + segmentation mask) into `Data/ZED_screens/`, no GUI — see [docs/annotate_refbank.md](docs/annotate_refbank.md). |
 | [debug_pose_axes.py](debug_pose_axes.py) | Publishes RViz/Foxglove axis markers for the poses on `/perception/fp/pose_base/...`. |
 | [config/](config/) | Calibration inputs/outputs (board pose, camera extrinsics). |
 | [external/](external/) | Third-party deps as submodules + the FoundationPose patch — see §2. |
@@ -85,9 +106,16 @@ pinned commit `ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a` (see
 ### 2.2 Docker
 
 The pipeline runs inside a CUDA container built from
-[Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda). The launch scripts assume a
-container named `vision` already exists (they `docker start`/`stop` it, they do
-not build it). Override the name with the `CONTAINER` env var.
+[Dockerfile.thesisnewcuda](Dockerfile.thesisnewcuda) (Python packages pinned in
+[requirements-docker.txt](requirements-docker.txt)). The launch scripts assume
+a container named `vision` already exists (they `docker start`/`stop` it, they
+do not build it). Override the name with the `CONTAINER` env var.
+
+**Setting up a fresh machine from scratch** (Docker image + container, GPU
+passthrough, the host ROS 2 workspace that `mv_launch`/`fp_debug_msgs` live
+in, camera SDKs)? See **[docs/setup_and_docker.md](docs/setup_and_docker.md)**
+for the full walkthrough — this section only covers the submodules/`Data/`
+half of one-time setup.
 
 ### 2.3 The `Data/` folder (you must create this)
 
@@ -133,7 +161,12 @@ Data/
 - **`ZED_screens/<assembly_name>/<object_id>/`** — the **DINO reference bank**:
   a handful of cropped photos of each object. DINOv2 embeds these once at
   startup and every candidate crop is classified against them. This is the
-  default reference source (`--reference-source real`).
+  default reference source (`--reference-source real`). Populate it with
+  [tools/refbank_crop_screenshots.py](tools/refbank_crop_screenshots.py)
+  (manual bbox from raw screenshots) and/or
+  [tools/refbank_autocrop_masks.py](tools/refbank_autocrop_masks.py)
+  (auto bbox from imgpy render + mask pairs) — see
+  [docs/annotate_refbank.md](docs/annotate_refbank.md) for the full guide.
 - **`reference_renders/<assembly_name>/<object_id>/`** — optional CAD-rendered
   alternative/extra reference views, produced by
   [tools/generate_dino_reference_renders.py](tools/generate_dino_reference_renders.py).
@@ -150,10 +183,162 @@ assembly prefix are read directly from the `Data/*` root instead.
 ## 3. Running the pipeline
 
 There are two halves: the **host stack** (cameras + visualization, runs on the
-host) and the **pipeline node** (runs inside the docker container).
+host) and the **pipeline node** (runs inside the docker container). This
+section covers the default rig — 1 static ZED 2i (`zed2i_1`) + 2
+end-effector-mounted RealSense D405 cameras. For the full tested start-to-finish
+sequence (including the required base→flange tf2 step before the cameras can
+be marked "ready"), see
+**[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**.
 
-### 3.1 Host stack — cameras + viz ([scripts/launch_host.sh](scripts/launch_host.sh))
+### 3.0 Prerequisite — base→flange transform in tf2
 
+The pipeline needs `lbr_link_0 → lbr_link_ee` resolvable via tf2 before the
+RealSense cameras can be marked "ready" (their extrinsic is computed live
+every frame from this):
+
+```bash
+# real robot (needs the KUKA FRI connection already live):
+ros2 launch lbr_bringup hardware.launch.py model:=iiwa7
+
+# or, with no robot connected, a fixed identity placeholder (fused RealSense
+# poses will be wrong, but camera sync/detection/fusion all still run):
+ros2 run tf2_ros static_transform_publisher \
+    --frame-id lbr_link_0 --child-frame-id lbr_link_ee \
+    --x 0 --y 0 --z 0 --qx 0 --qy 0 --qz 0 --qw 1
+```
+
+### 3.1 Host stack — cameras + viz ([scripts/launch_host_realsense.sh](scripts/launch_host_realsense.sh))
+
+Starts a tmux session with `zed2i_1`, both RealSense D405s, and
+`flange_pose_publisher`; the Foxglove bridge and per-camera `visualize_pipeline`
+windows come up by default so the mask + tracked-axes overlays show in Foxglove.
+
+```bash
+scripts/launch_host_realsense.sh                  # start (and attach) the tmux session
+scripts/launch_host_realsense.sh attach           # re-attach if already running
+scripts/launch_host_realsense.sh stop             # kill the session
+scripts/launch_host_realsense.sh --no-visualize   # skip the 3 visualize_pipeline windows
+scripts/launch_host_realsense.sh --no-foxglove    # skip the foxglove_bridge window
+```
+
+tmux: `Ctrl+b` then a number to switch windows, `Ctrl+b d` to detach.
+
+### 3.2 Pipeline node — the locked baseline ([scripts/launch_pipeline_realsense.sh](scripts/launch_pipeline_realsense.sh))
+
+Restarts the docker container, sources ROS + the venv, and runs
+`run_pipeline_track_multicam_realsense`:
+
+```bash
+scripts/launch_pipeline_realsense.sh init-only       # locked trio init baseline
+scripts/launch_pipeline_realsense.sh fast-track      # fast tracking preset
+scripts/launch_pipeline_realsense.sh accurate-track  # settled-axis accuracy preset
+scripts/launch_pipeline_realsense.sh baseline        # alias for init-only
+scripts/launch_pipeline_realsense.sh                 # interactive shell in the container
+scripts/launch_pipeline_realsense.sh --run-mode track --num-cameras 3 ...  # custom args
+CONTAINER=other-name scripts/launch_pipeline_realsense.sh fast-track       # different container
+```
+
+`init-only`/`baseline` runs in `init_only` mode (re-detect every tick, never
+tracks) and tees output to `outputs/logs/multicam_init_realsense_baseline.log`.
+`fast-track` keeps tracking responsive with centroid recovery and no rotation
+reseed/PCA/damping. `accurate-track` adds the rotation reseed + cautious PCA +
+light damping preset for better settled screw-axis estimates. The exact pinned
+flags are listed in the launch file and the init-only baseline is explained in
+[docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md). Named presets
+also launch a `cam-scene` tmux window (`publish_camera_scene_objects.py
+--dual-arm`) that publishes the ZED camera + holder meshes as
+`CollisionObject`s alongside the tracked parts — see §7.
+
+### Output
+
+Per detected object the pipeline publishes a base-frame `fp_debug_msgs/DebugPoseItem`
+(identified by `assembly_name`/`part_id`) on the shared
+`/perception/fp/pose_base/fused/assembly` topic; with logging flags, it writes
+CSV rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
+`init_renders/`. Same message/topic shape on the [3-ZED variant](#6-3-zed-trio-variant-original).
+
+---
+
+## 4. Hand-eye / camera calibration (default rig)
+
+Camera-to-flange offset for both RealSense cameras, plus the
+checkerboard-in-base-frame and ZED extrinsic, are solved by a **three-stage
+dual-arm routine** — see
+**[docs/getting_started_realsense.md §4](docs/getting_started_realsense.md#4-hand-eye-calibration-camera-to-flange-offset)**
+for the full walkthrough, or
+**[docs/calibration_cheatsheet.md](docs/calibration_cheatsheet.md)** for the
+condensed command sequence:
+
+```bash
+# Stage A (manual, both arms by default) — position each arm, save its
+# flange pose/joint config and a checkerboard capture; nothing solved yet
+python3 -m src.calibration.capture_handeye_data
+
+# Stage B (offline, no hardware) — solves T_flange_cam from Stage A's data
+python3 -m src.calibration.calibrate_handeye --write
+
+# Stage C (automatic replay) — drives both arms itself, solves checkerboard
+# pose + ZED extrinsic
+python3 -m src.calibration.autocalibrate_dual_realsense
+```
+
+Stage A's default `--controller moveit` needs jogging the arm interactively
+via MoveIt between samples; see
+**[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for that
+part — or skip jogging entirely with `--controller admittance` or
+`--controller handguided`, see
+**[docs/calibration_control_modes.md](docs/calibration_control_modes.md)**.
+Stage C needs no jogging — it drives both arms itself over the
+`moveit_msgs/action/MoveGroup` action (see
+[src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py)),
+including one simultaneous `both_arms_flange` goal per pose-pair for the
+hand-eye stage (calibration always targets the bare flange, regardless of
+whether the Y-gripper is attached — see `moveit_dual_arm.py`'s docstring).
+
+The original single-arm, single-camera manual scripts
+(`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`)
+still work standalone — see
+[docs/getting_started_realsense.md §4.7](docs/getting_started_realsense.md#47-manual-single-camera-fallback-original-scripts-still-available).
+
+**On the 3-ZED variant instead?** Its 3-camera checkerboard extrinsic
+calibration is different (single-stage, no hand-eye/flange offset involved) —
+see **[§6.2 below](#62-3-zed-camera-to-base-calibration)**.
+
+---
+
+## 5. How the pipeline works
+
+See **[docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md)** for the full
+per-tick breakdown, in two halves:
+
+- **Init** (Stages 0–4) — model loading, GDINO proposal, SAM segmentation, DINO
+  classification + candidate selection, cross-camera fusion, per-object
+  FoundationPose + ICP (incl. the conditional symmetry rotation grid and the
+  polishing ICP).
+- **Tracking** (Stage 5) — once objects are initialized, `track` mode drops the
+  learned front-end and runs the cheap Cutie-mask → masked-depth → fused-ICP loop
+  with its accept/hold/lost gates; this section also covers the `fast-track` vs
+  `accurate-track` presets and the optional rotation fixes (rot-reseed, PCA
+  shaft-axis, rotation damping).
+
+---
+
+## 6. 3-ZED trio variant (original)
+
+The pipeline's original rig: three static, calibrated ZED 2i cameras
+(`zed2i_1/2/3`), no end-effector-mounted cameras and no hand-eye calibration
+step. A separate set of scripts/config/launch files that doesn't touch
+anything in §3/§4 above — see
+**[docs/getting_started.md](docs/getting_started.md)** for the full
+student-facing calibrate → run → view guide, or the one-page
+**[cheat sheet](docs/cheatsheet.md)**.
+
+### 6.1 Running the pipeline (3-ZED)
+
+Same two-halves split as §3 — **host stack** (cameras + viz, on the host) and
+**pipeline node** (in the docker container).
+
+**Host stack — cameras + viz** ([scripts/launch_host.sh](scripts/launch_host.sh)).
 Starts a tmux session with one window each for: the ZED camera driver, the
 Foxglove bridge, a `visualize_pipeline` per camera, and `debug_pose_axes`.
 
@@ -161,13 +346,12 @@ Foxglove bridge, a `visualize_pipeline` per camera, and `debug_pose_axes`.
 scripts/launch_host.sh            # start (and attach) the tmux session
 scripts/launch_host.sh attach     # re-attach if already running
 scripts/launch_host.sh stop       # kill the session
-scripts/launch_host.sh calibrate  # same, but ZEDs grab/publish at HD2K/15fps (see §4)
+scripts/launch_host.sh calibrate  # same, but ZEDs grab/publish at HD2K/15fps (see §6.2)
 ```
 
 tmux: `Ctrl+b` then `0..5` to switch windows, `Ctrl+b d` to detach.
 
-### 3.2 Pipeline node — the locked baseline ([scripts/launch_pipeline.sh](scripts/launch_pipeline.sh))
-
+**Pipeline node — the locked baseline** ([scripts/launch_pipeline.sh](scripts/launch_pipeline.sh)).
 Restarts the docker container, sources ROS + the venv, and runs
 `run_pipeline_track_multicam`:
 
@@ -181,25 +365,11 @@ scripts/launch_pipeline.sh --run-mode track --num-cameras 3 ...  # custom args
 CONTAINER=other-name scripts/launch_pipeline.sh fast-track       # different container
 ```
 
-`init-only`/`baseline` runs in `init_only` mode (re-detect every tick, never
-tracks) and tees output to `outputs/logs/multicam_init_final_baseline.log`.
-`fast-track` keeps tracking responsive with centroid recovery and no rotation
-reseed/PCA/damping. `accurate-track` adds the rotation reseed + cautious PCA +
-light damping preset for better settled screw-axis estimates. The exact pinned
-flags are listed in the launch file and the init-only baseline is explained in
-[docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).
+Same `init-only`/`fast-track`/`accurate-track` preset semantics and output
+format (`fp_debug_msgs/DebugPoseItem` on `/perception/fp/pose_base/fused/assembly`)
+as §3 — see [docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md).
 
-### Output
-
-Per detected object the pipeline publishes a base-frame `fp_debug_msgs/DebugPoseItem`
-(identified by `assembly_name`/`part_id`) on the shared
-`/perception/fp/pose_base/fused/assembly` topic; with logging flags, it writes
-CSV rows (`init_pose_log.csv`, `outputs/logs/...csv`) and saves a render under
-`init_renders/`.
-
----
-
-## 4. Camera-to-base calibration
+### 6.2 3-ZED camera-to-base calibration
 
 The pipeline loads camera extrinsics from
 [config/camera_extrinsics_base.yaml](config/camera_extrinsics_base.yaml) (`T_base_cam`
@@ -264,88 +434,11 @@ consistency before trusting the result.
 
 ---
 
-## 5. How the pipeline works
-
-See **[docs/pipeline_walkthrough.md](docs/pipeline_walkthrough.md)** for the full
-per-tick breakdown, in two halves:
-
-- **Init** (Stages 0–4) — model loading, GDINO proposal, SAM segmentation, DINO
-  classification + candidate selection, cross-camera fusion, per-object
-  FoundationPose + ICP (incl. the conditional symmetry rotation grid and the
-  polishing ICP).
-- **Tracking** (Stage 5) — once objects are initialized, `track` mode drops the
-  learned front-end and runs the cheap Cutie-mask → masked-depth → fused-ICP loop
-  with its accept/hold/lost gates; this section also covers the `fast-track` vs
-  `accurate-track` presets and the optional rotation fixes (rot-reseed, PCA
-  shaft-axis, rotation damping).
-
----
-
-## 6. RealSense trio variant
-
-Experimental parallel pipeline: `zed2i_1` (static) + 2 end-effector-mounted Intel
-RealSense D405 cameras — a separate set of scripts/config/launch files that don't
-touch anything above.
-
-**For the full start-to-finish run sequence** (tested and verified working —
-tf2/robot setup, host stack, pipeline, what a healthy run looks like, and every
-bug already hit and fixed along the way), see
-**[docs/getting_started_realsense.md §1](docs/getting_started_realsense.md#1-run-it-start-to-finish-the-tested-sequence)**.
-
-Quick reference once you've read that once:
-
-```bash
-# terminal 1 — tf2 for the flange pose (real robot, or identity placeholder — see docs §1 Step 1)
-ros2 launch lbr_bringup hardware.launch.py model:=iiwa7
-
-# terminal 2 — host camera stack (ZED + both RealSense + flange_pose_publisher)
-scripts/launch_host_realsense.sh
-
-# terminal 3 — the pipeline itself (needs a real terminal, not a backgrounded/piped shell)
-scripts/launch_pipeline_realsense.sh init-only
-```
-
-**Hand-eye calibration for the two RealSense cameras** (camera-to-flange
-offset) plus the checkerboard-in-base-frame and ZED calibration are now a
-**two-script dual-arm routine** — see
-**[docs/getting_started_realsense.md §4](docs/getting_started_realsense.md#4-hand-eye-calibration-camera-to-flange-offset)**
-for the full walkthrough, or
-**[docs/calibration_cheatsheet.md](docs/calibration_cheatsheet.md)** for the
-condensed command sequence:
-
-```bash
-# Step 1 (manual, per arm) — jog + save flange poses, nothing calibrated yet
-python3 -m src.calibration.capture_flange_poses_dual --arm left
-python3 -m src.calibration.capture_flange_poses_dual --arm right
-
-# Step 2 (automatic replay) — drives both arms itself, solves hand-eye +
-# checkerboard pose + ZED extrinsic, in one run
-python3 -m src.calibration.autocalibrate_dual_realsense
-```
-
-Step 1 still needs jogging the arm interactively via MoveIt between samples;
-see **[docs/moveit_robot_control.md](docs/moveit_robot_control.md)** for
-that part — or skip jogging entirely with the hand-guided alternative
-(gravity-compensation bring-up + `capture_flange_poses_dual_handguided.py`),
-see **[docs/hand_guided_calibration.md](docs/hand_guided_calibration.md)**.
-Step 2 needs no jogging — it drives both arms itself over the
-`moveit_msgs/action/MoveGroup` action (see
-[src/calibration/moveit_dual_arm.py](src/calibration/moveit_dual_arm.py)),
-including one simultaneous `both_arms_flange` goal per pose-pair for the
-hand-eye stage (calibration always targets the bare flange, regardless of
-whether the Y-gripper is attached — see `moveit_dual_arm.py`'s docstring).
-
-The original single-arm, single-camera manual scripts
-(`handeye_flange_cam_realsense.py`, `board_pose_from_flange_realsense.py`)
-still work standalone — see
-[docs/getting_started_realsense.md §4.7](docs/getting_started_realsense.md#47-manual-single-camera-fallback-original-scripts-still-available).
-
----
-
 ## 7. MoveIt2 planning scene visualization
 
-Both pipeline runners (`run_pipeline_track_multicam.py` and the RealSense
-variant) publish each tracked part as a `moveit_msgs/CollisionObject` on
+Both pipeline runners (`run_pipeline_track_multicam_realsense.py` and the
+3-ZED variant, `run_pipeline_track_multicam.py`) publish each tracked part as
+a `moveit_msgs/CollisionObject` on
 `/planning_scene`, plus each camera's calibrated pose as a static TF frame —
 so RViz can show the tracked parts and cameras alongside a mock robot without
 any real hardware.
@@ -376,3 +469,9 @@ instead — a walkthrough of all three dual-arm control modes (gravity
 compensation, Cartesian impedance, admittance) side by side: what each
 does, when to reach for it, and how each fits (or doesn't yet) into the
 existing calibration routine.
+
+**Just want to park both arms at a known pose** (start/end of a session)?
+See **[docs/robot_init_pose_quickstart.md](docs/robot_init_pose_quickstart.md)**
+— `scripts/launch_robots_to_init_pose.sh`, Cartesian-impedance (compliant)
+by default, `CONTROL_MODE=position` for a stiff MoveGroup-executed move
+instead.

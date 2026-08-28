@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ from sensor_msgs.msg import Image, CameraInfo
 import yaml
 
 from src.utils.se3 import SE3
-from src.calibration.io_extrinsics import save_extrinsics_yaml
+from src.calibration.io_extrinsics import save_extrinsics_yaml, update_extrinsics_yaml_preserving_header
 from src.calibration.calibration_log import log_camera_transform
 from src.utils.robot_bases import get_active_robot_base
 
@@ -66,6 +67,14 @@ OUT_YAML = "config/camera_extrinsics_base.yaml"
 # to a terminal that may not be saved" justification for a second YAML no
 # longer held.
 DEBUG_DIR = "outputs/calibration_debug"
+# The realsense-trio tracking pipeline (run_pipeline_track_multicam_
+# realsense.py) reads zed2i_1 from this file, not from OUT_YAML -- its
+# zed2i_1 entry must be kept identical to OUT_YAML's (same dst frame:
+# active robot's lbr_link_0, see io_extrinsics.load_extrinsics_yaml), or the
+# pipeline silently tracks against a stale extrinsic. Synced automatically
+# below via update_extrinsics_yaml_preserving_header() whenever this script
+# recalibrates zed2i_1.
+TRACKING_PIPELINE_YAML = "config/camera_extrinsics_realsense.yaml"
 # ------------------------------------------------
 
 
@@ -175,8 +184,21 @@ def _compute_reproj_err_px(
     return float(err.mean())
 
 
-def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarray, float]:
-    # Find chessboard corners, refine to sub-pixel, then solve the board→camera pose.
+def _solve_board_pose_candidates(
+    img_bgr: np.ndarray, K: np.ndarray
+) -> Tuple[list, np.ndarray, list]:
+    """Reverted to the original single-solution algorithm: cv2.solvePnP
+    with SOLVEPNP_ITERATIVE, one pose per call. (Briefly replaced with
+    cv2.solvePnPGeneric + SOLVEPNP_IPPE, which returns every pose consistent
+    with the coplanar checkerboard corners for a near-fronto-parallel view,
+    disambiguated by _score_camera_pose's camera-height heuristic -- that
+    heuristic turned out to reject the genuinely correct, low-reprojection
+    solution outright on a real ZED capture (0.2px vs the picked
+    candidate's 31.8px), which is worse than SOLVEPNP_ITERATIVE's original
+    single deterministic answer. Went back to that rather than trying to
+    patch the heuristic further.) Still returns a list (of length 1) so the
+    BoardPoseSolve/_save_solve_debug plumbing built around multi-candidate
+    solves keeps working unchanged."""
     pattern_size = (CHESS_COLS, CHESS_ROWS)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -196,12 +218,79 @@ def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray) -> Tuple[SE3, np.ndarr
     if not ok:
         raise RuntimeError("solvePnP failed")
 
-    reproj_err_px = _compute_reproj_err_px(objp, corners, K, rvec, tvec)
-
     R, _ = cv2.Rodrigues(rvec)
-    t = tvec.reshape(3)
+    candidates = [SE3(R, tvec.reshape(3))]
+    reproj_errs = [_compute_reproj_err_px(objp, corners, K, rvec, tvec)]
 
-    return SE3(R, t), corners.reshape(-1, 2), reproj_err_px
+    return candidates, corners.reshape(-1, 2), reproj_errs
+
+
+# Vestigial now that _solve_board_pose_candidates is back to a single
+# SOLVEPNP_ITERATIVE solution (nothing left to disambiguate -- _solve_board_pose
+# always has exactly one candidate to pick from). Kept only because
+# BoardPoseSolve/_save_solve_debug still record each candidate's score in
+# the debug JSON for inspection; not used to choose between candidates
+# anymore. See _solve_board_pose_candidates's docstring for why the
+# IPPE + height-heuristic disambiguation this used to drive was reverted.
+def _score_camera_pose(t_base_cam: np.ndarray) -> float:
+    x, y, z = t_base_cam
+    return float(z - abs(x) - abs(y))
+
+
+@dataclass
+class _PoseCandidate:
+    R: np.ndarray
+    t: np.ndarray
+    reproj_px: float
+    score: float
+
+
+@dataclass
+class BoardPoseSolve:
+    """Everything about one board-pose solve worth dumping to disk for
+    inspection, not just the winning candidate -- see _save_solve_debug."""
+    T_cam_board: SE3
+    T_base_cam: SE3
+    corners: np.ndarray
+    reproj_px: float
+    K: np.ndarray
+    candidates: list       # list[_PoseCandidate], IPPE's original order
+    chosen_index: int
+
+
+def _solve_board_pose(img_bgr: np.ndarray, K: np.ndarray, T_base_board: SE3) -> BoardPoseSolve:
+    """Wraps _solve_board_pose_candidates's single SOLVEPNP_ITERATIVE
+    solution into a BoardPoseSolve (T_base_board @ T_cam_board^-1 for the
+    implied camera pose, plus the debug/candidate bookkeeping
+    _save_solve_debug expects) -- see that function's docstring for why
+    there's only ever one candidate here now."""
+    candidates, corners, reproj_errs = _solve_board_pose_candidates(img_bgr, K)
+
+    scores = [
+        _score_camera_pose((T_base_board @ candidates[i].inverse()).t)
+        for i in range(len(candidates))
+    ]
+    best_i = max(range(len(candidates)), key=lambda i: scores[i])
+
+    if len(candidates) > 1:
+        cams = {i: T_base_board @ candidates[i].inverse() for i in range(len(candidates))}
+        detail = "  ".join(
+            f"cand{i}: t={np.round(cams[i].t, 3)} reproj={reproj_errs[i]:.3f}px score={scores[i]:.3f}"
+            + (" <- chosen" if i == best_i else "")
+            for i in range(len(candidates))
+        )
+        print(f"  [ambiguous PnP, {len(candidates)} candidates] {detail}")
+
+    T_cam_board = candidates[best_i]
+    T_base_cam = T_base_board @ T_cam_board.inverse()
+    pose_candidates = [
+        _PoseCandidate(R=candidates[i].R, t=candidates[i].t, reproj_px=reproj_errs[i], score=scores[i])
+        for i in range(len(candidates))
+    ]
+    return BoardPoseSolve(
+        T_cam_board=T_cam_board, T_base_cam=T_base_cam, corners=corners,
+        reproj_px=reproj_errs[best_i], K=K, candidates=pose_candidates, chosen_index=best_i,
+    )
 
 
 def _draw_chessboard(img_bgr: np.ndarray, corners: np.ndarray, text: str) -> np.ndarray:
@@ -219,6 +308,67 @@ def _draw_chessboard(img_bgr: np.ndarray, corners: np.ndarray, text: str) -> np.
         cv2.LINE_AA,
     )
     return vis
+
+
+# Draws the detected corners (as _draw_chessboard) PLUS the board's own
+# coordinate frame (origin + RGB=XYZ axes) as solved for the CHOSEN
+# candidate -- lets you see at a glance, from the image alone, which
+# physical corner PnP thinks is the origin and which way X/Y/Z point,
+# which is exactly what's ambiguous when IPPE returns >1 candidate (see
+# _solve_board_pose). Not published live -- written straight to disk
+# alongside the matching JSON, see _save_solve_debug.
+def _draw_chessboard_with_axes(
+    img_bgr: np.ndarray, solve: "BoardPoseSolve", text: str,
+) -> np.ndarray:
+    vis = _draw_chessboard(img_bgr, solve.corners, text)
+    dist = np.zeros((8, 1), dtype=np.float64)
+    rvec = _rotation_matrix_to_rotvec(solve.T_cam_board.R).reshape(3, 1)
+    tvec = solve.T_cam_board.t.reshape(3, 1)
+    axis_len = 4 * SQUARE_SIZE_M  # 12cm -- clearly visible against 3cm squares
+    cv2.drawFrameAxes(vis, solve.K, dist, rvec, tvec, axis_len, thickness=3)
+    return vis
+
+
+# Dumps everything about a solve -- not just the winning candidate, every
+# candidate IPPE returned with its score -- so a rejected run (like the
+# one that motivated this: every sample rejected on reprojection, meaning
+# _solve_board_pose's own picture of "chosen" was never trustworthy to
+# begin with) can still be inspected after the fact instead of only ever
+# seeing images for samples that happened to pass the accept gate.
+def _save_solve_debug(
+    debug_dir: Path, cam_id: str, attempt_idx: int, img_bgr: np.ndarray,
+    solve: "BoardPoseSolve", accepted: bool, reject_reason: str = "",
+) -> None:
+    cam_dir = debug_dir / "base_to_cams" / cam_id
+    cam_dir.mkdir(parents=True, exist_ok=True)
+    status = "accepted" if accepted else "rejected"
+    stem = f"sample_{attempt_idx:03d}_{status}"
+
+    text = f"{cam_id} #{attempt_idx} {status} reproj={solve.reproj_px:.3f}px"
+    if len(solve.candidates) > 1:
+        text += f" ({len(solve.candidates)} candidates)"
+    vis = _draw_chessboard_with_axes(img_bgr, solve, text)
+    cv2.imwrite(str(cam_dir / f"{stem}.png"), vis)
+
+    data = {
+        "cam_id": cam_id,
+        "attempt_idx": attempt_idx,
+        "accepted": accepted,
+        "reject_reason": reject_reason,
+        "chosen_index": solve.chosen_index,
+        "chosen": {
+            "T_cam_board": {"R": solve.T_cam_board.R.tolist(), "t": solve.T_cam_board.t.tolist()},
+            "T_base_cam": {"R": solve.T_base_cam.R.tolist(), "t": solve.T_base_cam.t.tolist()},
+            "reproj_px": solve.reproj_px,
+        },
+        "candidates": [
+            {"R": c.R.tolist(), "t": c.t.tolist(), "reproj_px": c.reproj_px, "score": c.score}
+            for c in solve.candidates
+        ],
+        "corners_px": np.asarray(solve.corners, dtype=float).tolist(),
+        "K": np.asarray(solve.K, dtype=float).reshape(3, 3).tolist(),
+    }
+    (cam_dir / f"{stem}.json").write_text(json.dumps(data, indent=2))
 
 
 def _rotation_matrix_to_rotvec(R: np.ndarray) -> np.ndarray:
@@ -427,7 +577,15 @@ def main() -> None:
     t_start = time.time()
     t_last_print = 0.0
     t_last_reject_print = 0.0
+    t_last_debug_save = -1e9
+    DEBUG_SAVE_MIN_DT_S = 1.0   # cap disk writes to <=1 debug PNG+JSON set/sec, accepted or rejected alike
     last_accept_t = -1e9
+    attempt_idx = 0
+
+    print(
+        f"Per-attempt debug (corners + axes, every candidate, JSON+PNG, "
+        f"max 1/s) -> {debug_dir / 'base_to_cams'}"
+    )
 
     # Collect NUM_SAMPLES good synced sets, solving the board pose in each.
     while len(accepted) < NUM_SAMPLES:
@@ -451,14 +609,15 @@ def main() -> None:
             continue
 
         # Solve the board pose per camera; any failed detection rejects the whole set.
-        T_cam_board: dict[str, SE3] = {}
-        reproj_px: dict[str, float] = {}
-        corners_by_cam: dict[str, np.ndarray] = {}
+        # T_base_cam comes back already disambiguated against T_base_board
+        # (see _solve_board_pose) -- no separate T_base_board @ T_cam_board^-1
+        # step needed here.
+        solves: dict[str, BoardPoseSolve] = {}
         rejected = False
         for cam_id in cam_ids:
             img, K, _dt = synced[cam_id]
             try:
-                T_cam_board[cam_id], corners_by_cam[cam_id], reproj_px[cam_id] = _solve_board_pose(img, K)
+                solves[cam_id] = _solve_board_pose(img, K, T_base_board)
             except RuntimeError as e:
                 if now - t_last_reject_print > 1.0:
                     print(f"[reject] {cam_id}: {e}")
@@ -468,16 +627,39 @@ def main() -> None:
         if rejected:
             continue
 
-        if any(r > MAX_REPROJ_ERR_PX for r in reproj_px.values()):
+        T_cam_board = {c: s.T_cam_board for c, s in solves.items()}
+        T_base_cam = {c: s.T_base_cam for c, s in solves.items()}
+        reproj_px = {c: s.reproj_px for c, s in solves.items()}
+
+        reproj_bad = any(r > MAX_REPROJ_ERR_PX for r in reproj_px.values())
+        is_accepted = not reproj_bad
+        reject_reason = "" if is_accepted else f"reproj too high (limit {MAX_REPROJ_ERR_PX:.3f}px)"
+
+        # Dump corners+axes PNG and full-candidate JSON, accepted or
+        # rejected alike -- a run that rejects every single sample (like
+        # the one that motivated this) previously left NO debug images
+        # behind at all, since the old code only ever saved images for
+        # samples that already passed the accept gate. Rate-limited to
+        # DEBUG_SAVE_MIN_DT_S regardless of accept/reject status (a single
+        # shared gate, not one per branch) so a stuck reject-loop -- which
+        # can attempt several samples per second -- can't flood the disk.
+        if now - t_last_debug_save > DEBUG_SAVE_MIN_DT_S:
+            for cam_id in cam_ids:
+                img, _K, _dt = synced[cam_id]
+                _save_solve_debug(
+                    debug_dir, cam_id, attempt_idx, img, solves[cam_id],
+                    accepted=is_accepted, reject_reason=reject_reason,
+                )
+            t_last_debug_save = now
+            attempt_idx += 1
+
+        if reproj_bad:
             print(
                 f"[reject] reproj too high: "
                 f"{ {c: round(r, 3) for c, r in reproj_px.items()} } "
                 f"(limit {MAX_REPROJ_ERR_PX:.3f}px)"
             )
             continue
-
-        # T_base_cam = T_base_board · (T_cam_board)⁻¹ for each camera.
-        T_base_cam = {c: T_base_board @ T_cam_board[c].inverse() for c in cam_ids}
 
         sample = SampleResult(
             idx=len(accepted), T_cam_board=T_cam_board, T_base_cam=T_base_cam, reproj_px=reproj_px,
@@ -488,15 +670,6 @@ def main() -> None:
         dts_str = " ".join(f"{c}={synced[c][2]:.4f}s" for c in cam_ids)
         reproj_str = " ".join(f"{c}={reproj_px[c]:.3f}px" for c in cam_ids)
         print(f"[accept {len(accepted)}/{NUM_SAMPLES}] rgb-info dt: {dts_str} | reproj: {reproj_str}")
-
-        # Save annotated corner images for visual inspection.
-        for cam_id in cam_ids:
-            img, _K, _dt = synced[cam_id]
-            vis = _draw_chessboard(
-                img, corners_by_cam[cam_id],
-                f"{cam_id} sample {len(accepted)} reproj={reproj_px[cam_id]:.3f}px",
-            )
-            cv2.imwrite(str(debug_dir / f"{cam_id}_sample_{len(accepted):02d}.png"), vis)
 
     if len(accepted) < MIN_SAMPLES_TO_SOLVE:
         raise RuntimeError(f"Not enough accepted samples: {len(accepted)} < {MIN_SAMPLES_TO_SOLVE}")
@@ -562,6 +735,22 @@ def main() -> None:
         "call below -- no longer written to a separate YAML, see T_robotA_cam "
         "comment near OUT_YAML.)"
     )
+
+    # Keep the realsense-trio pipeline's copy of zed2i_1 in sync -- both
+    # files store the same dst frame (active robot's lbr_link_0), so this is
+    # a direct copy, no re-projection between robot_a/robot_b/base_link
+    # needed here; that resolution happens at pipeline runtime (see
+    # run_pipeline_track_multicam_realsense.py's use of get_active_robot_base
+    # / get_dual_arm_base_link).
+    synced = {c: T for c, T in T_base_cam_avg.items() if c == "zed2i_1"}
+    if synced:
+        rs_path = Path(TRACKING_PIPELINE_YAML)
+        if rs_path.exists():
+            backup = rs_path.with_suffix(".yaml.bak")
+            backup.write_text(rs_path.read_text())
+            print(f"Backed up existing YAML to: {backup}")
+        update_extrinsics_yaml_preserving_header(rs_path, synced)
+        print(f"Synced {list(synced)} into: {rs_path}")
 
     print(f"Saved debug corner images to: {debug_dir}")
 

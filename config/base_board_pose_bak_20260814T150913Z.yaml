@@ -1,0 +1,24 @@
+# Checkerboard pose in the robot base frame (robot_b's lbr_link_0),
+# computed by src/calibration/autocalibrate_dual_realsense.py from
+# 5 samples across both arms (realsense_1 + realsense_2).
+#
+# base_board_robot_a_frame is the SAME checkerboard pose, re-expressed in
+# robot_a's base frame (the global reference -- see config/robot_bases.yaml).
+base_board:
+  translation_xyz_m:
+  - 0.747116
+  - -0.580028
+  - -0.013334
+  rotation_rpy_deg:
+  - -0.0812
+  - 36.3568
+  - -0.1932
+base_board_robot_a_frame:
+  translation_xyz_m:
+  - 0.747116
+  - 0.259972
+  - -0.013334
+  rotation_rpy_deg:
+  - -0.0812
+  - 36.3568
+  - -0.1932

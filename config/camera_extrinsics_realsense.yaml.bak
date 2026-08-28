@@ -1,76 +1,109 @@
 # Extrinsics for the 1-ZED + 2-RealSense trio pipeline.
 #
+# LAYOUT (every entry below, for all cam_ids):
+#   R: [r00,r01,r02, r10,r11,r12, r20,r21,r22]   # 3x3 rotation, flattened ROW-MAJOR (not column-major)
+#   t: [tx,ty,tz]                                 # meters
+# Convention: p_dst = R @ p_cam + t  (R/t map points from the camera's
+# optical frame into "dst"; "dst" differs by entry, see below).
+# See src/calibration/io_extrinsics.py (load/save_extrinsics_yaml) for the
+# code that reads/writes this exact layout.
+#
 # zed2i_1 keeps the normal meaning: a STATIC camera-to-base transform,
-# copied as-is from config/camera_extrinsics_base.yaml.
+# copied as-is from config/camera_extrinsics_base.yaml. "base" here is the
+# active robot's lbr_link_0 frame (see config/robot_bases.yaml:
+# active_robot -- currently robot_b), i.e. dst = lbr_link_0.
 #
 # realsense_1 / realsense_2 mean something different: they are mounted on
 # the robot end-effector, so they move with the arm. For these two entries,
 # R/t describe the STATIC camera-to-flange offset (the fixed mechanical
-# mount transform), NOT a camera-to-base transform. At runtime the pipeline
-# composes this offset with the live flange pose (subscribed from a
-# PoseStamped topic, see --flange-pose-topic) to get the current
-# camera-to-base extrinsic every frame:
+# mount transform), NOT a camera-to-base transform -- dst = lbr_link_ee of
+# that same active robot. At runtime the pipeline composes this offset with
+# the live flange pose (subscribed from a PoseStamped topic, see
+# --flange-pose-topic) to get the current camera-to-base extrinsic every
+# frame:
 #
 #   T_base_cam(t) = T_base_flange(t) @ T_flange_cam
 #
-# PLACEHOLDER VALUES: realsense_1 / realsense_2 below are pure identity
-# (camera optical frame == flange frame, no offset at all). Replace R/t with
-# your real hand-eye calibration (camera optical frame relative to the
-# flange frame, lbr_link_ee) before trusting any fused pose from these two
-# cameras — identity is almost certainly wrong, it's a placeholder so the
-# pipeline can run end-to-end before calibration exists.
 #
 # RealSense USB serial numbers (for zed_realsense_trio.launch.py
 # rs1_serial:=/rs2_serial:=), recorded here for convenience:
 #   realsense_1: 260322275185
 #   realsense_2: 260522275434
+#
 
-zed2i_1:
-  R:
-  - -0.98305904327408
-  - -0.15541365087829384
-  - 0.09716745626870306
-  - -0.1790583561869697
-  - 0.7010643749690525
-  - -0.6902512928121703
-  - 0.03915383144305058
-  - -0.6959564205249723
-  - -0.7170157865859002
-  t:
-  - -0.17743503724584297
-  - 0.7057189434412777
-  - 0.4862059721899694
 
-# PLACEHOLDER (identity) — replace with calibrated camera-to-flange offset.
 realsense_1:
   R:
+  - 0.0
+  - -0.866
+  - 0.5
   - 1.0
   - 0.0
   - 0.0
   - 0.0
-  - 1.0
-  - 0.0
-  - 0.0
-  - 0.0
-  - 1.0
+  - 0.5
+  - 0.866
   t:
-  - 0.0
-  - 0.0
-  - 0.0
-
-# PLACEHOLDER (identity) — replace with calibrated camera-to-flange offset.
+  - 0.055667
+  - 0.009
+  - 0.070776
 realsense_2:
   R:
+  - 0.0
+  - -0.866
+  - 0.5
   - 1.0
   - 0.0
   - 0.0
   - 0.0
-  - 1.0
-  - 0.0
-  - 0.0
-  - 0.0
-  - 1.0
+  - 0.5
+  - 0.866
   t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+realsense_2_initial_guess_cad:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
   - 0.0
   - 0.0
   - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+realsense_nominal:
+  R:
+  - 0.0
+  - -0.866
+  - 0.5
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.866
+  t:
+  - 0.055667
+  - 0.009
+  - 0.070776
+zed2i_1:
+  R:
+  - 0.0044065342467657365
+  - -0.517977006169593
+  - 0.8553831910527103
+  - -0.9990573145894173
+  - -0.03922200880420279
+  - -0.018604198202156974
+  - 0.04318639393737539
+  - -0.8544948537615358
+  - -0.5176615499278823
+  t:
+  - 0.06449983363523973
+  - -0.3624150386109466
+  - 0.2578665416628918
