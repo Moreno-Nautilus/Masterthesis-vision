@@ -1,0 +1,391 @@
+# ============================================================
+# Runtime devices / top-level mode
+# ============================================================
+
+device: cuda
+
+dino_device: ""
+
+gdino_model_id: "IDEA-Research/grounding-dino-base"
+gdino_box_threshold: 0.20
+gdino_text_threshold: 0.25
+gdino_max_boxes: 40
+gdino_device: ""
+
+# Comma-separated text prompts
+gdino_text_prompts: "cooling base,cooling f,cooling screw,pb base,pb pipe,pb screw,pb top"
+
+run_mode: track
+
+start_paused: false
+
+tracking_profile: null
+
+
+# ============================================================
+# Object references / CAD / output
+# ============================================================
+
+reference_dir: "Data/ZED_screens"
+cad_dir: "Data/CAD_Models_centered"
+output_root: "outputs/foundationpose"
+
+assembly_part_ids_config: "Data/assembly_part_ids.json"
+
+planning_scene_frame_id: "world"
+
+
+# ============================================================
+# Synthetic-render reference bank
+# ============================================================
+
+reference_source: real
+reference_renders_dir: "Data/reference_renders"
+
+
+# ============================================================
+# DINO
+# ============================================================
+
+dino_model_name: "dinov2_vitg14"
+dino_min_score: 0.50
+dino_min_margin: 0.05
+area_penalty_weight: 1.5
+fill_ratio_weight: 0.15
+
+
+# ============================================================
+# SAM2 / dead-session recovery
+# ============================================================
+
+sam_repo_root: "external/sam2"
+sam_checkpoint: "external/sam2/checkpoints/sam2.1_hiera_base_plus.pt"
+sam_model_cfg: "configs/sam2.1/sam2.1_hiera_b+.yaml"
+
+sam_max_image_side: 1536
+sam_fp32: false
+
+restart_on_dead_init: true
+dead_init_cycles: 2
+dead_init_min_boxes: 3
+
+
+# ============================================================
+# Cameras
+# ============================================================
+
+num_cameras: 3
+
+flange_pose_max_age_s: 0.25
+
+fp_skip_cameras: ""
+
+strict_flange_freshness: false
+
+min_active_cameras: 1
+
+
+# ============================================================
+# Per-camera SAM / ROI filtering
+# cam1 = zed2i_1
+# cam2 = realsense_1
+# cam3 = realsense_2
+# ============================================================
+
+cam1_sam_min_mask_area: 10
+cam1_sam_min_bbox_side_px: 2
+cam1_sam_max_mask_area_ratio: 0.06
+cam1_sam_max_bbox_area_ratio: 0.06
+cam1_sam_border_px: 6
+cam1_sam_max_border_fraction: 0.00
+
+cam2_sam_min_mask_area: 10
+cam2_sam_min_bbox_side_px: 2
+cam2_sam_max_mask_area_ratio: 0.06
+cam2_sam_max_bbox_area_ratio: 0.06
+cam2_sam_border_px: 6
+cam2_sam_max_border_fraction: 0.00
+
+cam3_sam_min_mask_area: 10
+cam3_sam_min_bbox_side_px: 2
+cam3_sam_max_mask_area_ratio: 0.06
+cam3_sam_max_bbox_area_ratio: 0.06
+cam3_sam_border_px: 6
+cam3_sam_max_border_fraction: 0.00
+
+cam1_roi_polygon: ""
+cam2_roi_polygon: ""
+cam3_roi_polygon: ""
+
+mask_dedup_iou: 0.6
+
+
+# ============================================================
+# FoundationPose
+# ============================================================
+
+fp_repo_root: "external/FoundationPose"
+fp_weights_dir: "external/FoundationPose/weights"
+fp_debug: 0
+mesh_scale: 0.01
+
+timer_period_s: 0.05
+max_candidate_draw: 25
+
+min_valid_z_m: 0.05
+max_valid_z_m: 10.00
+
+max_objects: 15
+
+min_depth_coverage: 0.50
+
+
+# ============================================================
+# Fused tracking candidate gates before cloud merge
+# ============================================================
+
+fused_gate_min_mask_area: 50
+fused_gate_min_mask_area_ratio: 0.40
+fused_gate_max_mask_area_ratio: 2.50
+fused_gate_min_depth_coverage: 0.30
+fused_gate_min_cloud_points: 40
+fused_gate_max_centroid_dist_m: 0.08
+
+# Cross-camera consistency check at merge
+fused_consistency_max_disagreement_m: 0.0
+
+
+# ============================================================
+# Cross-camera fusion matching
+# Init-only
+# ============================================================
+
+fusion_match_max_centroid_dist_m: 0.07
+fusion_match_ambiguity_margin_m: 0.0
+fusion_match_label_penalty_m: 0.0
+
+fused_gate_min_per_cam_icp_fitness: 0.18
+fused_gate_max_per_cam_icp_rmse_m: 0.015
+
+
+# ============================================================
+# Fused pose acceptance gates after ICP
+# ============================================================
+
+fused_track_min_fused_icp_fitness: 0.12
+fused_track_max_fused_icp_rmse_m: 0.012
+
+fused_track_nominal_dt_s: 0.15
+fused_track_min_dt_s: 0.10
+fused_track_max_dt_s: 0.30
+
+fused_track_max_translation_speed_mps: 0.13333333333333333
+fused_track_max_rotation_speed_degps: 66.66666666666667
+
+fused_track_min_translation_jump_m: 0.008
+fused_track_min_rotation_jump_deg: 4.0
+
+fused_track_kalman_soft_translation_residual_m: 0.05
+fused_track_kalman_soft_max_icp_fitness: 0.22
+
+fused_track_weak_icp_fitness: 0.18
+
+fused_track_axis_dominant_fraction: 0.80
+fused_track_axis_dominant_min_translation_m: 0.012
+
+fused_track_icp_max_correspondence_dist_m: 0.05
+
+fused_track_icp_max_iteration: 15
+
+fused_track_icp_relative_fitness: 1.0e-4
+fused_track_icp_relative_rmse: 1.0e-4
+
+
+# ============================================================
+# Centroid recovery
+# ============================================================
+
+fused_track_centroid_recovery: false
+
+fused_track_centroid_recovery_cluster_dist_m: 0.12
+fused_track_centroid_recovery_min_cameras: 1
+fused_track_centroid_recovery_max_seed_jump_m: 0.75
+
+
+# ============================================================
+# Rotation re-seed
+# ============================================================
+
+fused_track_rot_reseed: false
+
+fused_track_rot_reseed_chamfer_m: 0.010
+fused_track_rot_reseed_max_chamfer_m: 0.080
+
+fused_track_rot_reseed_n_rot: 24
+fused_track_rot_reseed_icp_iters: 10
+
+
+# ============================================================
+# PCA shaft-axis correction
+# ============================================================
+
+fused_track_pca_axis: false
+
+fused_track_pca_axis_min_deg: 10.0
+fused_track_pca_axis_max_deg: 60.0
+fused_track_pca_axis_min_elongation: 3.0
+fused_track_pca_axis_min_points: 50
+fused_track_pca_axis_blend: 1.0
+
+
+# ============================================================
+# Rotation damping
+# ============================================================
+
+fused_track_rot_slew_limit_deg: 0.0
+
+fused_track_rot_lowpass: 0.0
+
+
+# ============================================================
+# Tracking warmup / hold / lost
+# ============================================================
+
+fused_track_warmup_frames: 5
+
+fused_track_hold_window_frames: 5
+fused_track_max_lost_frames: 20
+
+reinit_lost_tracks_while_tracking: false
+
+
+# ============================================================
+# Chamfer / mask-origin gates
+# ============================================================
+
+fused_track_max_chamfer_m: 0.015
+
+track_require_pose_origin_in_mask: false
+
+track_pose_mask_margin_px: 8
+
+
+# ============================================================
+# Median pose buffer
+# ============================================================
+
+median_pose_buffer_size: 3
+
+
+# ============================================================
+# Pose logging
+# ============================================================
+
+log_init_poses: false
+log_track_poses: false
+
+track_pose_log_path: "outputs/logs/track_pose_log.csv"
+
+
+# ============================================================
+# Debug / latency
+# ============================================================
+
+debug_per_cam_pose_publish: false
+
+debug_frame_publish: true
+
+debug_verbose_logs: false
+
+debug_logging: false
+
+
+# ============================================================
+# Tracking ICP
+# ============================================================
+
+skip_per_cam_icp_tracking: true
+
+cutie_max_internal_size: 480
+
+track_icp_num_points: 2000
+
+
+# ============================================================
+# Conditional Chamfer
+# ============================================================
+
+chamfer_skip_fitness_min: 0.30
+chamfer_skip_rmse_max_m: 0.005
+chamfer_skip_motion_max_m: 0.010
+
+chamfer_every_n_frames: 1
+
+
+# ============================================================
+# Kalman / jump gates
+# ============================================================
+
+disable_fused_kalman: false
+disable_axis_jump_gate: false
+
+
+# ============================================================
+# ICP variant
+# ============================================================
+
+icp_variant: point_to_point
+
+
+# ============================================================
+# Distance confidence
+# ============================================================
+
+distance_confidence_warn: false
+distance_confidence_max_m: 1.5
+distance_confidence_min_mask_area: 2000
+
+
+# ============================================================
+# Rotation-grid rescue
+# ============================================================
+
+icp_grid_n_rot: 45
+icp_grid_prescreen: false
+icp_grid_prescreen_tau: 0.04
+icp_grid_cross_cam_chamfer: false
+
+icp_grid_skip_chamfer_m: 0.004
+
+
+# ============================================================
+# DINO / MUSE
+# ============================================================
+
+dino_gem_p: 1.5
+
+gdino_use_items_prompt: true
+
+dino_min_crop_side: 0
+
+
+# ============================================================
+# Workspace / table
+# ============================================================
+
+table_plane_z_min: -0.03
+table_plane_z_max: 0.9
+
+workspace_x_min: 0.10
+workspace_y_min: -0.4
+workspace_y_max: 0.4
+
+
+# ============================================================
+# ICP mask processing
+# ============================================================
+
+icp_mask_close_kernel: 0
+icp_mask_interior_erosion: 0
+
+depth_fill_holes_kernel: 0

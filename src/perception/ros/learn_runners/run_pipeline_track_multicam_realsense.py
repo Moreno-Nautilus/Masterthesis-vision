@@ -13,16 +13,15 @@ from __future__ import annotations
 import argparse
 import array
 import csv
-import json
 import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
 
+
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped
 from moveit_msgs.msg import CollisionObject, PlanningScene, PlanningSceneWorld
@@ -36,12 +35,40 @@ from std_srvs.srv import SetBool, Trigger
 from fp_debug_msgs.msg import DebugCandidate, DebugFrame, DebugMaskCrop, DebugPoseItem
 from concurrent.futures import ThreadPoolExecutor
 
+from src.perception.ros.learn_runners.helpers import _dprint, save_init_pose_render, bbox_size_xyxy, T_to_pose_stamped, T_to_pose_msg, rotation_matrix_to_quaternion_xyzw, rotation_angle_deg
+from src.perception.ros.learn_runners.PoseKalmanFilter import PoseKalmanFilter
+from src.perception.ros.learn_runners.unified_logger import _UnifiedLogger
+from src.perception.ros.learn_runners.pipeline_config import parse_args
+from src.perception.ros.learn_runners.part_ids import (
+    PartIdAssigner,
+    resolve_assembly_name,
+)
+from src.perception.ros.learn_runners.camera_registry_realsense import select_cameras
+from src.perception.ros.learn_runners.track_types import (
+    CameraSAMParams,
+    CandidateSelection,
+    ObjectTrackState,
+)
+from src.perception.ros.learn_runners.mask_ops import (
+    bbox_crop_with_local_mask,
+    crop_rgb_to_polygon_bbox,
+    dedup_masks_by_bbox_iou,
+    lift_crop_masks_to_full_image,
+    mask_depth_coverage,
+    nms_by_position,
+    pad_mask_for_fp,
+    parse_polygon_string,
+    reject_border_masks,
+    reject_large_masks,
+    reject_outside_roi_polygon,
+    upscale_crop_if_small,
+)
+from src.perception.ros.learn_runners.dino_classify import batch_dino_classify
 from src.calibration.io_extrinsics import load_extrinsics_yaml
 from src.utils.robot_bases import get_active_robot_base, load_robot_bases, get_dual_arm_base_link
 from src.perception.learned.DINO.dino_identifier import (
     DINOIdentifier,
     DINOIdentifierConfig,
-    DINOResult,
     MUSE_EMBEDDING_MODE,
     MUSE_JOINT_SCORE_ALPHA,
     MUSE_OBJECTNESS_PRIOR_GAMMA,
@@ -60,14 +87,10 @@ from src.perception.learned.SAM.sam_segmentation import (
     SAMSegmenterConfig,
 )
 from src.perception.ros.multicam_grabber import CameraTopics, MultiCamGrabber
-from src.perception.ros.multicam_grabber_realsense import (
-    DynamicCameraTopics,
-    MultiCamGrabberRealsense,
-)
+from src.perception.ros.multicam_grabber_realsense import MultiCamGrabberRealsense
 from src.perception.tracking.realtime_tracker import RealtimeTracker, RealtimeTrackerConfig
 from src.perception.tracking.cutie_tracker import CutieConfig, CutieTracker
 from src.perception.tracking.icp_refiner import ICPConfig, ICPVariant
-from dataclasses import dataclass, field
 from src.perception.multicam_fusion import (
     FusionConfig,
     run_multicam_fusion,
@@ -87,94 +110,9 @@ from src.perception.fused_multicam_helpers import (
 )
 
 
+from scipy.spatial.transform import Rotation
+
 _DEBUG_LOGGING = False
-
-
-FAST_CUTIE_PROFILE_OVERRIDES = {
-    "track_require_pose_origin_in_mask": True,
-    "track_pose_mask_margin_px": 8,
-    "track_icp_num_points": 800,
-    "fused_track_icp_max_iteration": 6,
-    "fused_track_icp_relative_fitness": 1e-3,
-    "fused_track_icp_relative_rmse": 1e-3,
-    "median_pose_buffer_size": 1,
-    "fused_track_max_chamfer_m": 0.018,
-    "fused_track_max_translation_speed_mps": 0.25,
-    "fused_track_max_rotation_speed_degps": 180.0,
-    "fused_track_min_translation_jump_m": 0.02,
-    "fused_track_min_rotation_jump_deg": 10.0,
-    "skip_per_cam_icp_tracking": True,
-    "debug_per_cam_pose_publish": False,
-    "debug_verbose_logs": False,
-    "debug_logging": False,
-    "disable_fused_kalman": True,
-    "disable_axis_jump_gate": True,
-    "chamfer_every_n_frames": 3,
-}
-
-
-def _apply_fast_cutie_profile(namespace: argparse.Namespace) -> None:
-    # Mutate argparse's namespace exactly as if each fast-tracking flag was passed.
-    for key, value in FAST_CUTIE_PROFILE_OVERRIDES.items():
-        setattr(namespace, key, value)
-    setattr(namespace, "tracking_profile", "fast_cutie")
-
-
-class _TrackingProfileAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        _apply_fast_cutie_profile(namespace)
-
-
-def _dprint(*args, **kwargs) -> None:
-    # Cheap global gate for timing/debug prints outside ROS logging.
-    if _DEBUG_LOGGING:
-        # flush so this interleaves deterministically with _UnifiedLogger output
-        # (both are on stdout now) when the run is redirected to a single file.
-        kwargs.setdefault("flush", True)
-        print(*args, **kwargs)
-
-
-class _UnifiedLogger:
-    """Single-stream replacement for the ROS node logger.
-
-    The ROS get_logger() writes to stderr while the pipeline's own diagnostics
-    use print/_dprint on stdout; two independently-buffered streams interleave
-    non-deterministically when redirected to one log file. Routing every
-    get_logger() call through here puts ALL output on stdout with flush, so a
-    redirected log is ordered and consistently prefixed.
-
-    Level gating: warn/error/fatal always print (no longer silently dropped when
-    debug is off); info/debug print only when verbose.
-    """
-
-    def __init__(self, verbose: bool) -> None:
-        self._verbose = bool(verbose)
-
-    @staticmethod
-    def _emit(level: str, msg) -> None:
-        t = time.time()
-        ts = time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d}"
-        print(f"[{ts}] [{level}] {msg}", flush=True)
-
-    def info(self, msg="", *a, **kw):
-        if self._verbose:
-            self._emit("INFO", msg)
-
-    def debug(self, msg="", *a, **kw):
-        if self._verbose:
-            self._emit("DEBUG", msg)
-
-    def warn(self, msg="", *a, **kw):
-        self._emit("WARN", msg)
-
-    def warning(self, msg="", *a, **kw):
-        self._emit("WARN", msg)
-
-    def error(self, msg="", *a, **kw):
-        self._emit("ERROR", msg)
-
-    def fatal(self, msg="", *a, **kw):
-        self._emit("FATAL", msg)
 
 
 FAST_QOS = QoSProfile(
@@ -182,792 +120,6 @@ FAST_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
 )
-
-
-# Assembly subfolder name (under Data/CAD_Models*, Data/ZED_screens, Data/reference_renders)
-# for each known object_id prefix. Objects with no matching prefix (e.g. blue_cube,
-# screwdriver_1) live directly under the Data root and have no assembly.
-ASSEMBLY_PREFIXES = {
-    "cooling": "cooling_manifold",
-    "pb": "plumbers_block",
-}
-
-
-def resolve_assembly_name(object_id: str) -> str:
-    """Map an object_id (e.g. 'cooling_screw', 'pb_pipe') to its assembly name.
-
-    Returns "" if object_id does not belong to a known assembly.
-    """
-    prefix = str(object_id).split("_", 1)[0]
-    return ASSEMBLY_PREFIXES.get(prefix, "")
-
-
-class PartIdAssigner:
-    """Maps (assembly_name, object_id) detections to stable Fabrica part_ids.
-
-    Fabrica lists assembly parts as assembly/0, assembly/1, ... with repeated
-    object_ids where the same part occurs multiple times (e.g. plumbers_block
-    slot 1 and slot 4 are both pb_screw). The config (assembly_part_ids.json)
-    gives, per assembly, the object_id at each slot index (== part_id). Since
-    duplicate-object slots are physically interchangeable, each new tracked
-    instance of that object_id simply claims the lowest not-yet-claimed slot;
-    the claim is keyed by track_id so it stays stable for the life of that
-    track (including across re-init, which reuses track_id via centroid
-    matching in _resolve_track_id_for_new_detection).
-    """
-
-    def __init__(self, config_path: str):
-        self._slots_by_assembly: dict[str, list[str]] = {}
-        path = Path(config_path)
-        if path.is_file():
-            with path.open("r") as f:
-                raw = json.load(f)
-            self._slots_by_assembly = {k: list(v) for k, v in raw.items()}
-        # track_id -> (assembly_name, part_id), so claims are scoped per assembly.
-        self._claim_by_track: dict[str, tuple[str, int]] = {}
-
-    def resolve(self, assembly_name: str, object_id: str, track_id: str) -> int:
-        """Return the stable part_id for track_id, claiming a free slot on first use.
-
-        Returns -1 if assembly_name is unknown or has no matching slot for object_id.
-        """
-        if track_id in self._claim_by_track:
-            claimed_assembly, claimed_part_id = self._claim_by_track[track_id]
-            if claimed_assembly == assembly_name:
-                return claimed_part_id
-
-        slots = self._slots_by_assembly.get(assembly_name, [])
-        claimed_in_assembly = {
-            part_id for (a, part_id) in self._claim_by_track.values() if a == assembly_name
-        }
-        for part_id, slot_object_id in enumerate(slots):
-            if slot_object_id == object_id and part_id not in claimed_in_assembly:
-                self._claim_by_track[track_id] = (assembly_name, part_id)
-                return part_id
-        return -1
-
-    def part_id_for_track(self, track_id: str) -> Optional[tuple[str, int]]:
-        """Return the (assembly_name, part_id) already claimed by track_id, if any."""
-        return self._claim_by_track.get(track_id)
-
-    def release(self, track_id: str) -> None:
-        """Drop a stale track_id's slot claim so it can be reused."""
-        self._claim_by_track.pop(track_id, None)
-
-
-# Fixed camera set for this variant: one static tripod ZED (cam1) plus two
-# end-effector-mounted RealSense cameras (cam2, cam3). Unlike the original
-# ALL_CAMERAS[:num_cameras] prefix-selection scheme, this set is not sliced
-# by --num-cameras — it is always exactly these three, in this order, so it
-# lines up 1:1 with the existing cam1_*/cam2_*/cam3_* per-camera CLI args.
-#
-# RealSense topic names follow the realsense2_camera ROS2 wrapper's default
-# namespacing (camera_namespace/camera_name from the launch file). Depth is
-# aligned to the color frame (align_depth.enable:=true in the launch file)
-# so depth and RGB share the same intrinsics/resolution, same as the ZED's
-# depth_registered topic.
-ALL_CAMERAS: list[DynamicCameraTopics] = [
-    DynamicCameraTopics(
-        cam_id="zed2i_1",
-        depth_topic="/zed2i_1/zed_node/depth/depth_registered",
-        info_topic="/zed2i_1/zed_node/depth/depth_registered/camera_info",
-        rgb_topic="/zed2i_1/zed_node/rgb/color/rect/image",
-        rgb_info_topic="/zed2i_1/zed_node/rgb/color/rect/image/camera_info",
-        is_dynamic=False,
-    ),
-    # realsense_1 is bolted to the LEFT arm (port_id 30200 -- see
-    # lbr_dual_arm_description/ros2_control/lbr_one_system_config.yaml --
-    # and robot_base_key="robot_a" in config/robot_bases.yaml). 
-    DynamicCameraTopics(
-        cam_id="realsense_1",
-        # /image_rect (not /image_raw): rectified by the per-camera
-        # image_proc RectifyNode pair started in zed_realsense_trio.launch.py
-        # (see comment there). camera_info topics are unchanged — the D405's
-        # raw camera_info already carries P == K (Tx=Ty=0), which is what
-        # RectifyNode uses as the rectified image's intrinsics, so the
-        # original (distorted) camera_info's K is still the correct K to
-        # read for the rectified image.
-        depth_topic="/realsense_1/camera/aligned_depth_to_color/image_rect",
-        info_topic="/realsense_1/camera/aligned_depth_to_color/camera_info",
-        rgb_topic="/realsense_1/camera/color/image_rect",
-        rgb_info_topic="/realsense_1/camera/color/camera_info",
-        is_dynamic=True,
-        flange_pose_topic="/left/ee_pose",
-        robot_base_key="robot_a",
-    ),
-    # realsense_2 is bolted to the RIGHT arm (port_id 30201, robot_base_key
-    # "robot_b"). This is the camera that already has a real hand-eye
-    # calibration in camera_extrinsics_realsense.yaml, taken with
-    # active_robot: robot_b.
-    DynamicCameraTopics(
-        cam_id="realsense_2",
-        # See realsense_1's comment above — same /image_rect + unchanged
-        # camera_info rationale.
-        depth_topic="/realsense_2/camera/aligned_depth_to_color/image_rect",
-        info_topic="/realsense_2/camera/aligned_depth_to_color/camera_info",
-        rgb_topic="/realsense_2/camera/color/image_rect",
-        rgb_info_topic="/realsense_2/camera/color/camera_info",
-        is_dynamic=True,
-        flange_pose_topic="/right/ee_pose",
-        robot_base_key="robot_b",
-    ),
-]
-
-
-def select_cameras(num_cameras: int) -> list[DynamicCameraTopics]:
-    """Active camera set for this run.
-
-    Kept for interface parity with the original runner (FoundationPoseTrackerNode
-    calls select_cameras(args.num_cameras)), but this variant always runs all
-    three cameras in ALL_CAMERAS regardless of num_cameras.
-    """
-    if num_cameras != len(ALL_CAMERAS):
-        raise ValueError(
-            f"run_pipeline_track_multicam_realsense fixes the camera set to "
-            f"{len(ALL_CAMERAS)} cameras (1 ZED + 2 RealSense); got "
-            f"--num-cameras {num_cameras}"
-        )
-    return list(ALL_CAMERAS)
-
-class PoseKalmanFilter:
-    """
-    Simple Kalman filter for 6DoF pose prediction.
-    Tracks position and velocity, predicts next position.
-    """
-
-    def __init__(self, process_noise: float = 0.01, measurement_noise: float = 0.002):
-        """
-        Args:
-            process_noise: How much we expect velocity to change (m/frame)
-            measurement_noise: How noisy our pose measurements are (m)
-        """
-        # State: [x, y, z, vx, vy, vz]
-        self.state = np.zeros(6, dtype=np.float64)
-        
-        # Covariance matrix
-        self.P = np.eye(6, dtype=np.float64) * 0.1
-        
-        # Process noise 
-        self.Q = np.eye(6, dtype=np.float64)
-        self.Q[:3, :3] *= process_noise ** 2  # Position 
-        self.Q[3:, 3:] *= (process_noise * 2) ** 2  # Velocity
-        
-        # Measurement noise (position only)
-        self.R = np.eye(3, dtype=np.float64) * measurement_noise ** 2
-        
-        # State transition matrix (constant velocity model)
-        self.F = np.eye(6, dtype=np.float64)
-        self.F[0, 3] = 1.0  # x += vx
-        self.F[1, 4] = 1.0  # y += vy
-        self.F[2, 5] = 1.0  # z += vz
-        
-        # Measurement matrix (only position)
-        self.H = np.zeros((3, 6), dtype=np.float64)
-        self.H[0, 0] = 1.0
-        self.H[1, 1] = 1.0
-        self.H[2, 2] = 1.0
-        
-        self._initialized = False
-        self._frame_count = 0
-       
-    
-    def initialize(self, position: np.ndarray) -> None:
-        self.state[:3] = position
-        self.state[3:] = 0.0  # Zero initial velocity
-        self.P = np.eye(6, dtype=np.float64) * 0.1
-        self._initialized = True
-        self._frame_count = 1
-    
-    def predict(self) -> np.ndarray:
-        """
-        Advance state one step using the constant-velocity model and
-        propagate covariance.
-        """
-        if not self._initialized:
-            return np.zeros(3)
-
-        # x ← Fx, P ← FPFᵀ + Q.
-        self.state = self.F @ self.state
-        self.P = self.F @ self.P @ self.F.T + self.Q
-
-        return self.state[:3].copy()
-    
-    def update(self, position: np.ndarray) -> None:
-        """
-        Update filter with new measured position.
-        """
-        if not self._initialized:
-            self.initialize(position)
-            return
-
-        # Standard Kalman correction step (residual → gain → state/covariance update).
-        # Measurement residual
-        y = position - self.H @ self.state
-
-        # Residual covariance
-        S = self.H @ self.P @ self.H.T + self.R
-
-        # Kalman gain
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-
-        # Update state
-        self.state = self.state + K @ y
-        
-        # Update covariance
-        I = np.eye(6)
-        self.P = (I - K @ self.H) @ self.P
-        
-        self._frame_count += 1
-
-    def reset(self) -> None:
-        """Reset filter state."""
-        self.state = np.zeros(6, dtype=np.float64)
-        self.P = np.eye(6, dtype=np.float64) * 0.1
-        self._initialized = False
-        self._frame_count = 0
-    
-    @property
-    def is_initialized(self) -> bool:
-        return self._initialized
-
-# Per-camera, per-object tracking state carried between ticks (pose, masks, mode, Kalman).
-@dataclass
-class ObjectTrackState:
-    object_id: str
-    mesh_path: str
-    track_id: str = ""
-    mode: str = "search"
-    T_object_camera: Optional[np.ndarray] = None
-    dino_score: float = 0.0
-    lost_count: int = 0
-    last_mask_area: int = 0
-    degraded_count: int = 0
-    id_history: deque = field(default_factory=lambda: deque(maxlen=5))
-    track_pose_convention: str = "raw"
-    recovery_mask: Optional[np.ndarray] = None
-    last_good_mask: Optional[np.ndarray] = None
-    last_good_T: Optional[np.ndarray] = None
-    kalman: Optional[PoseKalmanFilter] = None  
-
-    last_logged_T_base: Optional[np.ndarray] = None
-    last_logged_convention: Optional[str] = None
-
-
-    def __post_init__(self):
-        if self.kalman is None:
-            self.kalman = PoseKalmanFilter()
-
-
-# One accepted detection for an object on a camera (chosen mask + its DINO scores).
-@dataclass
-class CandidateSelection:
-    object_id: str
-    score: float
-    scores_by_object: dict[str, float]
-    candidate: SAMMaskCandidate
-    base_scores_by_object: dict[str, float] = field(default_factory=dict)
-    score_source: str = "dino_base"
-    dino_class_score: float = 0.0
-    dino_margin: float = 0.0
-
-
-# Per-camera SAM mask-filtering parameters + ROI polygon.
-@dataclass
-class CameraSAMParams:
-    min_mask_area: int
-    min_bbox_side_px: int
-    max_mask_area_ratio: float
-    max_bbox_area_ratio: float
-    border_px: int
-    max_border_fraction: float
-    roi_polygon: np.ndarray
-
-
-# Geodesic angle (deg) between two rotation matrices.
-def rotation_angle_deg(R1: np.ndarray, R2: np.ndarray) -> float:
-    R_rel = R1.T @ R2
-    c = (np.trace(R_rel) - 1.0) * 0.5
-    c = float(np.clip(c, -1.0, 1.0))
-    return float(np.degrees(np.arccos(c)))
-
-def save_init_pose_render(
-    T_base: np.ndarray,
-    model_pcd,
-    obj_id: str,
-    save_path: str,
-    accepted: bool,
-    gt_pos=None,
-) -> None:
-    # Save a 3D scatter PNG of the model cloud at the estimated pose (init debug viz).
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    try:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-
-        # Transform model cloud to base frame
-        pts = np.asarray(model_pcd.points)
-        R, t = T_base[:3, :3], T_base[:3, 3]
-        pts_base = (R @ pts.T).T + t
-
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(111, projection='3d')
-
-        color = '#3366CC' if accepted else "#AF2323"
-        ax.scatter(pts_base[::3, 0], pts_base[::3, 1], pts_base[::3, 2],
-                   s=1, c=color, alpha=0.4)
-
-        # Draw pose axes
-        for axis_i, axis_color in enumerate(['r', 'g', 'b']):
-            axis_end = t + R[:, axis_i] * 0.05
-            ax.plot([t[0], axis_end[0]], [t[1], axis_end[1]], [t[2], axis_end[2]],
-                    color=axis_color, linewidth=2)
-
-        if gt_pos is not None:
-            ax.scatter(*gt_pos, s=80, c='lime', edgecolors='black', zorder=5)
-
-        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-        ax.set_title(f'{obj_id} | {"ACCEPT" if accepted else "REJECT"}')
-        ax.view_init(elev=30, azim=135)
-
-        # Equal aspect ratio
-        all_pts = pts_base
-        mid = all_pts.mean(axis=0)
-        max_range = (all_pts.max(axis=0) - all_pts.min(axis=0)).max() / 2 * 1.2
-        ax.set_xlim(mid[0]-max_range, mid[0]+max_range)
-        ax.set_ylim(mid[1]-max_range, mid[1]+max_range)
-        ax.set_zlim(mid[2]-max_range, mid[2]+max_range)
-
-        plt.savefig(save_path, dpi=120, bbox_inches='tight')
-        plt.close(fig)
-    except Exception as e:
-        _dprint(f"  [WARN] save_init_pose_render failed: {e}")
-
-
-# Rotation matrix → quaternion [x,y,z,w] (branch on the largest diagonal term).
-def rotation_matrix_to_quaternion_xyzw(R: np.ndarray) -> np.ndarray:
-    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-    q = np.empty(4, dtype=np.float64)
-    trace = np.trace(R)
-    if trace > 0.0:
-        s = np.sqrt(trace + 1.0) * 2.0
-        q[3] = 0.25 * s
-        q[0] = (R[2, 1] - R[1, 2]) / s
-        q[1] = (R[0, 2] - R[2, 0]) / s
-        q[2] = (R[1, 0] - R[0, 1]) / s
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-        q[3] = (R[2, 1] - R[1, 2]) / s
-        q[0] = 0.25 * s
-        q[1] = (R[0, 1] + R[1, 0]) / s
-        q[2] = (R[0, 2] + R[2, 0]) / s
-    elif R[1, 1] > R[2, 2]:
-        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-        q[3] = (R[0, 2] - R[2, 0]) / s
-        q[0] = (R[0, 1] + R[1, 0]) / s
-        q[1] = 0.25 * s
-        q[2] = (R[1, 2] + R[2, 1]) / s
-    else:
-        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-        q[3] = (R[1, 0] - R[0, 1]) / s
-        q[0] = (R[0, 2] + R[2, 0]) / s
-        q[1] = (R[1, 2] + R[2, 1]) / s
-        q[2] = 0.25 * s
-    q = q / (np.linalg.norm(q) + 1e-12)
-    return q.astype(np.float32)
-
-
-# Build a ROS Pose from a translation + quaternion.
-def quaternion_xyzw_to_pose_msg(t_xyz: np.ndarray, q_xyzw: np.ndarray) -> Pose:
-    msg = Pose()
-    msg.position.x = float(t_xyz[0])
-    msg.position.y = float(t_xyz[1])
-    msg.position.z = float(t_xyz[2])
-    msg.orientation.x = float(q_xyzw[0])
-    msg.orientation.y = float(q_xyzw[1])
-    msg.orientation.z = float(q_xyzw[2])
-    msg.orientation.w = float(q_xyzw[3])
-    return msg
-
-
-def T_to_pose_msg(T: np.ndarray) -> Pose:
-    T = np.asarray(T, dtype=np.float32).reshape(4, 4)
-    t = T[:3, 3]
-    q = rotation_matrix_to_quaternion_xyzw(T[:3, :3])
-    return quaternion_xyzw_to_pose_msg(t, q)
-
-
-def T_to_pose_stamped(T: np.ndarray, frame_id: str, stamp) -> PoseStamped:
-    T = np.asarray(T, dtype=np.float32).reshape(4, 4)
-    msg = PoseStamped()
-    msg.header = Header(frame_id=frame_id, stamp=stamp)
-    msg.pose = T_to_pose_msg(T)
-    return msg
-
-
-def parse_polygon_string(s: str) -> np.ndarray:
-    # Empty/whitespace => no ROI; resolved to the full frame at use time.
-    if not s or not s.strip():
-        return np.zeros((0, 2), dtype=np.int32)
-    vals = [int(v.strip()) for v in s.split(",")]
-    if len(vals) % 2 != 0:
-        raise ValueError(f"Polygon string must have even number of values: {s}")
-    return np.array(vals, dtype=np.int32).reshape(-1, 2)
-
-
-def bbox_size_xyxy(b: tuple[int, int, int, int]) -> tuple[int, int]:
-    x0, y0, x1, y1 = b
-    return x1 - x0, y1 - y0
-
-
-# Remove duplicate same-class states that occupy nearly the same camera-frame position.
-def nms_by_position(
-    states: list[ObjectTrackState],
-    position_threshold: float = 0.05,
-) -> list[ObjectTrackState]:
-    if len(states) <= 1:
-        return states
-
-    by_class: dict[str, list[ObjectTrackState]] = {}
-    for s in states:
-        by_class.setdefault(s.object_id, []).append(s)
-
-    kept: list[ObjectTrackState] = []
-    for _, obj_states in by_class.items():
-        if len(obj_states) == 1:
-            kept.extend(obj_states)
-            continue
-
-        obj_states = sorted(obj_states, key=lambda x: x.dino_score, reverse=True)
-        keep_mask = [True] * len(obj_states)
-
-        for i in range(len(obj_states)):
-            if not keep_mask[i]:
-                continue
-            if obj_states[i].T_object_camera is None:
-                continue
-            pos_i = obj_states[i].T_object_camera[:3, 3]
-            tid_i = getattr(obj_states[i], "track_id", "") or ""
-
-            for j in range(i + 1, len(obj_states)):
-                if not keep_mask[j]:
-                    continue
-                if obj_states[j].T_object_camera is None:
-                    continue
-                tid_j = getattr(obj_states[j], "track_id", "") or ""
-                if tid_i and tid_j and tid_i != tid_j:
-                    continue
-                pos_j = obj_states[j].T_object_camera[:3, 3]
-                dist = np.linalg.norm(pos_i - pos_j)
-                if dist < position_threshold:
-                    keep_mask[j] = False
-
-        kept.extend([s for s, k in zip(obj_states, keep_mask) if k])
-
-    return kept
-
-
-# Crop RGB and mask around a bbox, keeping a little context for DINO/memory crops.
-def bbox_crop_with_local_mask(
-    rgb: np.ndarray,
-    mask: np.ndarray,
-    bbox_xyxy: tuple[int, int, int, int],
-    pad_frac: float = 0.15,
-    min_pad_px: int = 6,
-) -> tuple[np.ndarray, np.ndarray]:
-    h, w = rgb.shape[:2]
-    x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
-
-    bw = x1 - x0
-    bh = y1 - y0
-
-    pad_x = max(min_pad_px, int(round(bw * pad_frac)))
-    pad_y = max(min_pad_px, int(round(bh * pad_frac)))
-
-    x0p = max(0, x0 - pad_x)
-    y0p = max(0, y0 - pad_y)
-    x1p = min(w, x1 + pad_x)
-    y1p = min(h, y1 + pad_y)
-
-    return (
-        rgb[y0p:y1p, x0p:x1p].copy(),
-        mask[y0p:y1p, x0p:x1p].copy(),
-    )
-
-
-def upscale_crop_if_small(
-    rgb: np.ndarray,
-    mask: np.ndarray,
-    min_side: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Bicubic-upscale a small crop so DINOv2's input-size downsample
-    doesn't throw away detail.
-    """
-    if min_side <= 0:
-        return rgb, mask
-    h, w = rgb.shape[:2]
-    short = min(h, w)
-    if short == 0 or short >= min_side:
-        return rgb, mask
-    scale = float(min_side) / float(short)
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-    rgb_up = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-    mask_up = cv2.resize(
-        mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST
-    ).astype(mask.dtype)
-    return rgb_up, mask_up
-
-
-# Filter obviously over-large SAM masks before expensive DINO scoring.
-def reject_large_masks(
-    masks: list[SAMMaskCandidate],
-    h: int,
-    w: int,
-    max_mask_area_ratio: float,
-    max_bbox_area_ratio: float,
-) -> list[SAMMaskCandidate]:
-    img_area = float(h * w)
-    out = []
-    for c in masks:
-        x0, y0, x1, y1 = c.bbox_xyxy
-        if float(c.area) / img_area > max_mask_area_ratio:
-            continue
-        if float((x1 - x0) * (y1 - y0)) / img_area > max_bbox_area_ratio:
-            continue
-        out.append(c)
-    return out
-
-
-# Keep masks whose bbox center lies inside the camera ROI polygon.
-def reject_outside_roi_polygon(
-    masks: list[SAMMaskCandidate],
-    polygon: np.ndarray,
-) -> list[SAMMaskCandidate]:
-    kept = []
-    for m in masks:
-        x0, y0, x1, y1 = m.bbox_xyxy
-        cx = (x0 + x1) // 2
-        cy = (y0 + y1) // 2
-        if cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False) >= 0:
-            kept.append(m)
-    return kept
-
-
-# Drop masks that mostly touch the image border; these are usually background spills.
-def reject_border_masks(
-    masks: list[SAMMaskCandidate],
-    border_px: int,
-    max_border_fraction: float,
-) -> list[SAMMaskCandidate]:
-    out = []
-    for c in masks:
-        m = c.mask
-        h, w = m.shape[:2]
-
-        bp = min(border_px, h // 2, w // 2)
-        if bp <= 0:
-            out.append(c)
-            continue
-
-        border_pixels = (
-            m[:bp, :].sum() + m[-bp:, :].sum()
-            + m[bp:-bp, :bp].sum()
-            + m[bp:-bp, -bp:].sum()
-        )
-        if c.area == 0:
-            continue
-        if float(border_pixels) / float(c.area) > max_border_fraction:
-            continue
-        out.append(c)
-    return out
-
-def pad_mask_for_fp(mask: np.ndarray, pad_px: int = 5) -> np.ndarray:
-    """Dilate mask by pad_px pixels to give FP more context around the object."""
-    if pad_px <= 0:
-        return mask
-    kernel = np.ones((2 * pad_px + 1, 2 * pad_px + 1), np.uint8)
-    dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
-    return dilated.astype(mask.dtype)
-
-def mask_depth_coverage(
-    depth: np.ndarray,
-    mask: np.ndarray,
-    zmin: float = 0.05,
-    zmax: float = 3.0,
-) -> float:
-    """Fraction of mask pixels with finite depth inside the valid range."""
-    mask_bool = mask.astype(bool)
-    n_mask = int(mask_bool.sum())
-    if n_mask == 0:
-        return 0.0
-    d = depth[mask_bool]
-    valid = np.isfinite(d) & (d > zmin) & (d < zmax)
-    return float(valid.sum()) / float(n_mask)
-
-
-def bbox_containment_ratio(
-    inner: tuple[int, int, int, int],
-    outer: tuple[int, int, int, int],
-) -> float:
-    """How much of `inner` is covered by `outer`."""
-    ix0, iy0, ix1, iy1 = inner
-    ox0, oy0, ox1, oy1 = outer
-
-    ax0 = max(ix0, ox0)
-    ay0 = max(iy0, oy0)
-    ax1 = min(ix1, ox1)
-    ay1 = min(iy1, oy1)
-
-    iw = max(0, ax1 - ax0)
-    ih = max(0, ay1 - ay0)
-    inter = iw * ih
-    inner_area = max(1, (ix1 - ix0) * (iy1 - iy0))
-
-    return float(inter) / float(inner_area)
-
-
-def bbox_iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
-    ax0, ay0, ax1, ay1 = a
-    bx0, by0, bx1, by1 = b
-    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
-    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
-    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
-    inter = iw * ih
-    area_a = max(1, (ax1 - ax0) * (ay1 - ay0))
-    area_b = max(1, (bx1 - bx0) * (by1 - by0))
-    union = area_a + area_b - inter
-    return float(inter) / float(union) if union > 0 else 0.0
-
-
-def dedup_masks_by_bbox_iou(
-    masks: list[SAMMaskCandidate],
-    iou_thresh: float = 0.7,
-    containment_thresh: float = 0.9,
-) -> list[SAMMaskCandidate]:
-    """Greedy bbox-level dedup, keeping larger masks first."""
-    out = []
-    masks_sorted = sorted(masks, key=lambda m: m.area, reverse=True)
-
-    for m in masks_sorted:
-        keep = True
-        for k in out:
-            if bbox_iou_xyxy(m.bbox_xyxy, k.bbox_xyxy) > iou_thresh:
-                keep = False
-                break
-            if bbox_containment_ratio(m.bbox_xyxy, k.bbox_xyxy) > containment_thresh:
-                keep = False
-                break
-        if keep:
-            out.append(m)
-
-    return out
-
-
-def crop_rgb_to_polygon_bbox(
-    rgb: np.ndarray,
-    polygon: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """Crop an RGB frame to the ROI bbox and shift polygon coords into crop space."""
-    h, w = rgb.shape[:2]
-    xs = polygon[:, 0]
-    ys = polygon[:, 1]
-
-    x0 = max(0, int(xs.min()))
-    y0 = max(0, int(ys.min()))
-    x1 = min(w, int(xs.max()) + 1)
-    y1 = min(h, int(ys.max()) + 1)
-
-    rgb_crop = rgb[y0:y1, x0:x1].copy()
-    polygon_crop = polygon.copy()
-    polygon_crop[:, 0] -= x0
-    polygon_crop[:, 1] -= y0
-
-    return rgb_crop, polygon_crop.astype(np.int32), x0, y0
-
-
-def lift_crop_masks_to_full_image(
-    crop_masks: list[SAMMaskCandidate],
-    full_h: int,
-    full_w: int,
-    x0: int,
-    y0: int,
-) -> list[SAMMaskCandidate]:
-    """Map masks produced on the ROI crop back into full-image coordinates."""
-    lifted = []
-    for c in crop_masks:
-        full_mask = np.zeros((full_h, full_w), dtype=c.mask.dtype)
-        h, w = c.mask.shape[:2]
-        full_mask[y0:y0 + h, x0:x0 + w] = c.mask
-
-        bx0, by0, bx1, by1 = c.bbox_xyxy
-        lifted.append(
-            SAMMaskCandidate(
-                mask=full_mask,
-                bbox_xyxy=(bx0 + x0, by0 + y0, bx1 + x0, by1 + y0),
-                area=int(c.area),
-                score=float(c.score),
-                prompt_score=c.prompt_score,
-            )
-        )
-    return lifted
-
-
-def batch_dino_classify(
-    dino: DINOIdentifier,
-    crops_rgb: list[np.ndarray],
-    crops_mask: list[np.ndarray | None],
-    objectness_priors: list[float | None] | None = None,
-) -> list[DINOResult]:
-    """Embed `crops_rgb` in one forward pass, then classify each via the ref bank."""
-
-    if not crops_rgb:
-        return []
-    if objectness_priors is not None and len(objectness_priors) != len(crops_rgb):
-        raise ValueError(
-            f"objectness_priors len {len(objectness_priors)} != crops {len(crops_rgb)}"
-        )
-
-    tensors = []
-    for rgb, mask in zip(crops_rgb, crops_mask):
-        rgb_proc = dino._ensure_rgb(rgb)
-        rgb_masked = dino._apply_mask(rgb_proc, mask)
-        t = dino._preprocess(rgb_masked)
-        tensors.append(t)
-
-    batch = torch.cat(tensors, dim=0)
-
-    with torch.inference_mode():
-        out = dino.model.forward_features(batch)
-    if not isinstance(out, dict):
-        raise RuntimeError(
-            f"forward_features returned {type(out)}; expected dict"
-        )
-    cls_tok = out["x_norm_clstoken"].reshape(batch.shape[0], -1)
-    patch_toks = out["x_norm_patchtokens"]  # (B, N, D)
-    gem = dino._gem_pool(patch_toks, p=float(dino.cfg.gem_p)).reshape(
-        batch.shape[0], -1
-    )
-    cls_n = F.normalize(cls_tok, dim=1)
-    gem_n = F.normalize(gem, dim=1)
-    embeddings = torch.stack([cls_n, gem_n], dim=1).detach().cpu().numpy()
-
-    results: list[DINOResult] = []
-    for i, emb in enumerate(embeddings):
-        prior = None
-        if objectness_priors is not None:
-            p = objectness_priors[i]
-            if p is not None:
-                prior = float(p)
-        results.append(
-            dino.classify_embedding(
-                emb,
-                objectness_prior=prior,
-            )
-        )
-    return results
-
 
 
 class FoundationPoseTrackerNode(Node):
@@ -1939,7 +1091,7 @@ class FoundationPoseTrackerNode(Node):
         # [VRAM] free-memory at each SAM forward.
         try:
             _free, _total = torch.cuda.mem_get_info()
-            _dprint(f"[VRAM] {cam_id}: free={_free/1e9:.2f}GB / {_total/1e9:.1f}GB")
+            _dprint(f"[VRAM] {cam_id}: free={_free/1e9:.2f}GB / {_total/1e9:.1f}GB", debug=_DEBUG_LOGGING)
         except Exception:
             pass
         full_h, full_w = rgb.shape[:2]
@@ -1960,7 +1112,7 @@ class FoundationPoseTrackerNode(Node):
         rgb_crop_masked = rgb_crop.copy()
         rgb_crop_masked[roi_mask_crop == 0] = 0
 
-        _dprint(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms")
+        _dprint(f"[TIMING]   ROI crop prep: {(time.time() - t0)*1000:.0f}ms", debug=_DEBUG_LOGGING)
 
         # --- Main proposal stage ---
         t1 = time.time()
@@ -1983,7 +1135,8 @@ class FoundationPoseTrackerNode(Node):
                 f"y=[{float(boxes[:,1].min()):.0f},{float(boxes[:,3].max()):.0f}] "
                 f"degenerate={int(((_bw<=0)|(_bh<=0)).sum())} "
                 f"box_score[min,max]=[{float(box_scores.min()):.2f},{float(box_scores.max()):.2f}] "
-                f"box_score_nan={int((~np.isfinite(box_scores)).sum())}"
+                f"box_score_nan={int((~np.isfinite(box_scores)).sum())}",
+                debug=_DEBUG_LOGGING
             )
             masks_crop = sam.generate_from_boxes(
                 rgb_crop_masked, boxes, box_scores=box_scores,
@@ -1992,7 +1145,8 @@ class FoundationPoseTrackerNode(Node):
             masks_crop = []
         _dprint(
             f"[TIMING]   GDINO+SAM (main): {(time.time() - t1)*1000:.0f}ms "
-            f"-> {len(proposals)} boxes -> {len(masks_crop)} masks"
+            f"-> {len(proposals)} boxes -> {len(masks_crop)} masks",
+            debug=_DEBUG_LOGGING
         )
 
         if not masks_crop:
@@ -2021,7 +1175,7 @@ class FoundationPoseTrackerNode(Node):
             masks = lift_crop_masks_to_full_image(
                 masks_crop, full_h, full_w, crop_x0, crop_y0
             )
-            _dprint(f"[TIMING]   Mask filtering: {(time.time() - t2)*1000:.0f}ms -> {len(masks)} after filter")
+            _dprint(f"[TIMING]   Mask filtering: {(time.time() - t2)*1000:.0f}ms -> {len(masks)} after filter", debug=_DEBUG_LOGGING)
 
         masks = sorted(masks, key=lambda m: m.area)
 
@@ -2029,7 +1183,7 @@ class FoundationPoseTrackerNode(Node):
         t5 = time.time()
         masks = reject_outside_roi_polygon(masks, polygon_full)
         masks = dedup_masks_by_bbox_iou(masks, iou_thresh=self.args.mask_dedup_iou)
-        _dprint(f"[TIMING]   Final filter + dedup: {(time.time() - t5)*1000:.0f}ms -> {len(masks)} final")
+        _dprint(f"[TIMING]   Final filter + dedup: {(time.time() - t5)*1000:.0f}ms -> {len(masks)} final", debug=_DEBUG_LOGGING)
 
         return masks
 
@@ -3690,7 +2844,7 @@ class FoundationPoseTrackerNode(Node):
 
         t_icp_end = time.time()
         if getattr(self.args, "debug_verbose_logs", False):
-            _dprint(f"[TIMING] Fused ICP all objects: {(t_icp_end-t_fuse)*1000:.0f}ms")
+            _dprint(f"[TIMING] Fused ICP all objects: {(t_icp_end-t_fuse)*1000:.0f}ms", debug=_DEBUG_LOGGING)
 
         # ── Kalman update ──
         if not fused_kalman_disabled:
@@ -3957,7 +3111,7 @@ class FoundationPoseTrackerNode(Node):
         Multi-camera fusion init with single-FP + symmetry-grid refinement.
         """
         t_start = time.time()
-        _dprint("\n[TIMING] ========== MULTICAM INIT START ==========")
+        _dprint("\n[TIMING] ========== MULTICAM INIT START ==========", debug=_DEBUG_LOGGING)
 
         self._init_cycle_counter += 1
         self._prune_stale_track_ids()
@@ -3986,7 +3140,7 @@ class FoundationPoseTrackerNode(Node):
             masks = self._generate_and_filter_masks(view.rgb, cam_id)
             cycle_total_masks += len(masks)
             cycle_total_boxes += int(getattr(self, "_last_sam_n_boxes", 0))
-            _dprint(f"[TIMING] SAM {cam_id}: {(time.time()-t_sam)*1000:.0f}ms -> {len(masks)} masks")
+            _dprint(f"[TIMING] SAM {cam_id}: {(time.time()-t_sam)*1000:.0f}ms -> {len(masks)} masks", debug=_DEBUG_LOGGING)
 
             if not masks:
                 selections_by_cam[cam_id] = []
@@ -4006,7 +3160,7 @@ class FoundationPoseTrackerNode(Node):
                 if masks else []
             )
             selected = self._select_top_candidates(ranked, view.depth)
-            _dprint(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected")
+            _dprint(f"[TIMING] DINO+select {cam_id}: {(time.time()-t_dino)*1000:.0f}ms -> {len(selected)} selected", debug=_DEBUG_LOGGING)
             selections_by_cam[cam_id] = selected
 
             if self._debug_frame_publish_enabled() and cam_id in self.pub_debug_frame:
@@ -4048,7 +3202,7 @@ class FoundationPoseTrackerNode(Node):
         if sum(len(v) for v in selections_by_cam.values()) == 0:
             for view in views:
                 self.track_states[view.cam_id] = []
-            _dprint("[TIMING] MULTICAM INIT: no detections")
+            _dprint("[TIMING] MULTICAM INIT: no detections", debug=_DEBUG_LOGGING)
             return
 
         # ── Phase 2: Fusion matching ──
@@ -4064,7 +3218,7 @@ class FoundationPoseTrackerNode(Node):
             T_base_cam_map=self.T_base_cam_map,
             cfg=fusion_cfg,
         )
-        _dprint(f"[TIMING] Fusion matching: {(time.time()-t_fusion)*1000:.0f}ms -> {len(fused_detections)} fused objects")
+        _dprint(f"[TIMING] Fusion matching: {(time.time()-t_fusion)*1000:.0f}ms -> {len(fused_detections)} fused objects", debug=_DEBUG_LOGGING)
 
         # ── Phase 3: Single-FP + ICP + symmetry grid + weighted average ──
         t_fp_all = time.time()
@@ -4114,7 +3268,7 @@ class FoundationPoseTrackerNode(Node):
                 )
                 if pcd is not None:
                     per_cam_clouds.append(pcd)
-                    _dprint(f"  [{cam_id}] Lifted {len(pcd.points)} pts for {fused.object_id}")
+                    _dprint(f"  [{cam_id}] Lifted {len(pcd.points)} pts for {fused.object_id}", debug=_DEBUG_LOGGING)
 
             # ─── Cloud overlap diagnostic ───
             if len(per_cam_clouds) >= 2 and getattr(self.args, "debug_verbose_logs", False):
@@ -4125,7 +3279,8 @@ class FoundationPoseTrackerNode(Node):
                 _dprint(
                     f"  CLOUD OVERLAP {fused.object_id}: "
                     f"{cam_ids_str[0]}<->{cam_ids_str[1]} "
-                    f"mean_dist={mean_overlap_dist*1000:.1f}mm"
+                    f"mean_dist={mean_overlap_dist*1000:.1f}mm",
+                    debug=_DEBUG_LOGGING
                 )
                 if mean_overlap_dist > 0.008:
                     self.get_logger().warn(
@@ -4138,9 +3293,9 @@ class FoundationPoseTrackerNode(Node):
             fused_cloud = merge_point_clouds(per_cam_clouds, voxel_size=INIT_VOXEL_SIZE)
 
             if fused_cloud is None or len(fused_cloud.points) < 50:
-                _dprint(f"  Fused cloud too small for {fused.object_id}, skipping")
+                _dprint(f"  Fused cloud too small for {fused.object_id}, skipping", debug=_DEBUG_LOGGING)
                 continue
-            _dprint(f"  Fused cloud: {len(fused_cloud.points)} pts ({(time.time()-t_lift)*1000:.0f}ms)")
+            _dprint(f"  Fused cloud: {len(fused_cloud.points)} pts ({(time.time()-t_lift)*1000:.0f}ms)", debug=_DEBUG_LOGGING)
 
             # Mesh sample used by both initial ICP and optional rotation grid.
             model_pcd = mesh_to_pcd_cached(mesh_path, float(self.args.mesh_scale), num_points=5000)
@@ -4157,7 +3312,7 @@ class FoundationPoseTrackerNode(Node):
 
             is_single_cam = len(fused.detections) == 1
             if is_single_cam:
-                _dprint(f"  ⚠ SINGLE-CAM init for {fused.object_id}")
+                _dprint(f"  ⚠ SINGLE-CAM init for {fused.object_id}", debug=_DEBUG_LOGGING)
 
             for det_idx, det in enumerate(fused.detections):
                 cam_id = det.cam_id
@@ -4165,7 +3320,7 @@ class FoundationPoseTrackerNode(Node):
                     continue
                 if cam_id in fp_skip_cameras:
                     _dprint(
-                        f"  FP skip [{cam_id}] {fused.object_id}: --fp-skip-cameras"
+                        f"  FP skip [{cam_id}] {fused.object_id}: --fp-skip-cameras", debug=_DEBUG_LOGGING
                     )
                     continue
 
@@ -4187,7 +3342,7 @@ class FoundationPoseTrackerNode(Node):
                     fp_ms = (time.time() - t_fp) * 1000
                 except Exception as e:
                     self.get_logger().warn(
-                        f"  FP failed [{cam_id}] {fused.object_id}: {e}"
+                        f"  FP failed [{cam_id}] {fused.object_id}: {e}", debug=_DEBUG_LOGGING
                     )
                     continue
 
@@ -4226,7 +3381,8 @@ class FoundationPoseTrackerNode(Node):
                 _dprint(
                     f"  FP+ICP [{cam_id}] {fused.object_id}: "
                     f"fp={fp_ms:.0f}ms icp={icp_ms:.0f}ms "
-                    f"fitness={fitness:.3f} chamfer={chamfer*1000:.2f}mm"
+                    f"fitness={fitness:.3f} chamfer={chamfer*1000:.2f}mm",
+                    debug=_DEBUG_LOGGING
                 )
 
                 best_T = T_refined
@@ -4247,7 +3403,8 @@ class FoundationPoseTrackerNode(Node):
                         _dprint(
                             f"    Symmetry grid improved [{cam_id}]: "
                             f"{best_chamfer*1000:.2f}mm → {grid_chamfer*1000:.2f}mm "
-                            f"({grid_ms:.0f}ms)"
+                            f"({grid_ms:.0f}ms)",
+                            debug=_DEBUG_LOGGING
                         )
                         best_T = grid_T
                         best_chamfer = grid_chamfer
@@ -4258,7 +3415,7 @@ class FoundationPoseTrackerNode(Node):
                             T_base_object=best_T,
                         )
                     else:
-                        _dprint(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)")
+                        _dprint(f"    Symmetry grid no improvement [{cam_id}] ({grid_ms:.0f}ms)", debug=_DEBUG_LOGGING)
 
                 if getattr(self.args, 'log_init_poses', False):
                     accepted_attempt = (best_chamfer <= CHAMFER_REJECT_M)
@@ -4282,7 +3439,7 @@ class FoundationPoseTrackerNode(Node):
                                 f'{best_chamfer*1000:.2f},{accepted_attempt}\n'
                             )
                     except Exception as e:
-                        _dprint(f"  [WARN] init pose CSV log failed: {e}")
+                        _dprint(f"  [WARN] init pose CSV log failed: {e}", debug=_DEBUG_LOGGING)
 
                     save_init_pose_render(
                         best_T, model_pcd, fused.object_id,
@@ -4293,7 +3450,8 @@ class FoundationPoseTrackerNode(Node):
                 _dprint(
                     f"  FINAL [{cam_id}] {fused.object_id}: "
                     f"fitness={best_fitness:.3f} rmse={best_rmse*1000:.1f}mm "
-                    f"chamfer={best_chamfer*1000:.2f}mm"
+                    f"chamfer={best_chamfer*1000:.2f}mm",
+                    debug=_DEBUG_LOGGING
                 )
 
                 # Track per-camera Chamfer to catch extrinsic drift over repeated inits.
@@ -4390,7 +3548,8 @@ class FoundationPoseTrackerNode(Node):
             _dprint(
                 f"  POLISH ICP {fused.object_id}: "
                 f"fitness={polish_fitness:.3f} rmse={polish_rmse*1000:.1f}mm "
-                f"chamfer={polish_chamfer*1000:.2f}mm ({polish_ms:.0f}ms)"
+                f"chamfer={polish_chamfer*1000:.2f}mm ({polish_ms:.0f}ms)",
+                debug=_DEBUG_LOGGING
             )
 
             T_publish = T_base_canonical.copy()
@@ -4404,7 +3563,8 @@ class FoundationPoseTrackerNode(Node):
                 f"  CANONICAL {fused.object_id}: "
                 f"t=[{t_canon[0]:.4f}, {t_canon[1]:.4f}, {t_canon[2]:.4f}] "
                 f"weights=[{weights_str}]"
-                f"{' [SINGLE-CAM]' if is_single_cam else ''}"
+                f"{' [SINGLE-CAM]' if is_single_cam else ''}",
+                debug=_DEBUG_LOGGING
             )
 
             if self.args.distance_confidence_warn:
@@ -4418,7 +3578,8 @@ class FoundationPoseTrackerNode(Node):
                 ):
                     _dprint(
                         f"  LOW-CONFIDENCE {fused.object_id}: "
-                        f"dist={dist_m:.2f}m min_mask_area={min_mask_area}"
+                        f"dist={dist_m:.2f}m min_mask_area={min_mask_area}",
+                        debug=_DEBUG_LOGGING
                     )
 
             # Allocate (or reuse) one track_id per fused detection so all
@@ -4482,7 +3643,7 @@ class FoundationPoseTrackerNode(Node):
                 assembly_name, part_id, fused.object_id, T_publish, stamp
             )
 
-        _dprint(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms")
+        _dprint(f"[TIMING] FP all objects: {(time.time()-t_fp_all)*1000:.0f}ms",  debug=_DEBUG_LOGGING)
 
         # Compare recent init Chamfer by camera to catch slow calibration drift.
         self._check_chamfer_drift()
@@ -4680,7 +3841,7 @@ class FoundationPoseTrackerNode(Node):
         views = self.grabber.get_latest_views()
         if views is None:
             if getattr(self.args, "debug_verbose_logs", False):
-                _dprint("[TICK] No views yet...")
+                _dprint("[TICK] No views yet...", debug=_DEBUG_LOGGING)
             return
     
         self.busy = True
@@ -4771,418 +3932,6 @@ class FoundationPoseTrackerNode(Node):
                         self.track_states[view.cam_id] = []
         finally:
             self.busy = False
-
-
-def parse_args() -> argparse.Namespace:
-    """Command-line knobs for model loading, init quality gates, and tracking behavior."""
-    p = argparse.ArgumentParser()
-
-    # Runtime devices and top-level mode selection.
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--dino-device", choices=["", "cpu", "cuda"], default="",
-                   help="Device for DINOv2 image embeddings. Empty reuses --device.")
-    # Grounding DINO + SAM (MUSE-style) proposal stage
-    p.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base")
-    p.add_argument("--gdino-box-threshold", type=float, default=0.20)
-    p.add_argument("--gdino-text-threshold", type=float, default=0.25)
-    p.add_argument("--gdino-max-boxes", type=int, default=40)
-    p.add_argument("--gdino-device", choices=["", "cpu", "cuda"], default="",
-                   help="Device for Grounding DINO. Empty reuses --device.")
-    # Comma-separated text prompts. Default covers the current object set;
-    # override via --gdino-text-prompts "a,b,c" to extend.
-    p.add_argument(
-        "--gdino-text-prompts",
-        default="cooling base,cooling f,cooling screw,pb base,pb pipe,pb screw,pb top",
-    )
-    p.add_argument("--run-mode", choices=["track", "init_only"], default="track")
-    p.add_argument(
-        "--start-paused", action="store_true",
-        help="Load all models but don't start ticking; call the "
-             "~/set_tracking_active service (std_srvs/SetBool) to begin.",
-    )
-    p.add_argument(
-        "--tracking-profile",
-        choices=["fast_cutie"],
-        default=None,
-        action=_TrackingProfileAction,
-        help="Use the fast Cutie tracking profile.",
-    )
-
-    # Object reference images, CAD meshes, and output folders.
-    p.add_argument("--reference-dir", default="Data/ZED_screens")
-    p.add_argument("--cad-dir", default="Data/CAD_Models_centered")
-    p.add_argument("--output-root", default="outputs/foundationpose")
-    p.add_argument(
-        "--assembly-part-ids-config",
-        default="Data/assembly_part_ids.json",
-        help=(
-            "JSON file mapping assembly_name -> ordered list of object_ids, "
-            "one entry per Fabrica part slot (list index == part_id). "
-            "Repeated object_ids (e.g. multiple screws) get distinct slots."
-        ),
-    )
-    p.add_argument(
-        "--planning-scene-frame-id",
-        default="world",
-        help=(
-            "Fixed frame_id used for MoveIt CollisionObjects published on "
-            "/planning_scene. Does not depend on tf2 frame resolution — set "
-            "this to whatever frame the robot/world is spawned under."
-        ),
-    )
-
-    # synthetic-render reference bank
-    p.add_argument("--reference-source", choices=["real", "renders", "both"],
-                   default="real")
-    p.add_argument("--reference-renders-dir", default="Data/reference_renders")
-
-    p.add_argument("--dino-model-name", default="dinov2_vitg14")
-    p.add_argument("--dino-min-score", type=float, default=0.50)
-    p.add_argument("--dino-min-margin", type=float, default=0.05)
-    p.add_argument("--area-penalty-weight", type=float, default=1.5)
-    p.add_argument("--fill-ratio-weight", type=float, default=0.15)
-
-    # SAM2 and dead-session recovery.
-    p.add_argument("--sam-repo-root", default="external/sam2")
-    p.add_argument(
-        "--sam-checkpoint",
-        default="external/sam2/checkpoints/sam2.1_hiera_base_plus.pt",
-    )
-    p.add_argument("--sam-model-cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
-    p.add_argument("--sam-max-image-side", type=int, default=1536)
-    p.add_argument("--sam-fp32", action="store_true")
-
-    p.add_argument("--restart-on-dead-init", action="store_true", default=True)
-    p.add_argument("--no-restart-on-dead-init", dest="restart_on_dead_init",
-                   action="store_false")
-    p.add_argument("--dead-init-cycles", type=int, default=2,
-                   help="consecutive all-cam-0-mask cycles before exiting for restart")
-    p.add_argument("--dead-init-min-boxes", type=int, default=3,
-                   help="min GDINO boxes in a cycle to count it as a real (non-empty) scene")
-    
-
-    # Fixed at 3 for this variant: zed2i_1 (static) + realsense_1 + realsense_2
-    # (end-effector-mounted, dynamic extrinsics). See ALL_CAMERAS above.
-    p.add_argument("--num-cameras", type=int, default=3, choices=[3])
-    p.add_argument(
-        "--flange-pose-max-age-s",
-        type=float,
-        default=0.25,
-        help="Reject (treat as not-ready) a flange pose older than this many seconds.",
-    )
-    p.add_argument(
-        "--fp-skip-cameras",
-        type=str,
-        default="",
-        help="Comma-separated camera ids to exclude from FoundationPose init calls.",
-    )
-    p.add_argument(
-        "--strict-flange-freshness",
-        action="store_true",
-        default=False,
-        help=(
-            "Restore the strict behavior: a flange pose older than "
-            "--flange-pose-max-age-s makes that camera (and, with too few "
-            "cameras left, the whole tick) not-ready. Default off: a stale "
-            "flange pose is logged and the last known pose is used instead, "
-            "so a brief gap in the flange-pose topic never stalls the "
-            "pipeline or drops the camera."
-        ),
-    )
-    p.add_argument(
-        "--min-active-cameras",
-        type=int,
-        default=1,
-        help=(
-            "Minimum number of the 3 configured cameras (zed2i_1, realsense_1, "
-            "realsense_2) that must be individually ready (image+intrinsics, "
-            "plus a fresh flange pose if end-effector-mounted) before the "
-            "pipeline starts ticking. Default 1: start with whichever camera "
-            "comes up first (no camera or flange pose is required to publish "
-            "up front) and pick up the rest automatically once they publish. "
-            "Set to 3 to restore the old all-cameras-required behavior."
-        ),
-    )
-
-    # Per-camera SAM/ROI filtering thresholds.
-    # cam1 = zed2i_1 (static). cam2/cam3 = realsense_1/realsense_2
-    # (end-effector-mounted); defaults below are inherited from the ZED trio
-    # tuning and likely need retuning for the RealSense field of view/mount
-    # distance once the cameras are physically calibrated.
-    p.add_argument("--cam1-sam-min-mask-area", type=int, default=10)
-    p.add_argument("--cam1-sam-min-bbox-side-px", type=int, default=2)
-    p.add_argument("--cam1-sam-max-mask-area-ratio", type=float, default=0.06)
-    p.add_argument("--cam1-sam-max-bbox-area-ratio", type=float, default=0.06)
-    p.add_argument("--cam1-sam-border-px", type=int, default=6)
-    p.add_argument("--cam1-sam-max-border-fraction", type=float, default=0.00)
-
-    p.add_argument("--cam2-sam-min-mask-area", type=int, default=10)
-    p.add_argument("--cam2-sam-min-bbox-side-px", type=int, default=2)
-    p.add_argument("--cam2-sam-max-mask-area-ratio", type=float, default=0.06)
-    p.add_argument("--cam2-sam-max-bbox-area-ratio", type=float, default=0.06)
-    p.add_argument("--cam2-sam-border-px", type=int, default=6)
-    p.add_argument("--cam2-sam-max-border-fraction", type=float, default=0.00)
-
-    p.add_argument("--cam3-sam-min-mask-area", type=int, default=10)
-    p.add_argument("--cam3-sam-min-bbox-side-px", type=int, default=2)
-    p.add_argument("--cam3-sam-max-mask-area-ratio", type=float, default=0.06)
-    p.add_argument("--cam3-sam-max-bbox-area-ratio", type=float, default=0.06)
-    p.add_argument("--cam3-sam-border-px", type=int, default=6)
-    p.add_argument("--cam3-sam-max-border-fraction", type=float, default=0.00)
-
-    p.add_argument("--cam1-roi-polygon", type=str,
-        default="" )
-    p.add_argument("--cam2-roi-polygon", type=str,
-        default="")
-    # Empty string => no ROI mask for cam3 until tuned.
-    p.add_argument("--cam3-roi-polygon", type=str, default="")
-
-    p.add_argument("--mask-dedup-iou", type=float, default=0.6)
-
-    p.add_argument("--fp-repo-root", default="external/FoundationPose")
-    p.add_argument("--fp-weights-dir", default="external/FoundationPose/weights")
-    p.add_argument("--fp-debug", type=int, default=0)
-    p.add_argument("--mesh-scale", type=float, default=0.01)
-
-    p.add_argument("--timer-period-s", type=float, default=0.05)
-    p.add_argument("--max-candidate-draw", type=int, default=25)
-
-    p.add_argument("--min-valid-z-m", type=float, default=0.05)
-    p.add_argument("--max-valid_z_m", dest="max_valid_z_m", type=float, default=10.00)
-
-    p.add_argument("--max-objects", type=int, default=15)
-
-    p.add_argument("--min-depth-coverage", type=float, default=0.50)
-
-    # Fused tracking candidate gates before cloud merge.
-    p.add_argument("--fused-gate-min-mask-area", type=int, default=50)
-    p.add_argument("--fused-gate-min-mask-area-ratio", type=float, default=0.40)
-    p.add_argument("--fused-gate-max-mask-area-ratio", type=float, default=2.50)
-    p.add_argument("--fused-gate-min-depth-coverage", type=float, default=0.30)
-    p.add_argument("--fused-gate-min-cloud-points", type=int, default=40)
-    p.add_argument("--fused-gate-max-centroid-dist-m", type=float, default=0.08)
-    # Cross-camera consistency check at merge
-    p.add_argument("--fused-consistency-max-disagreement-m", type=float, default=0.0)
-
-    # Cross-camera fusion MATCHING gate (init-only; distinct from the tracking
-    # gate above). Two per-cam detections fuse into one object iff their base-
-    # frame centroids are within this distance.
-    p.add_argument("--fusion-match-max-centroid-dist-m", type=float, default=0.07)
-    # Geometric ambiguity guard
-    p.add_argument("--fusion-match-ambiguity-margin-m", type=float, default=0.0)
-    # Soft DINO label penalty (meters of extra matching cost for a full label
-    # disagreement)
-    p.add_argument("--fusion-match-label-penalty-m", type=float, default=0.0)
-    p.add_argument("--fused-gate-min-per-cam-icp-fitness", type=float, default=0.18)
-    p.add_argument("--fused-gate-max-per-cam-icp-rmse-m", type=float, default=0.015)
-
-    # Fused pose acceptance gates after ICP.
-    p.add_argument("--fused-track-min-fused-icp-fitness", type=float, default=0.12)
-    p.add_argument("--fused-track-max-fused-icp-rmse-m", type=float, default=0.012)
-    p.add_argument("--fused-track-nominal-dt-s", type=float, default=0.15)
-    p.add_argument("--fused-track-min-dt-s", type=float, default=0.10)
-    p.add_argument("--fused-track-max-dt-s", type=float, default=0.30)
-    p.add_argument("--fused-track-max-translation-speed-mps", type=float, default=0.13333333333333333)
-    p.add_argument("--fused-track-max-rotation-speed-degps", type=float, default=66.66666666666667)
-    p.add_argument("--fused-track-min-translation-jump-m", type=float, default=0.008)
-    p.add_argument("--fused-track-min-rotation-jump-deg", type=float, default=4.0)
-    p.add_argument("--fused-track-kalman-soft-translation-residual-m", type=float, default=0.05)
-    p.add_argument("--fused-track-kalman-soft-max-icp-fitness", type=float, default=0.22)
-    p.add_argument("--fused-track-weak-icp-fitness", type=float, default=0.18)
-    p.add_argument("--fused-track-axis-dominant-fraction", type=float, default=0.80)
-    p.add_argument("--fused-track-axis-dominant-min-translation-m", type=float, default=0.012)
-    p.add_argument("--fused-track-icp-max-correspondence-dist-m", type=float, default=0.05)
-    # Tracking uses a tight init from the previous frame
-    p.add_argument("--fused-track-icp-max-iteration", type=int, default=15)
-    # Adaptive early-stop tolerances for tracking ICP
-    p.add_argument("--fused-track-icp-relative-fitness", type=float, default=1e-4)
-    p.add_argument("--fused-track-icp-relative-rmse", type=float, default=1e-4)
-
-    # Optional fast-motion recovery: translate the ICP seed from agreeing cloud centroids.
-    p.add_argument("--fused-track-centroid-recovery", action="store_true",
-                   help="Enable centroid-seeded ICP recovery for large mask-cloud jumps.")
-    p.add_argument("--fused-track-centroid-recovery-cluster-dist-m", type=float, default=0.12,
-                   help="Max distance between camera cloud centroids to form a recovery cluster.")
-    p.add_argument("--fused-track-centroid-recovery-min-cameras", type=int, default=1,
-                   help="Minimum agreeing centroid-far cameras required for recovery.")
-    p.add_argument("--fused-track-centroid-recovery-max-seed-jump-m", type=float, default=0.75,
-                   help="Reject centroid recovery if the proposed seed jump exceeds this distance.")
-
-    # Optional rotation re-seed during tracking, useful for symmetric/elongated meshes.
-    p.add_argument("--fused-track-rot-reseed", action="store_true",
-                   help="Enable chamfer-triggered rotation re-seed during tracking.")
-    p.add_argument("--fused-track-rot-reseed-chamfer-m", type=float, default=0.010,
-                   help="Trigger: re-seed only when grid-chamfer exceeds this (m).")
-    p.add_argument("--fused-track-rot-reseed-max-chamfer-m", type=float, default=0.080,
-                   help="Ceiling: above this the object is lost (not mis-rotated); skip the grid.")
-    p.add_argument("--fused-track-rot-reseed-n-rot", type=int, default=24,
-                   help="Rotation candidates for the tracking re-seed grid (init uses --icp-grid-n-rot).")
-    p.add_argument("--fused-track-rot-reseed-icp-iters", type=int, default=10,
-                   help="ICP iterations per candidate in the tracking re-seed grid.")
-
-    # Optional PCA shaft-axis correction for shaft-like objects.
-    p.add_argument("--fused-track-pca-axis", action="store_true",
-                   help="Enable PCA shaft-axis correction during tracking.")
-    p.add_argument("--fused-track-pca-axis-min-deg", type=float, default=10.0,
-                   help="Only correct when ICP shaft-axis disagrees with PCA axis by more than this (deg).")
-    p.add_argument("--fused-track-pca-axis-max-deg", type=float, default=60.0,
-                   help="Ceiling: above this the PCA axis is likely unreliable; skip correction (deg).")
-    p.add_argument("--fused-track-pca-axis-min-elongation", type=float, default=3.0,
-                   help="Only apply when the cloud is shaft-like (lambda1/lambda2 >= this).")
-    p.add_argument("--fused-track-pca-axis-min-points", type=int, default=50,
-                   help="Minimum fused-cloud points required for a stable PCA axis.")
-    p.add_argument("--fused-track-pca-axis-blend", type=float, default=1.0,
-                   help="Correction strength in [0,1]; 1.0 = full snap, <1.0 = partial (less jitter).")
-
-    # Optional rotation damping during tracking.
-    p.add_argument("--fused-track-rot-slew-limit-deg", type=float, default=0.0,
-                   help="Cap the per-frame rotation change (deg) vs the previous pose; "
-                        "SLERP from prev toward the ICP update so the change == limit. 0.0 = off.")
-    p.add_argument("--fused-track-rot-lowpass", type=float, default=0.0,
-                   help="Low-pass the (slew-limited) rotation toward the previous pose by "
-                        "this factor in [0,1] to smooth jitter. 0.0 = off.")
-
-    # Warmup frames after init relax gates while Cutie/ICP settle.
-    p.add_argument("--fused-track-warmup-frames", type=int, default=5)
-
-    # Hold/stale/lost windows for publishing the last good pose before reinit.
-    p.add_argument("--fused-track-hold-window-frames", type=int, default=5)
-    p.add_argument("--fused-track-max-lost-frames", type=int, default=20)
-    p.add_argument(
-        "--reinit-lost-tracks-while-tracking",
-        action="store_true",
-        help=(
-            "When one track is lost but other tracks still exist, run global "
-            "multicam init immediately. By default partial loss only drops the "
-            "lost track and keeps tracking the survivors."
-        ),
-    )
-
-    # Chamfer and mask-origin gates for outlier rejection during tracking.
-    p.add_argument("--fused-track-max-chamfer-m", type=float, default=0.015)
-    p.add_argument(
-        "--track-require-pose-origin-in-mask",
-        action="store_true",
-        help=(
-            "Reject tracking poses whose projected object-frame origin is not "
-            "inside the current Cutie tracker mask."
-        ),
-    )
-    p.add_argument(
-        "--track-pose-mask-margin-px",
-        type=int,
-        default=8,
-        help="Pixel tolerance around the projected pose origin for --track-require-pose-origin-in-mask.",
-    )
-
-    # Median pose buffer (temporal outlier filter, 0 to disable).
-    p.add_argument("--median-pose-buffer-size", type=int, default=3)
-
-    p.add_argument("--log-init-poses", action="store_true",
-                   help="Log CSV of init pose RPY + render 3D PNGs per attempt")
-    p.add_argument("--log-track-poses", action="store_true",
-                   help="Log compact per-tick fused tracking poses and metrics to CSV.")
-    p.add_argument("--track-pose-log-path",
-                   default="outputs/logs/track_pose_log.csv",
-                   help="CSV path for --log-track-poses. Overwritten at node startup.")
-
-    # ── Latency / debug flags ──
-    p.add_argument("--debug-per-cam-pose-publish", action="store_true")
-    p.add_argument("--debug-frame-publish", dest="debug_frame_publish",
-                   action="store_true", default=True,
-                   help="Publish fp_debug_msgs/DebugFrame messages.")
-    p.add_argument("--no-debug-frame-publish", dest="debug_frame_publish",
-                   action="store_false",
-                   help="Skip DebugFrame construction and publication.")
-    # When true, emit per-frame INFO logs and [TIMING] prints. Off by default.
-    p.add_argument("--debug-verbose-logs", action="store_true")
-    # Master switch for all logging/print statements across the pipeline.
-    p.add_argument("--debug-logging", action="store_true",
-                   help="Enable all pipeline logging (prints + ROS logger info/warn).")
-
-    # Tracking ICP can be skipped entirely (per-cam ICP is redundant because the
-    # fused-cloud ICP refines the pose anyway).
-    p.add_argument("--skip-per-cam-icp-tracking", action="store_true", default=True)
-
-    p.add_argument("--cutie-max-internal-size", type=int, default=480,
-                   help="Max image side for Cutie tracking resize. <=0 disables Cutie downscale.")
-
-    # Tracking-time model PCD point count (init keeps the original 5000 via a
-    # separate cache entry).
-    p.add_argument("--track-icp-num-points", type=int, default=2000)
-
-    # Conditional chamfer thresholds. Skip chamfer when both fitness/rmse are
-    # already clean and motion is small.
-    p.add_argument("--chamfer-skip-fitness-min", type=float, default=0.30)
-    p.add_argument("--chamfer-skip-rmse-max-m", type=float, default=0.005)
-    p.add_argument("--chamfer-skip-motion-max-m", type=float, default=0.010)
-    p.add_argument("--chamfer-every-n-frames", type=int, default=1,
-                   help="Run non-clean tracking Chamfer gate every N frames. 1 checks every eligible frame.")
-    p.add_argument("--disable-fused-kalman", action="store_true", default=False,
-                   help="Skip fused tracking Kalman prediction/update and soft reject gate.")
-    p.add_argument("--enable-fused-kalman", dest="disable_fused_kalman",
-                   action="store_false",
-                   help="Re-enable fused tracking Kalman when a profile disabled it.")
-    p.add_argument("--disable-axis-jump-gate", action="store_true", default=False,
-                   help="Skip axis-dominant weak-ICP jump rejection.")
-    p.add_argument("--enable-axis-jump-gate", dest="disable_axis_jump_gate",
-                   action="store_false",
-                   help="Re-enable axis-dominant jump rejection when a profile disabled it.")
-
-    # ICP variant for run_icp_in_base_frame.
-    p.add_argument("--icp-variant", choices=["point_to_point", "point_to_plane"],
-                   default="point_to_point")
-
-    # warn-tag poses that are likely lower confidence (far away / tiny mask).
-    p.add_argument("--distance-confidence-warn", action="store_true")
-    p.add_argument("--distance-confidence-max-m", type=float, default=1.5)
-    p.add_argument("--distance-confidence-min-mask-area", type=int, default=2000)
-
-
-    # Rotation-grid rescue for init and optional tracking re-seed.
-    #   --icp-grid-n-rot             : number of uniform SO(3) seed rotations
-    #   --icp-grid-prescreen         : skip ICP for seeds whose raw-Chamfer > tau
-    #   --icp-grid-cross-cam-chamfer : score by mean Chamfer across per-cam clouds
-    p.add_argument("--icp-grid-n-rot", type=int, default=45)
-    p.add_argument("--icp-grid-prescreen", action="store_true")
-    p.add_argument("--icp-grid-prescreen-tau", type=float, default=0.04)
-    p.add_argument("--icp-grid-cross-cam-chamfer", action="store_true")
-
-
-    p.add_argument("--depth-fill-holes-kernel", type=int, default=0)
-
-    # threshold above which the rotation grid runs.
-    p.add_argument("--icp-grid-skip-chamfer-m", type=float, default=0.004)
-
-    p.add_argument("--dino-gem-p", type=float, default=1.5,
-                   help="GeM exponent for the MUSE two-stream patch stream.")
-
-    p.add_argument("--gdino-use-items-prompt", dest="gdino_use_items_prompt",
-                   action="store_true", default=True,
-                   help="Use the MUSE class-agnostic literal 'items' prompt.")
-    p.add_argument("--no-gdino-use-items-prompt", dest="gdino_use_items_prompt",
-                   action="store_false",
-                   help="Use --gdino-text-prompts instead of the MUSE 'items' prompt.")
-
-    # bicubic-upscale DINO crops whose short side is below this many pixels
-    p.add_argument("--dino-min-crop-side", type=int, default=0)
-
-    p.add_argument("--table-plane-z-min", type=float, default=-0.03)
-    p.add_argument("--table-plane-z-max", type=float, default=0.9)
-    p.add_argument("--workspace-x-min", type=float, default=0.10)
-    p.add_argument("--workspace-y-min", type=float, default=-0.4)
-    p.add_argument("--workspace-y-max", type=float, default=0.4)
-
-
-    p.add_argument("--icp-mask-close-kernel", type=int, default=0)
-    p.add_argument("--icp-mask-interior-erosion", type=int, default=0)
-
-    args = p.parse_args()
-    if args.run_mode == "track" and args.tracking_profile is None:
-        p.error("--tracking-profile fast_cutie is required for --run-mode track")
-    if not (1 <= args.min_active_cameras <= 3):
-        p.error(f"--min-active-cameras must be between 1 and 3, got {args.min_active_cameras}")
-    return args
 
 
 def main() -> None:

@@ -1,0 +1,28 @@
+# fast_track preset — overlay merged onto config.yaml by parse_args().
+# tracking_profile: fast_cutie also pulls in profiles/fast_cutie.yaml.
+
+chamfer_every_n_frames: 1
+depth_fill_holes_kernel: 3
+dino_min_crop_side: 112
+fused_gate_max_centroid_dist_m: 0.25
+fused_track_centroid_recovery: true
+fused_track_icp_max_correspondence_dist_m: 0.15
+fused_track_icp_max_iteration: 8
+fused_track_max_dt_s: 0.8
+fused_track_max_rotation_speed_degps: 1200.0
+fused_track_max_translation_speed_mps: 1.2
+fused_track_min_rotation_jump_deg: 90.0
+fused_track_min_translation_jump_m: 0.1
+gdino_box_threshold: 0.3
+gdino_device: "cpu"
+gdino_max_boxes: 20
+gdino_text_threshold: 0.2
+icp_grid_cross_cam_chamfer: true
+icp_grid_prescreen: true
+log_track_poses: true
+planning_scene_frame_id: "base_link"
+run_mode: "track"
+sam_fp32: true
+track_pose_log_path: "outputs/logs/live_fast_track_realsense_q.csv"
+track_pose_mask_margin_px: 250
+tracking_profile: "fast_cutie"

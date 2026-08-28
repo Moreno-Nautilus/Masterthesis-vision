@@ -1,0 +1,31 @@
+# Fast Cutie tracking profile.
+#
+# Merged on top of config.yaml whenever the resolved config has
+#   tracking_profile: fast_cutie
+# (or a run passes --tracking-profile fast_cutie). Values here override the
+# base config; anything still passed on the command line overrides these.
+# Was FAST_CUTIE_PROFILE_OVERRIDES in run_pipeline_track_multicam_realsense.py.
+
+track_require_pose_origin_in_mask: true
+track_pose_mask_margin_px: 8
+track_icp_num_points: 800
+
+fused_track_icp_max_iteration: 6
+fused_track_icp_relative_fitness: 1.0e-3
+fused_track_icp_relative_rmse: 1.0e-3
+
+median_pose_buffer_size: 1
+
+fused_track_max_chamfer_m: 0.018
+fused_track_max_translation_speed_mps: 0.25
+fused_track_max_rotation_speed_degps: 180.0
+fused_track_min_translation_jump_m: 0.02
+fused_track_min_rotation_jump_deg: 10.0
+
+skip_per_cam_icp_tracking: true
+debug_per_cam_pose_publish: false
+debug_verbose_logs: false
+debug_logging: false
+disable_fused_kalman: true
+disable_axis_jump_gate: true
+chamfer_every_n_frames: 3
